@@ -1,0 +1,23 @@
+# Von jedem Nutzer lokal erzeugt - enthaelt IPs, Access Codes, API-Keys
+config.json
+
+# MK6: lokaler Druckauftrags-Verlauf je Drucker (Dateien + Vorschaubilder,
+# neben der exe/dem Skript angelegt, siehe PrintHistoryStore in app.py)
+# - Laufzeitdaten des jeweiligen Nutzers, kein Quellcode.
+print_history/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller-Buildartefakte
+build/
+dist/
+*.spec
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/

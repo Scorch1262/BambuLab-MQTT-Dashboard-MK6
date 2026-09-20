@@ -16,6 +16,9 @@ Konsolen-Skript oder als fertige Windows-/macOS-exe.
 
 Jeder Drucker bekommt ausserdem automatisch einen **Druckauftrags-
 Verlauf** (siehe [Abschnitt 3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)).
+Bambu Lab und Ultimaker bekommen zusaetzlich eine **Warteschlange**, die
+Druckauftraege automatisch aufnimmt, wenn der Drucker gerade beschaeftigt
+ist (siehe [Abschnitt 3j](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)).
 
 ---
 
@@ -33,6 +36,7 @@ Verlauf** (siehe [Abschnitt 3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk
 - [3g. Eigene Sensoren & Schaltflaechen](#3g-eigene-sensoren--schaltflaechen-per-zweitem-mqtt-broker)
 - [3h. Druckauftrags-Verlauf (neu seit MK6)](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)
 - [3i. Kartenlayout: 1/2/3-spaltig (neu seit MK6 v1.1.0)](#3i-kartenlayout-123-spaltig-neu-seit-mk6-v110)
+- [3j. Warteschlange je Drucker (neu seit MK6 v1.2.0)](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)
 - [4. Bambu Lab: Voraussetzungen](#4-voraussetzungen-auf-seite-der-bambu-lab-drucker)
 - [4a. Bambu Lab: Drag & Drop drucken](#4a-bambu-lab-druckauftrag-per-drag--drop-senden)
 - [5. Funktionsumfang](#5-funktionsumfang)
@@ -313,14 +317,29 @@ Eintrag: Dateiname, Datum/Uhrzeit, Vorschaubild (falls vorhanden), plus:
 
 | Aktion | Wirkung |
 |---|---|
-| **Erneut drucken** | sendet dieselbe Datei erneut; bei Bambu erscheint wieder der AMS-Zuordnungsdialog (Fach-Bestueckung kann sich geaendert haben) |
+| **Erneut drucken** | sendet dieselbe Datei erneut; bei Bambu erscheint wieder der AMS-Zuordnungsdialog (Fach-Bestueckung kann sich geaendert haben). Ist der Drucker gerade beschaeftigt, wird stattdessen automatisch in seine Warteschlange gelegt (siehe [3j](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)) |
+| **In Warteschlange** *(neu seit v1.2.0)* | legt diesen Eintrag in die eigene Warteschlange des Druckers, ohne ihn sofort zu senden |
+| **Zuweisen** *(neu seit v1.2.0)* | kopiert diesen Eintrag in die Warteschlange eines **anderen** Druckers im Dashboard |
 | **Loeschen** | entfernt Eintrag + Datei + Vorschaubild dauerhaft (Drucker selbst unberuehrt) |
+
+> ⚠️ **Kein doppelter Verlaufseintrag (seit v1.2.0):** wird ein Verlaufs-
+> eintrag erneut an DENSELBEN Drucker gesendet (direkt oder ueber die
+> Warteschlange), wird nur sein Zeitstempel aktualisiert und er nach oben
+> verschoben — es entsteht KEIN zweiter Eintrag fuer dieselbe Datei. Wird
+> er dagegen einem **anderen** Drucker zugewiesen, bekommt dessen Verlauf
+> nach dem Druck einen eigenen, neuen Eintrag (dort wurde schliesslich
+> tatsaechlich gedruckt).
 
 **Vorschaubilder:** bei Bambu (`.gcode.3mf`) wird das von Bambu Studio/
 OrcaSlicer eingebettete Plate-Vorschaubild gelesen. Bei Ultimaker
 (`.gcode`) wird **bewusst kein** Bild extrahiert — dafuer gibt es kein
 ueber alle Cura-Versionen zuverlaessig dokumentiertes Format; solche
 Eintraege zeigen ein generisches Datei-Symbol, das ist kein Fehler.
+
+**Sortierung:** Standardmaessig neueste zuerst. Ueber die Schaltflaeche
+oberhalb der Liste laesst sich *(neu seit v1.2.0)* auf alphabetische
+Sortierung nach Dateiname umschalten (rein clientseitig, ohne erneuten
+Datenabruf).
 
 Wird ein Drucker entfernt, bleibt sein Verlaufsordner bewusst erhalten
 (kein automatisches Aufraeumen) — bei Bedarf manuell aus `print_history/`
@@ -349,6 +368,73 @@ Kacheln nicht zu schmal werden — die interne Aufteilung jeder Karte
 eine Spalte zurueck. Das passiert unabhaengig davon, ob die Kacheln
 wegen des Fensters oder wegen des gewaehlten 3-Spalten-Modus schmal
 werden.
+
+## 3j. Warteschlange je Drucker (neu seit MK6 v1.2.0)
+
+Wird eine Druckdatei per Drag & Drop auf einen Drucker gezogen, **waehrend
+dieser bereits druckt (oder pausiert)**, wird sie NICHT sofort gesendet
+(kein AMS-Dialog, kein sofortiger Ultimaker-Druck), sondern automatisch in
+die **Warteschlange** dieses Druckers gelegt. Aufrufbar ueber das neue
+**Listen-Symbol** im Kopf jeder Bambu-/Ultimaker-Karte (mit Zaehl-Badge,
+sobald die Warteschlange nicht leer ist) — fuer OctoPrint/Creality/
+Formlabs gibt es keine Warteschlange, da diese Druckertypen keinen
+Druckversand per Dashboard-Upload unterstuetzen.
+
+**Reihenfolge:** der AELTESTE (=naechste) Auftrag steht **oben** — bewusst
+umgekehrt zum Verlauf, wo der NEUESTE oben steht (siehe [3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)).
+
+| Aktion | Wirkung |
+|---|---|
+| **▲ / ▼** | verschiebt einen Eintrag in der Warteschlange nach oben/unten |
+| **Zuweisen** | verschiebt den Eintrag in die Warteschlange eines **anderen** Druckers im Dashboard |
+| **Loeschen** | entfernt den Eintrag dauerhaft (Schaltflaeche/Symbol seit v2.1.0 durchgehend rot hinterlegt) |
+| **+ Datei hinzufuegen** | legt eine weitere Datei manuell in die Warteschlange — unabhaengig davon, ob der Drucker gerade beschaeftigt ist (fuer vorausschauendes Planen mehrerer Auftraege). Seit v2.1.0 kann die Datei alternativ auch per **Drag & Drop** auf die Drop-Zone im Warteschlangen-Fenster gezogen werden, genau wie auf die Drucker-Kachel selbst |
+| **Druckraum leer — naechsten senden** | sendet den obersten (aeltesten) Auftrag an den Drucker |
+
+**"Druckraum leer — naechsten senden":** gedacht zum Klicken, NACHDEM der
+laufende Druck fertig ist und das gedruckte Teil entnommen wurde. Bei
+Bambu erscheint danach ganz normal der AMS-Zuordnungsdialog (die
+Fach-Bestueckung kann sich seit dem Einreihen geaendert haben), bei
+Ultimaker startet der Druck sofort. Der Warteschlangen-Eintrag wird erst
+entfernt, wenn der Auftrag tatsaechlich erfolgreich gesendet wurde — ein
+Abbruch im AMS-Dialog oder ein Sendefehler verliert ihn also nicht, "Druckraum
+leer" kann dann einfach erneut geklickt werden.
+
+> ⚠️ **Bei Bambu Lab (seit v2.0.1) ist die Schaltflaeche erst klickbar,
+> wenn der Drucker WIRKLICH fertig ist** — der Status muss `FINISH`
+> (Druck soeben abgeschlossen) oder `IDLE` (Drucker hat noch gar nichts
+> gedruckt) sein. Solange der Drucker noch druckt, pausiert oder sich in
+> einem Uebergangszustand befindet (z. B. `PREPARE`/`SLICING`), bleibt der
+> Knopf ausgegraut und ein Hinweistext zeigt den aktuellen Status an —
+> das Dashboard aktualisiert das automatisch alle 2,5 Sekunden, ohne dass
+> das Fenster neu geoeffnet werden muss. Diese Pruefung erfolgt zusaetzlich
+> serverseitig, ein Klick auf einen deaktivierten Knopf kann den
+> Druckauftrag also nicht versehentlich vorzeitig auf den Drucker
+> schicken. Fuer Ultimaker gilt weiterhin die einfachere Regel "Drucker
+> ist nicht beschaeftigt".
+
+**Auftraege aus dem Verlauf hinzufuegen/zuweisen:** im Verlauf
+([3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)) legen die
+Schaltflaechen "In Warteschlange" bzw. "Zuweisen" einen bestehenden
+Verlaufseintrag zusaetzlich in eine Warteschlange, ohne den Verlaufs-
+eintrag selbst zu entfernen.
+
+Wird ein bereits im Verlauf vorhandener Auftrag ueber die Warteschlange
+tatsaechlich (erneut) gesendet, entsteht dabei **kein doppelter
+Verlaufseintrag** (siehe Hinweis in [3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6))
+— ausser er wird einem anderen Drucker zugewiesen, dort ist ein neuer
+Eintrag korrekt.
+
+> ⚠️ **Zuweisen an einen anderen Drucker (seit v2.1.0 eingeschraenkt):**
+> ein Verlaufs- oder Warteschlangen-Eintrag laesst sich nur einem Drucker
+> **desselben Typs** zuweisen (Bambu Lab → Bambu Lab, Ultimaker →
+> Ultimaker). Bei Bambu Lab zusaetzlich nur einem Drucker **derselben
+> Druckerfamilie** (siehe [4](#4-voraussetzungen-auf-seite-der-bambu-lab-drucker)),
+> also z. B. nur A1 untereinander oder nur X1 untereinander — ein fuer
+> eine X1 vorbereiteter Auftrag (Slicing/AMS-Zuordnung) passt nicht ohne
+> Weiteres auf eine A1. Die Auswahlliste im "Zuweisen"-Dialog zeigt von
+> vornherein nur passende Drucker an; die Pruefung erfolgt zusaetzlich
+> serverseitig.
 
 ## 4. Voraussetzungen auf Seite der Bambu Lab Drucker
 
@@ -454,13 +540,14 @@ Druckauftraege per Drag & Drop gibt es nur fuer **Bambu Lab** und
 | Aktuelle Datei | mit typspezifischer Bezeichnung (z. B. "Aktueller Waschzyklus" bei Wash L) |
 | Kamera | Bambu Lab, OctoPrint, Creality, Ultimaker |
 | AMS-Anzeige | Bambu Lab: Fuellstand je Fach als Balken (Farbe = Filamentfarbe) + Materialsorte |
-| Temperaturen | Duese/Bett bei Bambu/OctoPrint/Creality/Ultimaker; Kammer bei Bambu immer, bei Creality falls im Klipper-Setup konfiguriert (bei Ultimaker nicht verfuegbar — kein Sensor) |
+| Temperaturen | Duese/Bett bei Bambu/OctoPrint/Creality/Ultimaker; Kammer bei Bambu immer, bei Creality falls im Klipper-Setup konfiguriert (bei Ultimaker nicht verfuegbar — kein Sensor); Anzeige seit v2.1.0 immer auf max. 2 Nachkommastellen gerundet |
 | Material | Formlabs: aktuell geladenes Harz |
 | Restzeit | Bambu Lab, OctoPrint, Ultimaker |
 | Fehleranzeige | roter Klartext-Hinweis direkt auf der Karte bei Verbindungsproblemen |
 | Sensoren/Schalter | frei definierbar per zweitem MQTT-Broker ([3g](#3g-eigene-sensoren--schaltflaechen-per-zweitem-mqtt-broker)) |
 | **Druckauftrags-Verlauf** | **neu seit MK6** — automatischer Ordner je Drucker, Einsehen/Erneut drucken/Loeschen ([3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)) |
 | **Kartenlayout** | **neu seit MK6 v1.1.0** — wahlweise 1/2/3-spaltig, Auswahl je Browser gespeichert ([3i](#3i-kartenlayout-123-spaltig-neu-seit-mk6-v110)) |
+| **Warteschlange** | **neu seit MK6 v1.2.0** — Bambu Lab/Ultimaker: automatisches Einreihen bei beschaeftigtem Drucker, manuell bearbeitbar (Reihenfolge/Loeschen/Hinzufuegen), Zuweisen an andere Drucker ([3j](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)) |
 | Aktualisierung | automatisch alle 2,5 Sekunden im Browser |
 
 ## 6. Hinweise / Grenzen

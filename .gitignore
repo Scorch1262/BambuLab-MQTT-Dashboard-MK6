@@ -6,6 +6,10 @@ config.json
 # - Laufzeitdaten des jeweiligen Nutzers, kein Quellcode.
 print_history/
 
+# MK6 v1.2.0: lokale Warteschlange je Drucker (Dateien + Vorschaubilder,
+# siehe PrintQueueStore in app.py) - ebenfalls Laufzeitdaten, kein Quellcode.
+print_queue/
+
 # Python
 __pycache__/
 *.pyc

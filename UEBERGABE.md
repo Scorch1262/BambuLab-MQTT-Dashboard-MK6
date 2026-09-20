@@ -42,6 +42,9 @@ README.md                       <- ausführliche Nutzer-Doku (Setup, alle Drucke
 print_history/                  <- LAUFZEIT-Ordner (nicht im Repo, siehe .gitignore), automatisch
                                     angelegt neben der exe/app.py - ein Unterordner je Drucker-ID
                                     mit dessen Druckauftrags-Verlauf (seit MK6, siehe Abschnitt 5)
+print_queue/                    <- LAUFZEIT-Ordner (nicht im Repo, siehe .gitignore), analog zu
+                                    print_history/ - ein Unterordner je Drucker-ID mit dessen
+                                    Warteschlange (seit MK6 v1.2.0, siehe Abschnitt 5)
 ```
 
 `app.py` ist bewusst **eine einzige Datei** (mittlerweile > 4000 Zeilen):
@@ -2130,6 +2133,217 @@ daher meist, nur den Type-Tuple und die Frontend-Labels zu erweitern,
     (Syntaxpruefung des gesamten Frontend-JS, nicht nur des neuen Teils).
     Kein Hardware-Test noetig (rein clientseitige CSS/JS-Aenderung ohne
     neue Backend-Route).
+- **Warteschlange je Drucker (neu seit MK6 v1.2.0).** Groesstes MK6-
+  Feature seit dem Druckauftrags-Verlauf - siehe README Abschnitt 3j fuer
+  die Nutzersicht. Kernidee: ein Druckauftrag wird nur dann SOFORT an
+  einen Bambu-/Ultimaker-Drucker geschickt, wenn dieser gerade NICHT
+  beschaeftigt ist; ansonsten landet er in einer neuen, editierbaren
+  Warteschlange, die der Nutzer nach Fertigstellung des laufenden Drucks
+  per Knopfdruck weiterverarbeitet.
+  - **`PRINTER_BUSY_STATES`** (Modul-Konstante, direkt unter
+    `PRINT_HISTORY_MAX_JOBS`): dieselbe Zustandsmenge, die `stateClass()`
+    im Frontend fuer den "running"/"paused"-Badge nutzt (`RUNNING`,
+    `PRINTING`, `WASHING`, `CURING`, `BUSY`, `OPERATIONAL`, plus bewusst
+    `PAUSE`/`PAUSED` dazu - ein pausierter Druck belegt den Druckraum
+    weiterhin). `DashboardApp.is_printer_busy()` prueft `gcode_state` der
+    laufenden `PrinterConnection`/`UltimakerConnection` gegen diese Menge;
+    ein unbekannter/nicht verbundener Drucker gilt bewusst als NICHT
+    beschaeftigt (sonst waere er das faelschlich dauerhaft, solange noch
+    kein Status empfangen wurde - ein echtes Verbindungsproblem wird
+    ohnehin beim eigentlichen `send_print()` gemeldet).
+  - **`PrintQueueStore`** (neue Klasse, direkt nach `PrintHistoryStore`):
+    Ablage strukturell identisch zu `PrintHistoryStore`
+    (`print_queue/<drucker-id>/index.json` + `<job_id><endung>` +
+    optional `<job_id>.png`), mit EINEM bewussten Unterschied:
+    `add_entry()` haengt neue Eintraege am ENDE der Liste an (nicht vorne
+    wie beim Verlauf), damit Position 0 immer der AELTESTE/naechste
+    Auftrag ist - passend zur gewuenschten Anzeige "aeltester zuerst"
+    (Verlauf zeigt bewusst umgekehrt "neuester zuerst"). Zusaetzliches
+    Feld je Eintrag: optionales `history_ref` ({"printer_id","job_id"}) -
+    gesetzt, wenn der Auftrag urspruenglich aus einem Verlaufseintrag
+    stammt. Neue Methode `reorder(printer_id, ordered_job_ids)` validiert,
+    dass die uebergebene Menge an job_ids EXAKT der aktuellen Warteschlange
+    entspricht (sonst No-Op mit `False`-Rueckgabe) - verhindert Datenverlust
+    durch einen veralteten Reorder-Request (z. B. zwei gleichzeitig offene
+    Browser-Tabs).
+  - **Kein doppelter Verlaufseintrag beim Reprint (neue Anforderung):**
+    `PrintHistoryStore.touch_entry(printer_id, job_id)` aktualisiert einen
+    BESTEHENDEN Verlaufseintrag (Zeitstempel + an Position 0 verschoben),
+    OHNE einen neuen Eintrag anzulegen. `DashboardApp.
+    _record_history_after_send(job)` (neue gemeinsame Methode, ersetzt die
+    frueher in `start_confirm_print_job()`/`send_ultimaker_print_now()`
+    direkt aufgerufene `history.add_entry()`) entscheidet nach jedem
+    ERFOLGREICHEN Senden: `job["history_ref"]` gesetzt UND dessen
+    `printer_id` == Ziel-`printer_id` des gerade gesendeten Auftrags ->
+    `touch_entry()` (kein Duplikat); sonst -> normales `add_entry()` (neuer
+    Eintrag - korrekt, wenn der Auftrag einem ANDEREN Drucker zugewiesen
+    wurde, denn dort wurde ja tatsaechlich zum ersten Mal gedruckt). Direkt
+    im Anschluss: ist `job["queue_ref"]` gesetzt, wird dieser
+    Warteschlangen-Eintrag jetzt entfernt (`queue.delete_entry()`) - ERST
+    NACH bestaetigtem Erfolg, nicht schon beim Dequeuen (siehe naechster
+    Punkt).
+  - **`history_ref`/`queue_ref` durch den bestehenden Job-Fluss geschleift:**
+    `prepare_print_job()` und `send_ultimaker_print_now()` haben je zwei
+    neue optionale Parameter (`history_ref=None, queue_ref=None`), die im
+    `_print_jobs[job_id]`-Eintrag mitgespeichert (Bambu) bzw. per Closure
+    an den Worker-Thread weitergereicht werden (Ultimaker) - beide Wege
+    laufen am Ende durch `_record_history_after_send()`. Rueckwaertskompatibel:
+    beide Parameter sind optional, bestehende Aufrufstellen ohne diese
+    Argumente verhalten sich unveraendert (`history_ref=None` -> immer
+    `add_entry()`, wie vor v1.2.0).
+  - **`reprint_from_history()` erweitert:** prueft jetzt zuerst
+    `is_printer_busy()`. Beschaeftigt -> `queue.add_entry()` DIREKT mit der
+    Verlaufsdatei als Quelle (kein Zwischenkopieren in einen Temp-Ordner
+    noetig - `add_entry()` kopiert ohnehin, das Original im Verlauf bleibt
+    unangetastet), `history_ref` auf den eigenen Verlaufseintrag gesetzt,
+    Rueckgabe `{"mode": "queued", "queue_entry": {...}}`. NICHT
+    beschaeftigt -> wie bisher ueber `prepare_print_job()`/
+    `send_ultimaker_print_now()`, aber jetzt ebenfalls MIT `history_ref` -
+    auch ein direktes (nicht ueber die Warteschlange gelaufenes) "Erneut
+    drucken" soll den Verlaufseintrag nur aktualisieren, nicht verdoppeln.
+  - **`_copy_to_temp_job_dir(stored_path, filename)`** (neue
+    `@staticmethod`): extrahiert das vorher in `reprint_from_history()`
+    inline stehende "temporaeren Job-Ordner anlegen + Datei hineinkopieren"
+    - jetzt von `reprint_from_history()` UND `start_next_queued_print()`
+    gemeinsam genutzt, um Code-Duplikation zu vermeiden. Reines
+    Utility-Refactoring ohne Verhaltensaenderung.
+  - **`start_next_queued_print(printer_id)`** (neue Methode - "Druckraum
+    leer"-Knopf): prueft SICHERHEITSHALBER erneut `is_printer_busy()`
+    (verhindert einen versehentlichen Doppel-Klick waehrend eines noch
+    laufenden Drucks), nimmt dann den AELTESTEN Warteschlangen-Eintrag
+    (`entries[0]`), kopiert dessen Datei in einen frischen Temp-Ordner und
+    dispatcht - wortwoertlich identisch zu `reprint_from_history()` - an
+    `prepare_print_job()` (Bambu, AMS-Dialog erscheint erneut, da sich die
+    Bestueckung seit dem Einreihen geaendert haben kann) bzw.
+    `send_ultimaker_print_now()` (Ultimaker, sofortiger Druckstart). Der
+    Warteschlangen-Eintrag wird NICHT beim Dequeuen entfernt, sondern erst
+    von `_record_history_after_send()` nach bestaetigtem Erfolg - ein
+    Abbruch im AMS-Dialog oder ein Sendefehler verliert den Auftrag also
+    nicht aus der Warteschlange, "Druckraum leer" kann einfach erneut
+    geklickt werden.
+  - **Warteschlange manuell bearbeitbar:** `enqueue_upload()` (manueller
+    Datei-Upload direkt in die Warteschlange, unabhaengig vom Beschaeftigt-
+    Status - fuer vorausschauendes Planen), `reorder_print_queue()`
+    (duenner Wrapper um `queue.reorder()`), `delete_print_queue_entry()`.
+  - **Zuweisung an einen ANDEREN Drucker (neue Anforderung):**
+    `add_history_entry_to_queue(printer_id, job_id, target_printer_id)` -
+    kopiert einen Verlaufseintrag in die Warteschlange eines beliebigen
+    Ziel-Druckers (Default: der eigene, fuer "In Warteschlange legen"),
+    OHNE den Verlaufseintrag selbst zu entfernen; `history_ref` zeigt
+    weiterhin auf den URSPRUENGLICHEN Drucker, damit die Dedup-Logik oben
+    korrekt entscheidet (touch beim Ursprungsdrucker, add_entry bei jedem
+    anderen). `move_queue_entry(printer_id, job_id, target_printer_id)` -
+    VERSCHIEBT (nicht kopiert) einen Warteschlangen-Eintrag samt eventuell
+    vorhandenem `history_ref` in die Warteschlange eines anderen Druckers
+    und entfernt ihn aus der urspruenglichen.
+  - **Neue REST-Routen** (alle unter `/api/printers/<id>/...`): `GET
+    queue` (Liste, aeltester zuerst), `POST queue` (manueller Upload direkt
+    in die Warteschlange), `GET queue/<job_id>/thumbnail`, `DELETE
+    queue/<job_id>`, `POST queue/reorder` (Body `{"order": [job_id, ...]}`),
+    `POST queue/next` ("Druckraum leer"), `POST queue/<job_id>/assign`
+    (Body `{"target_printer_id": ...}`), `POST history/<job_id>/queue`
+    (Body optional `{"target_printer_id": ...}`, Default = eigener
+    Drucker). Bestehende Routen erweitert: `POST print/prepare` und `POST
+    ultimaker/print` pruefen jetzt zuerst `is_printer_busy()` und liefern
+    bei beschaeftigtem Drucker `{"mode": "queued", "queue_entry": {...}}`
+    statt den normalen AMS-Vorbereitungs-/Sofort-Druck-Antworten; `POST
+    history/<job_id>/reprint` kann jetzt ebenfalls `mode: "queued"`
+    liefern.
+  - **`all_status()` liefert `queue_count`** je Drucker (Laenge der
+    Warteschlangen-Liste) - fuer das Zaehl-Badge am Warteschlangen-Symbol
+    der Kachel, ueber denselben bestehenden 2,5-Sekunden-Poll (`GET
+    /api/status`), kein separater Endpunkt noetig.
+  - **Frontend:** neues Listen-Icon (`QUEUE_ICON`, `renderQueueIcon()`) NUR
+    auf Bambu-/Ultimaker-Karten (bewusste Scope-Entscheidung - nur diese
+    Typen unterstuetzen Druckversand per Dashboard-Upload). Neues Modal
+    `queueModal` (Liste mit ▲/▼-Sortier-Buttons, "Zuweisen", "Loeschen",
+    Datei-Upload-Button, "Druckraum leer"-Knopf). Neues generisches Modal
+    `assignModal` (Dropdown mit allen anderen Bambu-/Ultimaker-Druckern,
+    populiert aus `lastPrinterList` - der zuletzt von `refresh()`
+    abgerufenen Druckerliste, kein zusaetzlicher Request noetig) - von
+    sowohl Verlaufs- als auch Warteschlangen-Eintraegen aus aufrufbar
+    (`openAssignModal('history'|'queue', printerId, jobId)`). Verlaufs-
+    Modal um Sortier-Umschalter (`toggleHistorySort()`, rein clientseitige
+    Sortierung von `lastHistoryEntries` - kein erneuter Server-Request)
+    sowie "In Warteschlange"/"Zuweisen"-Buttons erweitert. `dzDrop()`/
+    `dzDropUltimaker()` behandeln jetzt `data.mode === 'queued'` (Toast
+    statt AMS-Dialog/Sofort-Druck-Polling).
+  - **Getestet (ohne echten Drucker):** vollstaendige Kette per Flask-Test-
+    Client + direktem Aufruf der `DashboardApp`-Methoden (`gcode_state`
+    einer `PrinterConnection` manuell auf `RUNNING`/`IDLE` gesetzt, um
+    Beschaeftigt-/Idle-Zustaende zu simulieren, da kein echter Drucker
+    verfuegbar ist): Upload waehrend Idle -> normaler `/print/prepare`-Ablauf
+    (kein `mode`-Feld); Upload waehrend Busy -> `mode: "queued"`, Datei
+    landet nachweislich in der Warteschlange, urspruengliche Temp-Datei
+    wird aufgeraeumt; `queue/next` waehrend Busy liefert Fehler (kein
+    Absenden); `queue/next` waehrend Idle dispatcht korrekt an
+    `prepare_print_job()`, Eintrag bleibt bis zum bestaetigten Erfolg
+    erhalten (nach `cancel_print_job()` weiterhin in der Warteschlange
+    vorhanden); Reorder mit korrekter/inkorrekter Job-id-Menge (Validierung
+    greift); Loeschen; `move_queue_entry()` verschiebt nachweislich
+    zwischen zwei Druckern (Quelle leer danach, Ziel hat den Eintrag);
+    `_record_history_after_send()` direkt getestet: gleicher Zieldrucker
+    wie `history_ref` -> `touch_entry()` (Eintragszahl bleibt bei 1, kein
+    Duplikat), ANDERER Zieldrucker -> neuer Eintrag dort, Quelle
+    unveraendert; `queue_ref` wird nach simuliertem Erfolg korrekt aus der
+    Warteschlange entfernt. Zusaetzlich `python3 -m py_compile app.py`,
+    `node --check` auf dem gesamten extrahierten `<script>`-Block, sowie
+    ein Flask-Test-Client-Check, dass `GET /` alle neuen HTML-/JS-Marker
+    enthaelt (Modals, Funktionen, Icon). Kein Test gegen echte Hardware
+    noetig/moeglich, da FTPS-Upload und MQTT-Druckstart bereits durch die
+    bestehenden, unveraendert wiederverwendeten Funktionen
+    (`prepare_print_job()`/`send_ultimaker_print_now()`) abgedeckt sind.
+- **"Druckraum leer" bei Bambu Lab: strengere Bereitschaftspruefung (seit
+  v2.0.1).** Bis v1.2.0 durfte die Warteschlange fortgesetzt werden,
+  sobald der Drucker NICHT in `PRINTER_BUSY_STATES` war - das schloss
+  Uebergangszustaende wie `PREPARE`/`SLICING` (Drucker raeumt intern noch
+  auf/bereitet sich vor, ist aber noch nicht wirklich fertig) faelschlich
+  mit ein. Auf expliziten Nutzerwunsch verlangt Bambu Lab jetzt EXPLIZIT
+  einen der `BAMBU_READY_FOR_NEXT_STATES` (`FINISH` oder `IDLE`) - neue
+  Konstante direkt unter `PRINTER_BUSY_STATES`.
+  - **`DashboardApp.is_ready_for_next_print(printer_id)`** (neue Methode,
+    ersetzt NUR fuer `start_next_queued_print()` die bisherige
+    `is_printer_busy()`-Pruefung - `is_printer_busy()` selbst bleibt
+    unveraendert und wird weiterhin fuer die Auto-Warteschlangen-
+    Entscheidung beim Upload/Reprint verwendet, siehe Kommentar an der
+    Methode): bei Bambu Lab `gcode_state in BAMBU_READY_FOR_NEXT_STATES`,
+    bei allen anderen Typen (aktuell nur Ultimaker relevant) unveraendert
+    `not is_printer_busy()` - der Nutzer hat die Verschaerfung
+    ausdruecklich nur fuer "bambulab" verlangt.
+  - **`start_next_queued_print()`** ruft jetzt `is_ready_for_next_print()`
+    statt `is_printer_busy()` auf und liefert bei Bambu Lab eine
+    spezifischere Fehlermeldung ("...Status muss FINISH oder IDLE
+    sein...").
+  - **Frontend:** neuer Button `id="queueSendNextBtn"` + Hinweistext
+    `id="queueSendHint"` im `queueModal`. Neue Funktion
+    `updateQueueSendButtonState()` spiegelt dieselbe Logik client-seitig
+    (JS-Konstante `PRINTER_BUSY_STATES_JS` als Spiegel von
+    `PRINTER_BUSY_STATES` - bei Aenderung dort auch hier nachziehen) und
+    deaktiviert den Knopf, solange der Drucker (bei Bambu: Status nicht
+    `FINISH`/`IDLE`) nicht bereit ist ODER die Warteschlange leer ist -
+    inkl. Hinweistext mit dem aktuellen Status. Wird sowohl beim
+    Oeffnen/Aktualisieren des Warteschlangen-Modals als auch bei JEDEM
+    regulaeren 2,5-Sekunden-Status-Poll (`refresh()`) neu ausgewertet,
+    solange das Modal offen ist - der Knopf wird also automatisch aktiv,
+    sobald der Druck fertig ist, ohne dass der Nutzer das Modal schliessen
+    und neu oeffnen muss. Die serverseitige Pruefung in
+    `start_next_queued_print()` bleibt in jedem Fall zusaetzlich bestehen
+    (Client-Deaktivierung ist Komfort, keine alleinige Absicherung).
+  - **`APP_VERSION` 1.2.0 -> 2.0.1** auf ausdruecklichen Wunsch des
+    Nutzers (als Gesamtsumme mehrerer MK6-Aenderungen), nicht ueber die
+    sonst uebliche Automatik (README Abschnitt 0a) hergeleitet - im Code
+    per Kommentar direkt bei `APP_VERSION` dokumentiert.
+  - **Getestet:** direkte Methodentests fuer `is_ready_for_next_print()`/
+    `start_next_queued_print()` mit `gcode_state` manuell auf `RUNNING`,
+    `PREPARE` (Uebergangszustand, bewusst NICHT in `PRINTER_BUSY_STATES`,
+    aber trotzdem als "nicht bereit" bestaetigt), `FINISH` und `IDLE`
+    gesetzt - jeweils erwartetes Verhalten (abgelehnt/abgelehnt/
+    dispatcht/bereit) verifiziert; Ultimaker-Verhalten unveraendert
+    bestaetigt (busy/idle weiterhin ausreichend). Zusaetzlich `python3 -m
+    py_compile app.py`, `node --check` auf dem vollstaendigen extrahierten
+    `<script>`-Block, sowie ein Flask-Test-Client-Check, dass `GET /` die
+    neuen Marker (`queueSendNextBtn`, `queueSendHint`,
+    `updateQueueSendButtonState`, `PRINTER_BUSY_STATES_JS`) enthaelt.
 
 ---
 
@@ -2452,6 +2666,75 @@ Learned) - sie wird hier nicht dupliziert, nur fortgesetzt.
   Modus), unabhaengig von der Fensterbreite. Siehe Abschnitt 5
   (Unterabschnitt "Kartenlayout 1/2/3-spaltig") fuer die vollstaendige
   technische Beschreibung und den Testumfang.
+- **v1.2.0 (MK6):** Neues Feature (kein Bugfix, rein additiv): **Warte-
+  schlange je Drucker** fuer Bambu Lab/Ultimaker. Ein Druckauftrag wird
+  nur noch sofort gesendet, wenn der Drucker gerade NICHT beschaeftigt
+  ist (`PRINTER_BUSY_STATES`/`is_printer_busy()`) - sonst landet er in
+  einer neuen, editierbaren Warteschlange (`PrintQueueStore`), die per
+  "Druckraum leer"-Knopf (`start_next_queued_print()`) nach Abschluss des
+  laufenden Drucks weiterverarbeitet wird. Reihenfolge aeltester zuerst
+  (bewusst umgekehrt zum Verlauf). Zusaetzlich: manuelles Hinzufuegen/
+  Umsortieren/Loeschen in der Warteschlange, Uebernahme von Verlaufs-
+  eintraegen in eine Warteschlange, Zuweisen von Verlaufs-/Warteschlangen-
+  Eintraegen an einen ANDEREN Drucker im Dashboard, alphabetische
+  Sortierung im Verlauf umschaltbar, sowie ein Dedup-Mechanismus
+  (`PrintHistoryStore.touch_entry()`/`DashboardApp.
+  _record_history_after_send()`), der verhindert, dass ein an DENSELBEN
+  Drucker erneut gesendeter Verlaufseintrag doppelt im Verlauf auftaucht.
+  Siehe Abschnitt 5 (Unterabschnitt "Warteschlange je Drucker") fuer die
+  vollstaendige technische Beschreibung und den Testumfang.
+- **v2.0.1 (MK6):** Verhaltensverfeinerung (kein Bugfix, additiv): bei
+  Bambu Lab darf die Warteschlange erst fortgesetzt werden ("Druckraum
+  leer"-Knopf), wenn der Drucker EXPLIZIT den Status `FINISH` oder `IDLE`
+  meldet (`BAMBU_READY_FOR_NEXT_STATES`/`DashboardApp.
+  is_ready_for_next_print()`) - bisher reichte "nicht in
+  `PRINTER_BUSY_STATES`", was Uebergangszustaende wie `PREPARE`/`SLICING`
+  faelschlich zuliess. Der Knopf im Frontend ist jetzt bis dahin
+  deaktiviert (`updateQueueSendButtonState()`, live aktualisiert ueber den
+  bestehenden 2,5-Sekunden-Status-Poll) statt erst beim Klick einen
+  Serverfehler zu melden. Ultimaker-Verhalten unveraendert. Versionssprung
+  1.2.0 -> 2.0.1 auf ausdruecklichen Nutzerwunsch (Gesamtsumme mehrerer
+  MK6-Aenderungen), nicht nach der sonst ueblichen Automatik hergeleitet.
+  Siehe Abschnitt 5 (Unterabschnitt ""Druckraum leer" bei Bambu Lab:
+  strengere Bereitschaftspruefung") fuer die vollstaendige technische
+  Beschreibung und den Testumfang.
+- **v2.1.0 (MK6):** Vier additive Verbesserungen, keine davon ein Bugfix:
+  1. **Drag & Drop in die Warteschlange:** die Drop-Zone im Warteschlangen-
+     Fenster (`#queueDropZone`) nimmt Dateien jetzt genau wie die Drucker-
+     Kachel selbst per Drag & Drop entgegen (`dzDropQueue()`), zusaetzlich
+     zum bestehenden Datei-Auswahl-Button. Beide Wege teilen sich jetzt die
+     Upload-Logik ueber die neue gemeinsame Funktion `uploadFileToQueue()`
+     (vorher nur in `addFileToQueue()` enthalten). Client-seitige
+     Endungspruefung anhand des Druckertyps des offenen Modals (`.gcode.3mf`
+     bei Bambu, `.gcode` bei Ultimaker), serverseitige Pruefung unveraendert.
+  2. **Loesch-Schaltflaechen/-Symbole durchgehend rot:** `.del-icon` ist
+     jetzt permanent (nicht erst bei Hover) in der Warnfarbe `--danger`
+     eingefaerbt; die "Loeschen"-Knoepfe in Verlauf/Warteschlange nutzen
+     dafuer eine neue, eigene CSS-Klasse `.btn-mini.btn-delete` - bewusst
+     NICHT die bestehende `.btn-mini.off`, da diese auch fuer den
+     unabhaengigen "Aus"-Knopf eines Sensoren/Schalter-Eintrags
+     (`renderExtras()`) verwendet wird, der fachlich keine destruktive
+     Aktion ist und daher nicht rot werden soll.
+  3. **Temperaturanzeige auf max. 2 Nachkommastellen gerundet:** neue
+     JS-Hilfsfunktion `formatTemp(v)` (Duesen-/Bett-/Kammertemperatur bei
+     allen unterstuetzten Druckertypen), da einzelne Backends (v. a.
+     Bambu-MQTT) Werte mit deutlich mehr Nachkommastellen liefern, als fuer
+     die Anzeige sinnvoll ist. Rein darstellungsseitig, keine Aenderung an
+     gespeicherten/uebertragenen Rohwerten.
+  4. **Zuweisen nur innerhalb derselben Bambu-Druckerfamilie:** ein
+     Verlaufs- oder Warteschlangen-Eintrag kann nur noch einem Drucker
+     DESSELBEN Typs zugewiesen werden, bei Bambu Lab zusaetzlich nur
+     einem Drucker derselben `bambu_family` (z. B. nur A1 untereinander,
+     nur X1 untereinander) - ein fuer eine Familie vorbereiteter
+     Druckauftrag (Slicing/AMS-Zuordnung) ist auf einer anderen nicht
+     ohne Weiteres gueltig. Umgesetzt ueber eine neue gemeinsame
+     Backend-Pruefung `DashboardApp._validate_assign_target()`, angewendet
+     in `add_history_entry_to_queue()` und `move_queue_entry()`;
+     `all_status()` liefert dafuer neu `bambu_family` je Bambu-Drucker
+     mit, das Frontend (`openAssignModal()`) filtert die Zielauswahl
+     bereits clientseitig entsprechend vor.
+  Siehe Abschnitt 5 (Unterabschnitt "Warteschlange je Drucker") fuer die
+  Einordnung dieser Erweiterungen in den Gesamtkontext des Feature.
 
 **Regel für die Weiterarbeit (unveraendert seit MK5): bei jeder
 ausgelieferten Änderung `APP_VERSION` in `app.py` erhöhen (semantisch:

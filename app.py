@@ -41,7 +41,11 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Abschnitt 9) - die Detail-Historie von MK5 (1.0.0-1.6.8) bleibt in der
 # MK5-UEBERGABE.md dokumentiert, gilt aber technisch unveraendert weiter
 # fort (MK6 ist ein additiver Fortsatz von MK5 v1.6.8, kein Rewrite).
-APP_VERSION = "1.1.0"
+#
+# Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
+# Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
+# README Abschnitt 0a beschriebenen Automatik hergeleitet).
+APP_VERSION = "2.1.0"
 
 import os
 import sys
@@ -143,6 +147,32 @@ KNOWN_TYPES = ("bambu",) + FORMLABS_TYPES + ("octoprint",) + CREALITY_TYPES + ("
 # Nutzer manuell hineinschauen moechte.
 # ----------------------------------------------------------------------
 PRINT_HISTORY_MAX_JOBS = 30  # aelteste Eintraege werden je Drucker automatisch entfernt
+
+# MK6 v1.2.0: Zustaende, in denen ein Drucker als "beschaeftigt" gilt (ein
+# Druckauftrag belegt gerade den Druckraum) - dieselbe Zustandsmenge wie
+# stateClass() im Frontend fuer den "running"/"paused"-Badge verwendet,
+# hier aber fuer eine Backend-Entscheidung: neue Druckauftraege werden in
+# diesem Zustand NICHT an den Drucker geschickt, sondern in dessen
+# Warteschlange gelegt (siehe PrintQueueStore, DashboardApp.
+# is_printer_busy()/enqueue_upload()/start_next_queued_print()). PAUSE/
+# PAUSED zaehlt bewusst mit dazu - der vorherige Auftrag ist dann noch
+# nicht abgeschlossen, der Druckraum also weiterhin belegt.
+PRINTER_BUSY_STATES = {
+    "RUNNING", "PRINTING", "WASHING", "CURING", "BUSY", "OPERATIONAL",
+    "PAUSE", "PAUSED",
+}
+
+# v2.0.1: Fuer Bambu Lab reicht "nicht in PRINTER_BUSY_STATES" allein NICHT
+# aus, um die Warteschlange fortzusetzen ("Druckraum leer") - dazwischen
+# liegende Uebergangszustaende wie z. B. "PREPARE"/"SLICING" (Drucker
+# bereitet bereits den naechsten, ihm intern bekannten Vorgang vor bzw.
+# raeumt noch auf) sind zwar nicht in PRINTER_BUSY_STATES, aber ebenfalls
+# NICHT "fertig". DashboardApp.is_ready_for_next_print() verlangt bei
+# Bambu deshalb EXPLIZIT einen dieser beiden Zustaende: "FINISH" (Druck
+# soeben abgeschlossen) oder "IDLE" (Drucker war zuvor gar nicht am
+# Drucken - z. B. frisch gestarteter/verbundener Drucker mit bereits
+# vorbefuellter Warteschlange).
+BAMBU_READY_FOR_NEXT_STATES = {"FINISH", "IDLE"}
 
 
 def _extract_thumbnail(local_path: str, filename: str):
@@ -319,6 +349,195 @@ class PrintHistoryStore:
             entries = [e for e in entries if e.get("job_id") != job_id]
             self._save_index(printer_id, entries)
         self._delete_files(printer_id, match)
+        return True
+
+    def _delete_files(self, printer_id: str, entry: dict) -> None:
+        job_dir = self.dir_for(printer_id)
+        job_id = entry.get("job_id")
+        for suffix in (entry.get("file_ext", ".job"), ".png"):
+            try:
+                os.remove(os.path.join(job_dir, f"{job_id}{suffix}"))
+            except Exception:
+                pass
+
+    def touch_entry(self, printer_id: str, job_id: str) -> bool:
+        """MK6 v1.2.0: Aktualisiert einen BESTEHENDEN Verlaufseintrag auf
+        "jetzt gesendet" und verschiebt ihn an die oberste (=neueste)
+        Stelle, OHNE einen zusaetzlichen Eintrag anzulegen oder Dateien
+        erneut zu kopieren. Wird verwendet, wenn ein bereits im Verlauf
+        vorhandener Auftrag ERNEUT an DENSELBEN Drucker gesendet wird
+        (direktes "Erneut drucken" oder ueber die Warteschlange mit
+        gesetztem history_ref) - ohne dies wuerde derselbe Druckauftrag ein
+        zweites Mal in der Liste auftauchen (siehe DashboardApp.
+        _record_history_after_send())."""
+        with self._lock:
+            entries = self._load_index(printer_id)
+            match = next((e for e in entries if e.get("job_id") == job_id), None)
+            if not match:
+                return False
+            match["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entries = [e for e in entries if e.get("job_id") != job_id]
+            entries.insert(0, match)
+            self._save_index(printer_id, entries)
+        return True
+
+
+# ----------------------------------------------------------------------
+# MK6 v1.2.0 NEUES FEATURE: Warteschlange je Drucker - wird beim
+# Hochladen eines Druckauftrags befuellt, wenn der Ziel-Drucker gerade
+# beschaeftigt ist (siehe PRINTER_BUSY_STATES/DashboardApp.
+# is_printer_busy()), statt den Auftrag sofort zu senden. Der Nutzer kann
+# die Warteschlange einsehen, umsortieren, Eintraege loeschen, manuell
+# weitere Auftraege (auch aus dem Verlauf, auch fuer einen ANDEREN
+# Drucker) hinzufuegen, und nach Fertigstellung des laufenden Drucks per
+# Schaltflaeche ("Druckraum leer") den jeweils aeltesten Auftrag an den
+# Drucker senden lassen. Siehe README Abschnitt 3j und UEBERGABE.md
+# Abschnitt 5 fuer die vollstaendige Beschreibung.
+# ----------------------------------------------------------------------
+class PrintQueueStore:
+    """Verwaltet pro Drucker eine Warteschlange noch nicht gesendeter
+    Druckauftraege. Ablage-Struktur bewusst identisch zu
+    PrintHistoryStore (job_id-Praefix je Datei + ein gemeinsames
+    index.json je Drucker-Ordner), mit EINEM wichtigen Unterschied in der
+    Reihenfolge: neue Eintraege werden hier am ENDE der Liste angehaengt
+    (nicht vorne eingefuegt wie beim Verlauf), so dass Position 0 immer
+    der AELTESTE und damit naechste zu druckende Auftrag ist - passend
+    zur gewuenschten Anzeige-Reihenfolge "aeltester/naechster zuerst".
+
+    Jeder Eintrag kann optional ein "history_ref"-Feld tragen
+    ({"printer_id":..., "job_id":...}), gesetzt, wenn der Auftrag
+    urspruenglich aus einem Verlaufseintrag stammt (Reprint waehrend der
+    Zieldrucker beschaeftigt war, oder bewusst per "In Warteschlange
+    legen"/"Zuweisen" aus dem Verlauf hinzugefuegt). Beim tatsaechlichen
+    Senden wertet DashboardApp._record_history_after_send() dieses Feld
+    aus, damit derselbe Auftrag nicht doppelt im Verlauf auftaucht.
+
+    Ablage: "<Ordner der exe/des Skripts>/print_queue/<drucker_id>/"."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def dir_for(self, printer_id: str) -> str:
+        d = os.path.join(base_dir(), "print_queue", printer_id)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def ensure_dir(self, printer_id: str) -> None:
+        self.dir_for(printer_id)
+
+    def _index_path(self, printer_id: str) -> str:
+        return os.path.join(self.dir_for(printer_id), "index.json")
+
+    def _load_index(self, printer_id: str) -> list:
+        path = self._index_path(printer_id)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_index(self, printer_id: str, entries: list) -> None:
+        path = self._index_path(printer_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def list_entries(self, printer_id: str) -> list:
+        """Aeltester (=naechster) Auftrag zuerst - siehe Klassenkommentar."""
+        with self._lock:
+            return self._load_index(printer_id)
+
+    def get_entry(self, printer_id: str, job_id: str):
+        for e in self.list_entries(printer_id):
+            if e.get("job_id") == job_id:
+                return e
+        return None
+
+    def add_entry(self, printer_id: str, local_path: str, filename: str, history_ref: dict = None):
+        """Kopiert `local_path` in den Warteschlangen-Ordner (das Original
+        wird hier NICHT geloescht/verschoben - das entscheidet die
+        aufrufende Stelle, siehe DashboardApp.enqueue_upload() vs.
+        reprint_from_history()) und haengt den neuen Eintrag am ENDE der
+        Liste an. Best effort wie PrintHistoryStore.add_entry() - ein
+        Fehler wird nur geloggt (still verworfen), damit ein bereits
+        erfolgreich hochgeladenes/laufendes Verhalten nicht nachtraeglich
+        als Fehler erscheint."""
+        try:
+            job_id = uuid.uuid4().hex
+            job_dir = self.dir_for(printer_id)
+            ext = ".gcode.3mf" if filename.lower().endswith(".gcode.3mf") else (os.path.splitext(filename)[1] or ".job")
+            stored_path = os.path.join(job_dir, f"{job_id}{ext}")
+            shutil.copyfile(local_path, stored_path)
+
+            has_image = False
+            try:
+                thumb = _extract_thumbnail(local_path, filename)
+                if thumb:
+                    with open(os.path.join(job_dir, f"{job_id}.png"), "wb") as f:
+                        f.write(thumb)
+                    has_image = True
+            except Exception:
+                has_image = False
+
+            entry = {
+                "job_id": job_id,
+                "filename": filename,
+                "file_ext": ext,
+                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "has_image": has_image,
+                "history_ref": history_ref,
+            }
+            with self._lock:
+                entries = self._load_index(printer_id)
+                entries.append(entry)
+                self._save_index(printer_id, entries)
+            return entry
+        except Exception:
+            return None
+
+    def get_job_file_path(self, printer_id: str, job_id: str):
+        entry = self.get_entry(printer_id, job_id)
+        if not entry:
+            return None, None
+        path = os.path.join(self.dir_for(printer_id), f"{job_id}{entry['file_ext']}")
+        return (path, entry["filename"]) if os.path.exists(path) else (None, None)
+
+    def get_thumbnail_path(self, printer_id: str, job_id: str):
+        entry = self.get_entry(printer_id, job_id)
+        if not entry or not entry.get("has_image"):
+            return None
+        path = os.path.join(self.dir_for(printer_id), f"{job_id}.png")
+        return path if os.path.exists(path) else None
+
+    def delete_entry(self, printer_id: str, job_id: str) -> bool:
+        with self._lock:
+            entries = self._load_index(printer_id)
+            match = next((e for e in entries if e.get("job_id") == job_id), None)
+            if not match:
+                return False
+            entries = [e for e in entries if e.get("job_id") != job_id]
+            self._save_index(printer_id, entries)
+        self._delete_files(printer_id, match)
+        return True
+
+    def reorder(self, printer_id: str, ordered_job_ids: list) -> bool:
+        """Setzt eine vollstaendig neue Reihenfolge (z. B. nach Verschieben
+        eines Eintrags per Pfeil-Buttons im Frontend). `ordered_job_ids`
+        muss GENAU dieselbe Menge an job_ids enthalten wie die aktuelle
+        Warteschlange, sonst wird NICHTS geaendert - verhindert, dass ein
+        veralteter/unvollstaendiger Reorder-Request (z. B. zwei Browser-
+        Tabs gleichzeitig offen) Eintraege verliert."""
+        with self._lock:
+            entries = self._load_index(printer_id)
+            by_id = {e.get("job_id"): e for e in entries}
+            if set(by_id.keys()) != set(ordered_job_ids) or len(ordered_job_ids) != len(entries):
+                return False
+            new_entries = [by_id[jid] for jid in ordered_job_ids]
+            self._save_index(printer_id, new_entries)
         return True
 
     def _delete_files(self, printer_id: str, entry: dict) -> None:
@@ -2279,11 +2498,13 @@ class DashboardApp:
         self.cfg = load_config()
         self.connections = {}
         self.history = PrintHistoryStore()
+        self.queue = PrintQueueStore()  # MK6 v1.2.0: siehe PrintQueueStore-Kommentar
         self.extras = ExtrasMqttManager(self.cfg)
         self.extras.start()
         for p in self.cfg["printers"]:
             self._start_printer(p)
-        self._print_jobs = {}          # job_id -> {local_path, remote_name, printer_id, created}
+        self._print_jobs = {}          # job_id -> {local_path, remote_name, printer_id, created,
+                                        #            history_ref, queue_ref} (letzte zwei: MK6 v1.2.0)
         self._print_jobs_lock = threading.Lock()
         self._print_progress = {}      # job_id -> {phase, sent, total, percent, error, ams}
         self._print_progress_lock = threading.Lock()
@@ -2300,6 +2521,7 @@ class DashboardApp:
         # aus config.json geladene als auch ueber add_printer() neu
         # angelegte Drucker ab, da beide Wege ueber diese Methode laufen.
         self.history.ensure_dir(printer_cfg["id"])
+        self.queue.ensure_dir(printer_cfg["id"])  # MK6 v1.2.0: siehe PrintQueueStore-Kommentar
         ptype = printer_cfg.get("type", "bambu")
         if ptype in FORMLABS_TYPES:
             conn = FormlabsLocalApiConnection(printer_cfg, self.cfg.get("preform_server"))
@@ -2400,6 +2622,17 @@ class DashboardApp:
             item["extras"] = self._resolve_extras(p)
             if p.get("type") == "ultimaker":
                 item["ultimaker_paired"] = bool(p.get("ultimaker_auth_id") and p.get("ultimaker_auth_key"))
+            # MK6 v2.1.0: Druckerfamilie (x1/a1/h2/...) fuer Bambu-Lab-Drucker
+            # mitliefern, damit das Frontend beim Zuweisen (openAssignModal)
+            # nur Drucker derselben Familie als Ziel anbietet.
+            if p.get("type", "bambu") == "bambu":
+                item["bambu_family"] = p.get("bambu_family", "x1")
+            # MK6 v1.2.0: Anzahl wartender Auftraege, fuer das Badge am
+            # Warteschlangen-Symbol der Kachel - wird ueber denselben
+            # 2,5-Sekunden-Status-Poll mitgeliefert, kein eigener Endpunkt
+            # noetig. Guenstig genug (kleine JSON-Datei einlesen), um bei
+            # jedem Status-Abruf frisch berechnet zu werden.
+            item["queue_count"] = len(self.queue.list_entries(p["id"]))
             out.append(item)
         return out
 
@@ -2448,7 +2681,7 @@ class DashboardApp:
             with self._print_progress_lock:
                 self._print_progress.pop(jid, None)
 
-    def prepare_print_job(self, printer_id, local_path, remote_name):
+    def prepare_print_job(self, printer_id, local_path, remote_name, history_ref=None, queue_ref=None):
         p = self.get_printer_cfg(printer_id)
         if not p:
             return False, "Drucker nicht gefunden.", None, None
@@ -2468,6 +2701,12 @@ class DashboardApp:
                 "remote_name": remote_name,
                 "printer_id": printer_id,
                 "created": time.time(),
+                # MK6 v1.2.0: siehe _record_history_after_send() - history_ref
+                # verhindert einen doppelten Verlaufseintrag bei Reprint/
+                # Warteschlange, queue_ref entfernt den urspruenglichen
+                # Warteschlangen-Eintrag erst NACH bestaetigtem Erfolg.
+                "history_ref": history_ref,
+                "queue_ref": queue_ref,
             }
         return True, None, job_id, preview
 
@@ -2519,10 +2758,11 @@ class DashboardApp:
                 ams_summary = conn.send_print(job["local_path"], job["remote_name"], mapping, on_progress=on_progress)
                 self._set_progress(job_id, phase="done", sent=total_size, total=total_size, percent=100, ams=ams_summary)
                 # MK6: erfolgreich gesendeten Auftrag in den Verlauf des
-                # Druckers uebernehmen, BEVOR die temporaere Datei unten
-                # per _cleanup_job_file() geloescht wird (add_entry()
-                # kopiert die Datei, ruehrt das Original also nicht an).
-                self.history.add_entry(job["printer_id"], job["local_path"], job["remote_name"])
+                # Druckers uebernehmen (bzw. bei Reprint/Warteschlange nur
+                # den bestehenden Eintrag aktualisieren - siehe
+                # _record_history_after_send()), BEVOR die temporaere Datei
+                # unten per _cleanup_job_file() geloescht wird.
+                self._record_history_after_send(job)
                 with self._print_jobs_lock:
                     self._print_jobs.pop(job_id, None)
                 self._cleanup_job_file(job)
@@ -2548,6 +2788,95 @@ class DashboardApp:
             os.rmdir(os.path.dirname(job["local_path"]))
         except Exception:
             pass
+
+    def _record_history_after_send(self, job):
+        """MK6 v1.2.0: gemeinsame Verlaufs-/Warteschlangen-Buchfuehrung
+        NACH erfolgreichem Senden, verwendet von start_confirm_print_job()
+        (Bambu) und send_ultimaker_print_now() (Ultimaker).
+
+        - Traegt den Auftrag normalerweise als NEUEN Eintrag in den
+          Verlauf des Zieldruckers ein (history.add_entry()).
+        - AUSSER `job["history_ref"]` verweist auf einen Verlaufseintrag
+          DESSELBEN Druckers (job["history_ref"]["printer_id"] ==
+          job["printer_id"]) - dann wird stattdessen NUR dieser bestehende
+          Eintrag aktualisiert (history.touch_entry()), damit ein erneut
+          gedruckter Verlaufseintrag nicht ein zweites Mal in der Liste
+          auftaucht. Wurde der Auftrag hingegen einem ANDEREN Drucker
+          zugewiesen, ist ein neuer Eintrag in DESSEN Verlauf korrekt (er
+          wurde dort schliesslich tatsaechlich gedruckt).
+        - War der Auftrag Teil einer Warteschlange (`job["queue_ref"]`
+          gesetzt), wird der Warteschlangen-Eintrag jetzt entfernt - ERST
+          NACH bestaetigtem Erfolg, damit ein fehlgeschlagener/
+          abgebrochener Versuch ihn nicht verliert (siehe start_
+          next_queued_print()-Kommentar: "Druckraum leer" kann dann
+          einfach erneut geklickt werden)."""
+        printer_id = job["printer_id"]
+        history_ref = job.get("history_ref")
+        if history_ref and history_ref.get("printer_id") == printer_id:
+            self.history.touch_entry(history_ref["printer_id"], history_ref["job_id"])
+        else:
+            self.history.add_entry(printer_id, job["local_path"], job["remote_name"])
+        queue_ref = job.get("queue_ref")
+        if queue_ref:
+            self.queue.delete_entry(queue_ref["printer_id"], queue_ref["job_id"])
+
+    def is_printer_busy(self, printer_id) -> bool:
+        """MK6 v1.2.0: True, wenn der Druckraum dieses Druckers gerade
+        belegt ist (siehe PRINTER_BUSY_STATES) - entscheidet, ob ein neu
+        hochgeladener/erneut gestarteter Druckauftrag sofort gesendet
+        oder stattdessen in die Warteschlange gelegt wird. Unbekannte/
+        nicht verbundene Drucker gelten bewusst als NICHT beschaeftigt
+        (liefert sonst widerspruechlich immer "beschaeftigt", solange der
+        Status noch nicht einmal einmal empfangen wurde) - ein
+        tatsaechliches Verbindungsproblem wird ohnehin an anderer Stelle
+        (send_print()) gemeldet."""
+        conn = self.connections.get(printer_id)
+        if not conn:
+            return False
+        state = str(conn.status.get("gcode_state") or "").upper()
+        return state in PRINTER_BUSY_STATES
+
+    def is_ready_for_next_print(self, printer_id) -> bool:
+        """v2.0.1: Gibt an, ob die Warteschlange dieses Druckers jetzt
+        fortgesetzt werden darf ("Druckraum leer"-Knopf). Bei Bambu Lab
+        strenger als is_printer_busy(): reicht "nicht beschaeftigt" allein
+        NICHT - verlangt EXPLIZIT einen der BAMBU_READY_FOR_NEXT_STATES
+        ("FINISH" oder "IDLE"), siehe Kommentar dort. Uebergangszustaende
+        wie "PREPARE"/"SLICING" gelten damit bewusst NICHT als bereit,
+        obwohl sie nicht in PRINTER_BUSY_STATES stehen. Fuer alle anderen
+        Druckertypen (aktuell nur Ultimaker relevant, da nur diese Typen
+        eine Warteschlange haben) bleibt es bei der bisherigen, einfachen
+        Regel "nicht beschaeftigt" - dafuer wurde keine Verschaerfung
+        angefragt."""
+        p = self.get_printer_cfg(printer_id)
+        ptype = p.get("type", "bambu") if p else "bambu"
+        if ptype == "bambu":
+            conn = self.connections.get(printer_id)
+            if not conn:
+                return False
+            state = str(conn.status.get("gcode_state") or "").upper()
+            return state in BAMBU_READY_FOR_NEXT_STATES
+        return not self.is_printer_busy(printer_id)
+
+    @staticmethod
+    def _copy_to_temp_job_dir(stored_path, filename):
+        """Kopiert eine dauerhaft gespeicherte Datei (Verlauf oder
+        Warteschlange) in einen frischen temporaeren Job-Ordner, wie ihn
+        prepare_print_job()/send_ultimaker_print_now() fuer jeden Upload
+        erwarten. Wirft bei einem Fehler weiter (Aufrufer entscheidet
+        ueber die Fehlermeldung) - raeumt den halb angelegten Ordner dabei
+        aber auf."""
+        tmp_dir = tempfile.mkdtemp(prefix="dashboard-print-")
+        tmp_path = os.path.join(tmp_dir, filename)
+        try:
+            shutil.copyfile(stored_path, tmp_path)
+        except Exception:
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+            raise
+        return tmp_path
 
     # ------------------------------------------------------------------
     # Ultimaker: Kopplung ("Pairing") und Druckauftrag per Drag & Drop
@@ -2604,7 +2933,7 @@ class DashboardApp:
             return True, None, "unauthorized"
         return True, None, "pending"
 
-    def send_ultimaker_print_now(self, printer_id, local_path, filename):
+    def send_ultimaker_print_now(self, printer_id, local_path, filename, history_ref=None, queue_ref=None):
         """Anders als bei Bambu (siehe prepare_print_job()/
         start_confirm_print_job()) gibt es bei Ultimaker keine AMS-
         Zuordnung zu bestaetigen - der Druck wird deshalb SOFORT nach
@@ -2638,6 +2967,8 @@ class DashboardApp:
                 "remote_name": filename,
                 "printer_id": printer_id,
                 "created": time.time(),
+                "history_ref": history_ref,   # MK6 v1.2.0: siehe _record_history_after_send()
+                "queue_ref": queue_ref,
             }
 
         self._set_progress(job_id, phase="uploading", sent=0, total=total_size, percent=0, error=None)
@@ -2650,7 +2981,10 @@ class DashboardApp:
                 conn.send_print(local_path, filename, on_progress=on_progress)
                 self._set_progress(job_id, phase="done", sent=total_size, total=total_size, percent=100)
                 # MK6: siehe identischer Kommentar in start_confirm_print_job() oben.
-                self.history.add_entry(printer_id, local_path, filename)
+                self._record_history_after_send({
+                    "printer_id": printer_id, "local_path": local_path,
+                    "remote_name": filename, "history_ref": history_ref, "queue_ref": queue_ref,
+                })
                 with self._print_jobs_lock:
                     job = self._print_jobs.pop(job_id, None)
                 if job:
@@ -2693,7 +3027,17 @@ class DashboardApp:
         blind zu wiederholen - die AMS-Bestueckung kann sich seit dem
         letzten Druck geaendert haben. Fuer Ultimaker (keine AMS-
         Zuordnung noetig) wird der Druck dagegen sofort gestartet,
-        identisch zu send_ultimaker_print_now()."""
+        identisch zu send_ultimaker_print_now().
+
+        MK6 v1.2.0: Ist der Drucker gerade beschaeftigt (is_printer_busy()),
+        wird NICHT sofort erneut gedruckt, sondern der Auftrag landet in
+        dessen Warteschlange (mode "queued") - mit history_ref auf den
+        urspruenglichen Verlaufseintrag, damit ein spaeteres tatsaechliches
+        Senden ueber die Warteschlange KEINEN zweiten Verlaufseintrag
+        erzeugt (siehe _record_history_after_send()). Auch im NICHT
+        beschaeftigten Fall wird history_ref mitgegeben, aus demselben
+        Grund - ein direktes "Erneut drucken" soll den Verlaufseintrag nur
+        aktualisieren, nicht verdoppeln."""
         p = self.get_printer_cfg(printer_id)
         if not p:
             return False, "Drucker nicht gefunden.", None
@@ -2701,35 +3045,206 @@ class DashboardApp:
         if not stored_path:
             return False, "Dieser Verlaufseintrag ist nicht mehr vorhanden.", None
 
-        tmp_dir = tempfile.mkdtemp(prefix="dashboard-print-")
-        tmp_path = os.path.join(tmp_dir, filename)
+        history_ref = {"printer_id": printer_id, "job_id": job_id}
+
+        if self.is_printer_busy(printer_id):
+            entry = self.queue.add_entry(printer_id, stored_path, filename, history_ref=history_ref)
+            if not entry:
+                return False, "Auftrag konnte nicht in die Warteschlange gelegt werden.", None
+            return True, None, {"mode": "queued", "queue_entry": entry}
+
         try:
-            shutil.copyfile(stored_path, tmp_path)
+            tmp_path = self._copy_to_temp_job_dir(stored_path, filename)
         except Exception as e:
-            try:
-                os.rmdir(tmp_dir)
-            except Exception:
-                pass
             return False, f"Datei konnte nicht aus dem Verlauf kopiert werden: {e}", None
 
         if p.get("type") == "ultimaker":
-            ok, err, new_job_id = self.send_ultimaker_print_now(printer_id, tmp_path, filename)
+            ok, err, new_job_id = self.send_ultimaker_print_now(printer_id, tmp_path, filename, history_ref=history_ref)
             if not ok:
-                try:
-                    os.remove(tmp_path)
-                    os.rmdir(tmp_dir)
-                except Exception:
-                    pass
+                self._cleanup_job_file({"local_path": tmp_path})
                 return False, err, None
             return True, None, {"mode": "ultimaker", "job_id": new_job_id}
 
-        ok, err, new_job_id, preview = self.prepare_print_job(printer_id, tmp_path, filename)
+        ok, err, new_job_id, preview = self.prepare_print_job(printer_id, tmp_path, filename, history_ref=history_ref)
         if not ok:
-            try:
-                os.remove(tmp_path)
-                os.rmdir(tmp_dir)
-            except Exception:
-                pass
+            self._cleanup_job_file({"local_path": tmp_path})
+            return False, err, None
+        return True, None, {
+            "mode": "bambu",
+            "job_id": new_job_id,
+            "filename": filename,
+            "filaments": preview["filaments"],
+            "ams_trays": preview["ams_trays"],
+            "total_filaments": preview.get("total_filaments", len(preview["filaments"])),
+        }
+
+    # ------------------------------------------------------------------
+    # MK6 v1.2.0 NEUES FEATURE: Warteschlange je Drucker (siehe
+    # PrintQueueStore-Kommentar). Analog zu reprint_from_history() oben
+    # nutzt start_next_queued_print() denselben Sende-Ablauf wieder
+    # (prepare_print_job()/send_ultimaker_print_now()), statt eine eigene
+    # parallele Druckstart-Logik einzufuehren.
+    # ------------------------------------------------------------------
+    def get_print_queue(self, printer_id):
+        return self.queue.list_entries(printer_id)
+
+    def delete_print_queue_entry(self, printer_id, job_id):
+        return self.queue.delete_entry(printer_id, job_id)
+
+    def get_print_queue_thumbnail_path(self, printer_id, job_id):
+        return self.queue.get_thumbnail_path(printer_id, job_id)
+
+    def reorder_print_queue(self, printer_id, ordered_job_ids):
+        return self.queue.reorder(printer_id, ordered_job_ids)
+
+    def enqueue_upload(self, printer_id, local_path, filename):
+        """Legt eine frisch hochgeladene Datei in die Warteschlange - sei
+        es automatisch, weil der Drucker beim Hochladen beschaeftigt war
+        (api_print_prepare()/api_ultimaker_print()), oder weil der Nutzer
+        bewusst manuell vorab einreiht (api_print_queue_add()). `local_path`
+        ist eine EINMALIGE Temp-Datei dieses Uploads (wie sonst auch beim
+        direkten Druckstart) - queue.add_entry() kopiert sie in den
+        Warteschlangen-Ordner, das Original wird danach hier geloescht
+        (identisch zum Muster von _cleanup_job_file())."""
+        p = self.get_printer_cfg(printer_id)
+        if not p:
+            return False, "Drucker nicht gefunden.", None
+        entry = self.queue.add_entry(printer_id, local_path, filename)
+        self._cleanup_job_file({"local_path": local_path})
+        if not entry:
+            return False, "Datei konnte nicht in die Warteschlange gelegt werden.", None
+        return True, None, entry
+
+    def _validate_assign_target(self, source_cfg, target_cfg):
+        """MK6 v2.1.0: prueft, ob ein Druckauftrag von source_cfg auf
+        target_cfg zugewiesen werden darf. Beide Drucker muessen vom
+        selben Typ sein; bei Bambu Lab zusaetzlich derselben Druckerfamilie
+        angehoeren (z.B. nur A1 untereinander, nur X1 untereinander) - ein
+        auf A1 vorbereiteter Druckauftrag (Slicing/AMS-Zuordnung) ist auf
+        einem X1 nicht ohne Weiteres gueltig. Gibt (True, None) oder
+        (False, Fehlermeldung) zurueck."""
+        source_type = source_cfg.get("type", "bambu")
+        target_type = target_cfg.get("type", "bambu")
+        if source_type != target_type:
+            return False, "Ein Druckauftrag kann nur einem Drucker desselben Typs zugewiesen werden."
+        if source_type == "bambu":
+            source_family = source_cfg.get("bambu_family", "x1")
+            target_family = target_cfg.get("bambu_family", "x1")
+            if source_family != target_family:
+                return False, ("Ein Druckauftrag kann bei Bambu Lab nur einem Drucker derselben "
+                               "Druckerfamilie zugewiesen werden (z.B. nur A1 untereinander, "
+                               "nur X1 untereinander).")
+        return True, None
+
+    def add_history_entry_to_queue(self, printer_id, job_id, target_printer_id=None):
+        """Legt einen VORHANDENEN Verlaufseintrag in eine Warteschlange -
+        standardmaessig die EIGENE des Druckers ("In Warteschlange legen"),
+        oder per target_printer_id die eines ANDEREN Druckers im Dashboard
+        ("Zuweisen"). Der Verlaufseintrag selbst bleibt in jedem Fall
+        unangetastet bestehen (stored_path wird nur KOPIERT)."""
+        target_printer_id = target_printer_id or printer_id
+        target_cfg = self.get_printer_cfg(target_printer_id)
+        if not target_cfg:
+            return False, "Ziel-Drucker nicht gefunden.", None
+        if target_printer_id != printer_id:
+            source_cfg = self.get_printer_cfg(printer_id)
+            if not source_cfg:
+                return False, "Quell-Drucker nicht gefunden.", None
+            ok, err = self._validate_assign_target(source_cfg, target_cfg)
+            if not ok:
+                return False, err, None
+        stored_path, filename = self.history.get_job_file_path(printer_id, job_id)
+        if not stored_path:
+            return False, "Dieser Verlaufseintrag ist nicht mehr vorhanden.", None
+        entry = self.queue.add_entry(target_printer_id, stored_path, filename,
+                                      history_ref={"printer_id": printer_id, "job_id": job_id})
+        if not entry:
+            return False, "Auftrag konnte nicht in die Warteschlange gelegt werden.", None
+        return True, None, entry
+
+    def move_queue_entry(self, printer_id, job_id, target_printer_id):
+        """Weist einen Warteschlangen-Eintrag einem ANDEREN Drucker im
+        Dashboard zu: kopiert ihn (samt ggf. vorhandenem history_ref) in
+        dessen Warteschlange und entfernt ihn danach aus der urspruenglichen
+        - er wird also VERSCHOBEN, nicht dupliziert."""
+        if not target_printer_id or target_printer_id == printer_id:
+            return False, "Ziel-Drucker muss sich vom aktuellen Drucker unterscheiden.", None
+        target_cfg = self.get_printer_cfg(target_printer_id)
+        if not target_cfg:
+            return False, "Ziel-Drucker nicht gefunden.", None
+        source_cfg = self.get_printer_cfg(printer_id)
+        if not source_cfg:
+            return False, "Quell-Drucker nicht gefunden.", None
+        ok, err = self._validate_assign_target(source_cfg, target_cfg)
+        if not ok:
+            return False, err, None
+        src_entry = self.queue.get_entry(printer_id, job_id)
+        stored_path, filename = self.queue.get_job_file_path(printer_id, job_id)
+        if not stored_path:
+            return False, "Dieser Warteschlangen-Eintrag ist nicht mehr vorhanden.", None
+        history_ref = (src_entry or {}).get("history_ref")
+        new_entry = self.queue.add_entry(target_printer_id, stored_path, filename, history_ref=history_ref)
+        if not new_entry:
+            return False, "Auftrag konnte nicht dem Ziel-Drucker zugewiesen werden.", None
+        self.queue.delete_entry(printer_id, job_id)
+        return True, None, new_entry
+
+    def start_next_queued_print(self, printer_id):
+        """'Druckraum leer' - startet den AELTESTEN (=naechsten) Auftrag
+        der Warteschlange dieses Druckers, ueber denselben Ablauf wie
+        reprint_from_history() (AMS-Dialog bei Bambu, sofortiger Druck bei
+        Ultimaker). Der Warteschlangen-Eintrag wird erst NACH bestaetigtem
+        Erfolg entfernt (siehe _record_history_after_send()), nicht schon
+        hier - ein Abbruch im AMS-Dialog oder ein Sendefehler verliert den
+        Auftrag also nicht aus der Warteschlange.
+
+        Prueft sicherheitshalber ERNEUT is_ready_for_next_print() -
+        verhindert, dass ein versehentlicher zweiter Klick waehrend eines
+        noch laufenden Drucks (oder, bei Bambu, waehrend eines
+        Uebergangszustands wie "PREPARE"/"SLICING") einen weiteren
+        Auftrag ueber dieselbe Verbindung lostreten will (v2.0.1: bei
+        Bambu Lab strenger als reines "nicht beschaeftigt" - siehe
+        is_ready_for_next_print())."""
+        p = self.get_printer_cfg(printer_id)
+        if not p:
+            return False, "Drucker nicht gefunden.", None
+        if not self.is_ready_for_next_print(printer_id):
+            if p.get("type", "bambu") == "bambu":
+                return False, ("Dieser Bambu-Lab-Drucker ist noch nicht fertig (Status muss FINISH "
+                                "oder IDLE sein) - die Warteschlange kann erst fortgesetzt werden, "
+                                "wenn der aktuelle Druck abgeschlossen ist."), None
+            return False, ("Dieser Drucker druckt (oder pausiert) noch - die Warteschlange kann "
+                            "erst fortgesetzt werden, wenn der aktuelle Druck abgeschlossen ist."), None
+        entries = self.queue.list_entries(printer_id)
+        if not entries:
+            return False, "Die Warteschlange dieses Druckers ist leer.", None
+        next_entry = entries[0]
+        job_id = next_entry["job_id"]
+        stored_path, filename = self.queue.get_job_file_path(printer_id, job_id)
+        if not stored_path:
+            self.queue.delete_entry(printer_id, job_id)
+            return False, "Datei zu diesem Warteschlangen-Eintrag fehlt - Eintrag wurde entfernt.", None
+
+        try:
+            tmp_path = self._copy_to_temp_job_dir(stored_path, filename)
+        except Exception as e:
+            return False, f"Datei konnte nicht aus der Warteschlange kopiert werden: {e}", None
+
+        queue_ref = {"printer_id": printer_id, "job_id": job_id}
+        history_ref = next_entry.get("history_ref")
+
+        if p.get("type") == "ultimaker":
+            ok, err, new_job_id = self.send_ultimaker_print_now(printer_id, tmp_path, filename,
+                                                                  history_ref=history_ref, queue_ref=queue_ref)
+            if not ok:
+                self._cleanup_job_file({"local_path": tmp_path})
+                return False, err, None
+            return True, None, {"mode": "ultimaker", "job_id": new_job_id}
+
+        ok, err, new_job_id, preview = self.prepare_print_job(printer_id, tmp_path, filename,
+                                                                history_ref=history_ref, queue_ref=queue_ref)
+        if not ok:
+            self._cleanup_job_file({"local_path": tmp_path})
             return False, err, None
         return True, None, {
             "mode": "bambu",
@@ -2885,6 +3400,16 @@ def api_print_prepare(printer_id):
     tmp_path = os.path.join(tmp_dir, filename)
     f.save(tmp_path)
 
+    # MK6 v1.2.0: Ist der Drucker gerade beschaeftigt, wird NICHT der
+    # AMS-Zuordnungsdialog geoeffnet, sondern die Datei landet in dessen
+    # Warteschlange (siehe PrintQueueStore-Kommentar) - der Nutzer sendet
+    # sie spaeter ueber "Druckraum leer" (POST .../queue/next).
+    if dash.is_printer_busy(printer_id):
+        ok, err, entry = dash.enqueue_upload(printer_id, tmp_path, filename)
+        if not ok:
+            return jsonify({"error": err}), 400
+        return jsonify({"ok": True, "mode": "queued", "queue_entry": entry})
+
     ok, err, job_id, preview = dash.prepare_print_job(printer_id, tmp_path, filename)
     if not ok:
         try:
@@ -2993,6 +3518,13 @@ def api_ultimaker_print(printer_id):
     tmp_path = os.path.join(tmp_dir, filename)
     f.save(tmp_path)
 
+    # MK6 v1.2.0: siehe identischer Kommentar in api_print_prepare() oben.
+    if dash.is_printer_busy(printer_id):
+        ok, err, entry = dash.enqueue_upload(printer_id, tmp_path, filename)
+        if not ok:
+            return jsonify({"error": err}), 400
+        return jsonify({"ok": True, "mode": "queued", "queue_entry": entry})
+
     ok, err, job_id = dash.send_ultimaker_print_now(printer_id, tmp_path, filename)
     if not ok:
         try:
@@ -3043,11 +3575,137 @@ def api_print_history_reprint(printer_id, job_id):
     (job_id, filename, filaments, ams_trays, total_filaments), damit das
     Frontend denselben AMS-Zuordnungsdialog (openAmsModal()) weiter-
     verwenden kann; bei Ultimaker nur job_id (Fortschritt ueber den
-    bestehenden generischen /print/progress/<job_id>-Endpunkt)."""
+    bestehenden generischen /print/progress/<job_id>-Endpunkt). MK6
+    v1.2.0: ist der Drucker gerade beschaeftigt, liefert die Antwort
+    stattdessen mode "queued" + queue_entry (Auftrag wurde in die
+    Warteschlange gelegt, siehe DashboardApp.reprint_from_history())."""
     ok, err, result = dash.reprint_from_history(printer_id, job_id)
     if not ok:
         return jsonify({"error": err}), 400
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/printers/<printer_id>/history/<job_id>/queue", methods=["POST"])
+def api_print_history_to_queue(printer_id, job_id):
+    """MK6 v1.2.0: Legt einen Verlaufseintrag in eine Warteschlange -
+    standardmaessig die EIGENE des Druckers ("In Warteschlange legen"),
+    optional per Body {"target_printer_id": "..."} die eines ANDEREN
+    Druckers im Dashboard ("Zuweisen"). Der Verlaufseintrag selbst bleibt
+    unangetastet erhalten (siehe DashboardApp.add_history_entry_to_queue())."""
+    data = request.get_json(force=True) or {}
+    target_printer_id = data.get("target_printer_id") or printer_id
+    ok, err, entry = dash.add_history_entry_to_queue(printer_id, job_id, target_printer_id)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "queue_entry": entry})
+
+
+# ----------------------------------------------------------------------
+# MK6 v1.2.0 NEUES FEATURE: Warteschlange pro Drucker (siehe
+# PrintQueueStore/DashboardApp.start_next_queued_print() weiter oben)
+# ----------------------------------------------------------------------
+@app.route("/api/printers/<printer_id>/queue", methods=["GET"])
+def api_print_queue(printer_id):
+    """Liste der wartenden Druckauftraege dieses Druckers, AELTESTER
+    (=naechster) zuerst, fuer das Warteschlangen-Untermenue der Kachel."""
+    return jsonify(dash.get_print_queue(printer_id))
+
+
+@app.route("/api/printers/<printer_id>/queue", methods=["POST"])
+def api_print_queue_add(printer_id):
+    """Legt eine Datei manuell in die Warteschlange - UNABHAENGIG vom
+    Beschaeftigt-Status des Druckers (fuer vorausschauendes Einreihen
+    mehrerer Auftraege, auch waehrend der Drucker gerade idle ist)."""
+    p = dash.get_printer_cfg(printer_id)
+    if not p:
+        return jsonify({"error": "Drucker nicht gefunden."}), 404
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "Keine Datei erhalten."}), 400
+
+    filename = secure_filename(f.filename)
+    ptype = p.get("type", "bambu")
+    if ptype == "ultimaker":
+        if not filename.lower().endswith(".gcode"):
+            return jsonify({"error": "Nur fertig gesclicte .gcode-Dateien werden unterstuetzt (Export aus Cura)."}), 400
+    elif ptype == "bambu":
+        if not filename.lower().endswith(".gcode.3mf"):
+            return jsonify({
+                "error": "Nur fertig gesclicte .gcode.3mf-Dateien werden unterstuetzt "
+                         "(Export aus Bambu Studio/OrcaSlicer)."
+            }), 400
+    else:
+        return jsonify({"error": "Eine Warteschlange wird fuer diesen Druckertyp aktuell nicht unterstuetzt."}), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix="dashboard-print-")
+    tmp_path = os.path.join(tmp_dir, filename)
+    f.save(tmp_path)
+
+    ok, err, entry = dash.enqueue_upload(printer_id, tmp_path, filename)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "queue_entry": entry})
+
+
+@app.route("/api/printers/<printer_id>/queue/<job_id>/thumbnail", methods=["GET"])
+def api_print_queue_thumbnail(printer_id, job_id):
+    path = dash.get_print_queue_thumbnail_path(printer_id, job_id)
+    if not path:
+        return "Kein Vorschaubild vorhanden.", 404
+    return send_file(path, mimetype="image/png")
+
+
+@app.route("/api/printers/<printer_id>/queue/<job_id>", methods=["DELETE"])
+def api_print_queue_delete(printer_id, job_id):
+    """Entfernt einen einzelnen Warteschlangen-Eintrag (Datei + ggf.
+    Vorschaubild + Index-Eintrag) dauerhaft."""
+    ok = dash.delete_print_queue_entry(printer_id, job_id)
+    if not ok:
+        return jsonify({"error": "Warteschlangen-Eintrag nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/printers/<printer_id>/queue/reorder", methods=["POST"])
+def api_print_queue_reorder(printer_id):
+    """Setzt eine vollstaendig neue Reihenfolge, Body {"order": [job_id, ...]}
+    - siehe PrintQueueStore.reorder() fuer die Validierung."""
+    data = request.get_json(force=True) or {}
+    order = data.get("order")
+    if not isinstance(order, list) or not order:
+        return jsonify({"error": "order (Liste von job_ids) fehlt."}), 400
+    ok = dash.reorder_print_queue(printer_id, order)
+    if not ok:
+        return jsonify({
+            "error": "Reihenfolge passt nicht zur aktuellen Warteschlange (evtl. zwischenzeitlich "
+                     "geaendert) - bitte Ansicht neu laden."
+        }), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/api/printers/<printer_id>/queue/next", methods=["POST"])
+def api_print_queue_next(printer_id):
+    """'Druckraum leer' - startet den aeltesten Auftrag der Warteschlange,
+    siehe DashboardApp.start_next_queued_print(). Antwortformat identisch
+    zu /history/<job_id>/reprint (mode "bambu"/"ultimaker")."""
+    ok, err, result = dash.start_next_queued_print(printer_id)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/printers/<printer_id>/queue/<job_id>/assign", methods=["POST"])
+def api_print_queue_assign(printer_id, job_id):
+    """Weist einen Warteschlangen-Eintrag einem ANDEREN Drucker im
+    Dashboard zu (verschiebt ihn in dessen Warteschlange), Body
+    {"target_printer_id": "..."}."""
+    data = request.get_json(force=True) or {}
+    target_printer_id = data.get("target_printer_id")
+    if not target_printer_id:
+        return jsonify({"error": "target_printer_id fehlt."}), 400
+    ok, err, entry = dash.move_queue_entry(printer_id, job_id, target_printer_id)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "queue_entry": entry})
 
 
 @app.route("/api/version", methods=["GET"])
@@ -3151,6 +3809,14 @@ INDEX_HTML = r"""
   }
   .btn-mini:hover{ border-color:var(--accent-2); }
   .btn-mini.off:hover{ border-color:var(--danger); }
+  /* v2.1.0: alle echten "Loeschen"-Schaltflaechen (Verlauf/Warteschlange)
+     durchgehend rot, nicht erst bei Hover - analog zu .del-icon. Bewusst
+     eine EIGENE Klasse statt .btn-mini.off: .off wird bereits fuer den
+     "Aus"-Knopf eines Sensoren/Schalter-Eintrags verwendet (siehe
+     renderExtras()) - der soll NICHT rot werden, das waere fachlich
+     falsch (Ausschalten ist keine destruktive Loesch-Aktion). */
+  .btn-mini.btn-delete{ color:var(--danger); border-color:#c0392b66; }
+  .btn-mini.btn-delete:hover{ border-color:var(--danger); filter:brightness(1.15); }
   /* MK6: main = #printerList - Karten-Layout wahlweise 1/2/3-spaltig,
      siehe .cols-2/.cols-3 (per JS umgeschaltet, Wahl lokal gespeichert). */
   main{
@@ -3212,8 +3878,10 @@ INDEX_HTML = r"""
   .hist-icon:hover{ border-color:var(--accent-2); }
   .hist-icon svg{ width:16px; height:16px; fill:var(--text-dim); }
   .hist-icon:hover svg{ fill:var(--accent-2); }
-  .del-icon{ cursor:pointer; color:var(--text-dim); font-size:18px; padding:0 4px;}
-  .del-icon:hover{ color:var(--danger); }
+  /* v2.1.0: Loesch-Icon/-Buttons durchgehend rot hinterlegt (nicht erst
+     bei Hover), damit eine destruktive Aktion sofort erkennbar ist. */
+  .del-icon{ cursor:pointer; color:var(--danger); font-size:18px; padding:0 4px;}
+  .del-icon:hover{ filter:brightness(1.25); }
 
   .card-body{ padding:20px; display:grid; grid-template-columns:1.3fr 1fr; gap:24px; }
   .card-body.single-col{ grid-template-columns:1fr; }
@@ -3409,6 +4077,32 @@ INDEX_HTML = r"""
   }
   .history-date{ font-family:var(--mono); font-size:11px; color:var(--text-dim); }
   .history-actions{ display:flex; flex-direction:column; gap:6px; flex-shrink:0; }
+
+  /* MK6 v1.2.0: Warteschlange je Drucker */
+  .queue-icon{
+    position:relative; cursor:pointer; width:30px; height:30px; border-radius:6px;
+    display:flex; align-items:center; justify-content:center;
+    border:1px solid var(--border); background:#1b2027;
+  }
+  .queue-icon:hover{ border-color:var(--accent); }
+  .queue-icon svg{ width:16px; height:16px; fill:var(--text-dim); }
+  .queue-icon:hover svg{ fill:var(--accent); }
+  .queue-badge{
+    position:absolute; top:-6px; right:-6px; min-width:16px; height:16px; padding:0 4px;
+    border-radius:8px; background:var(--accent); color:#12100c; font-size:10px;
+    font-weight:700; font-family:var(--mono); display:flex; align-items:center; justify-content:center;
+  }
+  .history-modal-tools{
+    display:flex; justify-content:flex-end; margin:-8px 0 10px 0; gap:8px;
+  }
+  .queue-item{ align-items:center; }
+  .queue-order-btns{ display:flex; flex-direction:column; gap:2px; flex-shrink:0; }
+  .queue-order-btns .btn-mini{ padding:2px 7px; line-height:1; }
+  .file-btn{ display:inline-block; }
+  /* v2.1.0: Drop-Zone oben im Warteschlangen-Modal (Drag & Drop-Upload,
+     analog zur Drop-Zone auf der Drucker-Kachel selbst) */
+  .queue-drop-zone{ margin-top:0; margin-bottom:14px; }
+  .queue-drop-zone .file-btn{ margin-top:4px; }
 </style>
 </head>
 <body>
@@ -3559,9 +4253,55 @@ INDEX_HTML = r"""
 <div class="modal-backdrop" id="historyModal">
   <div class="modal history-modal">
     <h2>Druckauftrags-Verlauf</h2>
+    <div class="history-modal-tools">
+      <button class="btn-mini" id="historySortBtn" onclick="toggleHistorySort()">Sortierung: Neueste zuerst</button>
+    </div>
     <div id="historyModalBody"></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeHistoryModal()">Schliessen</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Warteschlange (MK6 v1.2.0) -->
+<div class="modal-backdrop" id="queueModal">
+  <div class="modal history-modal">
+    <h2>Warteschlange</h2>
+    <!-- v2.1.0: Datei kann per Drag & Drop hierher gezogen werden -
+         genau wie auf die Drucker-Kachel selbst (dzDrop()/dzDropUltimaker()) -
+         oder ueber den Datei-Auswahl-Button darin. -->
+    <div class="drop-zone queue-drop-zone" id="queueDropZone"
+         ondragover="dzDragOver(event)"
+         ondragleave="dzDragLeave(event)"
+         ondrop="dzDropQueue(event)">
+      Datei hier ablegen, um sie in die Warteschlange zu legen
+      <div class="dz-hint">
+        oder
+        <label class="btn-mini file-btn">
+          Datei auswaehlen
+          <input type="file" style="display:none" onchange="addFileToQueue(queueModalPrinterId, this)">
+        </label>
+      </div>
+    </div>
+    <div id="queueModalBody"></div>
+    <!-- v2.0.1: Hinweistext + Deaktivierung siehe updateQueueSendButtonState() -->
+    <div class="hint-text" id="queueSendHint" style="margin-top:10px;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeQueueModal()">Schliessen</button>
+      <button class="btn" id="queueSendNextBtn" onclick="sendNextQueued(queueModalPrinterId)">Druckraum leer - naechsten senden</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Auftrag einem anderen Drucker zuweisen (MK6 v1.2.0) -->
+<div class="modal-backdrop" id="assignModal">
+  <div class="modal">
+    <h2>Auftrag zuweisen</h2>
+    <label>Ziel-Drucker</label>
+    <select id="assignTargetSelect"></select>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeAssignModal()">Abbrechen</button>
+      <button class="btn" onclick="confirmAssign()">Zuweisen</button>
     </div>
   </div>
 </div>
@@ -3573,6 +4313,16 @@ INDEX_HTML = r"""
 const CAM_ICON = `<svg viewBox="0 0 24 24"><path d="M4 7h3l1.5-2h7L17 7h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm8 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg>`;
 const HIST_ICON = `<svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 1 0 8.94 10h-2.02A7 7 0 1 1 13 5v4l5-4-5-4z"/><path d="M12 8v5l4 2-.75 1.3L11 14V8z"/></svg>`;
 const FILE_ICON = `<svg viewBox="0 0 24 24"><path d="M6 2h9l5 5v15H6zm8 1.5V8h4.5z"/></svg>`;
+// MK6 v1.2.0: Warteschlangen-Symbol (Listen-Icon) fuer die Kachel.
+const QUEUE_ICON = `<svg viewBox="0 0 24 24"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h12v2H3z"/></svg>`;
+
+// MK6 v1.2.0: nur fuer Bambu/Ultimaker relevant (nur diese unterstuetzen
+// Druckauftraege per Dashboard-Upload, siehe PrintQueueStore-Kommentar) -
+// die anderen Kartentypen bekommen bewusst KEIN Warteschlangen-Symbol.
+function renderQueueIcon(p){
+  const badge = p.queue_count ? `<span class="queue-badge">${p.queue_count}</span>` : '';
+  return `<div class="queue-icon" title="Warteschlange" onclick="openQueueModal('${p.id}')">${QUEUE_ICON}${badge}</div>`;
+}
 
 const FL_LABELS = {
   formlabs:      { badge: 'Formlabs Drucker', file: 'Aktueller Druckauftrag', showMaterial: true  },
@@ -3668,9 +4418,14 @@ function closeCam(){
 
 // MK6: Druckauftrags-Verlauf (Untermenue je Drucker-Kachel) -----------
 let historyModalPrinterId = null;
+// MK6 v1.2.0: 'date' (Backend liefert bereits neueste zuerst) oder 'alpha'
+// (Dateiname A-Z) - rein clientseitig, kein erneuter Server-Request noetig.
+let historySortMode = 'date';
+let lastHistoryEntries = [];
 
 async function openHistoryModal(printerId){
   historyModalPrinterId = printerId;
+  historySortMode = 'date';
   document.getElementById('historyModalBody').innerHTML = '<div class="history-empty">Wird geladen ...</div>';
   document.getElementById('historyModal').classList.add('show');
   await refreshHistoryModal();
@@ -3695,10 +4450,32 @@ async function refreshHistoryModal(){
     return;
   }
   if(historyModalPrinterId !== printerId) return; // Modal wurde inzwischen geschlossen/gewechselt
-  if(!entries || entries.length === 0){
+  lastHistoryEntries = entries || [];
+  renderHistoryEntries();
+}
+
+function toggleHistorySort(){
+  historySortMode = (historySortMode === 'date') ? 'alpha' : 'date';
+  renderHistoryEntries();
+}
+
+function renderHistoryEntries(){
+  const printerId = historyModalPrinterId;
+  const body = document.getElementById('historyModalBody');
+  const sortBtn = document.getElementById('historySortBtn');
+  if(sortBtn){
+    sortBtn.textContent = (historySortMode === 'date') ? 'Sortierung: Neueste zuerst' : 'Sortierung: A-Z';
+  }
+  if(!lastHistoryEntries.length){
     body.innerHTML = '<div class="history-empty">Noch keine Druckauftraege ueber das Dashboard gesendet.</div>';
     return;
   }
+  // 'date': Backend liefert bereits neueste zuerst - unveraendert uebernehmen.
+  // 'alpha': Kopie sortieren, damit lastHistoryEntries (Backend-Reihenfolge)
+  // beim naechsten Umschalten zurueck auf 'date' erhalten bleibt.
+  const entries = (historySortMode === 'alpha')
+    ? [...lastHistoryEntries].sort((a, b) => a.filename.localeCompare(b.filename, 'de'))
+    : lastHistoryEntries;
   body.innerHTML = entries.map(e => {
     const thumb = e.has_image
       ? `<img class="history-thumb" src="/api/printers/${printerId}/history/${e.job_id}/thumbnail" alt="">`
@@ -3712,7 +4489,9 @@ async function refreshHistoryModal(){
         </div>
         <div class="history-actions">
           <button class="btn-mini" onclick="reprintHistoryEntry('${printerId}','${e.job_id}')">Erneut drucken</button>
-          <button class="btn-mini off" onclick="deleteHistoryEntry('${printerId}','${e.job_id}')">Loeschen</button>
+          <button class="btn-mini" onclick="addHistoryEntryToQueue('${printerId}','${e.job_id}')">In Warteschlange</button>
+          <button class="btn-mini" onclick="openAssignModal('history','${printerId}','${e.job_id}')">Zuweisen</button>
+          <button class="btn-mini btn-delete" onclick="deleteHistoryEntry('${printerId}','${e.job_id}')">Loeschen</button>
         </div>
       </div>`;
   }).join('');
@@ -3742,6 +4521,13 @@ async function reprintHistoryEntry(printerId, jobId){
       showToast(data.error || 'Fehler beim erneuten Senden.', 'err');
       return;
     }
+    // MK6 v1.2.0: Drucker war beschaeftigt - Auftrag wurde in die
+    // Warteschlange gelegt, statt sofort erneut gesendet zu werden.
+    if(data.mode === 'queued'){
+      closeHistoryModal();
+      showToast('Drucker ist beschaeftigt - Auftrag wurde in die Warteschlange gelegt.', 'ok');
+      return;
+    }
     if(data.mode === 'ultimaker'){
       closeHistoryModal();
       showToast('Druckauftrag wird erneut gesendet ...', 'ok');
@@ -3757,11 +4543,316 @@ async function reprintHistoryEntry(printerId, jobId){
   }
 }
 
+async function addHistoryEntryToQueue(printerId, jobId){
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/history/' + jobId + '/queue', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Fehler beim Hinzufuegen zur Warteschlange.', 'err');
+      return;
+    }
+    showToast('In die Warteschlange gelegt.', 'ok');
+  } catch(e){
+    showToast('Netzwerkfehler beim Hinzufuegen zur Warteschlange.', 'err');
+  }
+}
+
+// MK6 v1.2.0: Warteschlange (Untermenue je Drucker-Kachel) ------------
+let queueModalPrinterId = null;
+let queueModalHasEntries = false;  // v2.0.1: fuer updateQueueSendButtonState()
+
+async function openQueueModal(printerId){
+  queueModalPrinterId = printerId;
+  queueModalHasEntries = false;
+  document.getElementById('queueModalBody').innerHTML = '<div class="history-empty">Wird geladen ...</div>';
+  document.getElementById('queueModal').classList.add('show');
+  await refreshQueueModal();
+}
+
+function closeQueueModal(){
+  document.getElementById('queueModal').classList.remove('show');
+  document.getElementById('queueModalBody').innerHTML = '';
+  queueModalPrinterId = null;
+}
+
+// v2.0.1: Aktiviert/deaktiviert den "Druckraum leer"-Knopf anhand des
+// zuletzt bekannten Druckerstatus (aus lastPrinterList, siehe refresh())
+// - bei Bambu Lab wird dafuer EXPLIZIT der Status FINISH oder IDLE
+// verlangt (nicht nur "nicht am Drucken"), siehe DashboardApp.
+// is_ready_for_next_print() fuer die serverseitige Gegenpruefung, die in
+// jedem Fall zusaetzlich greift. Wird sowohl nach jedem Laden/Aendern der
+// Warteschlange als auch bei jedem regulaeren 2,5-Sekunden-Status-Poll
+// aufgerufen (siehe refresh()), damit der Knopf automatisch aktiv wird,
+// sobald der laufende Druck fertig ist, ohne dass der Nutzer das Modal
+// schliessen/neu oeffnen muss.
+function updateQueueSendButtonState(){
+  const btn = document.getElementById('queueSendNextBtn');
+  const hint = document.getElementById('queueSendHint');
+  if(!btn || !queueModalPrinterId) return;
+  const p = lastPrinterList.find(x => x.id === queueModalPrinterId);
+  const state = (p && p.gcode_state) ? String(p.gcode_state).toUpperCase() : '';
+  const isBambu = p && p.type === 'bambu';
+  const ready = isBambu ? ['FINISH', 'IDLE'].includes(state) : !PRINTER_BUSY_STATES_JS.includes(state);
+
+  if(!queueModalHasEntries){
+    btn.disabled = true;
+    hint.textContent = 'Die Warteschlange ist leer.';
+  } else if(!ready){
+    btn.disabled = true;
+    hint.textContent = isBambu
+      ? `Warten, bis der Drucker fertig ist (aktueller Status: ${state || 'unbekannt'}).`
+      : `Warten, bis der Drucker fertig ist (aktueller Status: ${state || 'unbekannt'}).`;
+  } else {
+    btn.disabled = false;
+    hint.textContent = '';
+  }
+}
+
+async function refreshQueueModal(){
+  const printerId = queueModalPrinterId;
+  if(!printerId) return;
+  const body = document.getElementById('queueModalBody');
+  let entries;
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue');
+    entries = await res.json();
+  } catch(e){
+    body.innerHTML = '<div class="history-empty">Warteschlange konnte nicht geladen werden.</div>';
+    queueModalHasEntries = false;
+    updateQueueSendButtonState();
+    return;
+  }
+  if(queueModalPrinterId !== printerId) return; // Modal wurde inzwischen geschlossen/gewechselt
+  queueModalHasEntries = !!(entries && entries.length);
+  updateQueueSendButtonState();
+  if(!entries || entries.length === 0){
+    body.innerHTML = '<div class="history-empty">Die Warteschlange ist leer.</div>';
+    return;
+  }
+  // Aeltester (=naechster) Auftrag zuerst - siehe PrintQueueStore-Kommentar.
+  body.innerHTML = entries.map((e, i) => {
+    const thumb = e.has_image
+      ? `<img class="history-thumb" src="/api/printers/${printerId}/queue/${e.job_id}/thumbnail" alt="">`
+      : `<div class="history-thumb-placeholder">${FILE_ICON}</div>`;
+    const label = (i === 0) ? '<b>Naechster:</b> ' : '';
+    return `
+      <div class="history-item queue-item">
+        <div class="queue-order-btns">
+          <button class="btn-mini" ${i === 0 ? 'disabled' : ''} title="Nach oben" onclick="moveQueueEntry('${printerId}','${e.job_id}',-1)">&uarr;</button>
+          <button class="btn-mini" ${i === entries.length - 1 ? 'disabled' : ''} title="Nach unten" onclick="moveQueueEntry('${printerId}','${e.job_id}',1)">&darr;</button>
+        </div>
+        ${thumb}
+        <div class="history-body">
+          <div class="history-filename">${label}${e.filename}</div>
+          <div class="history-date">In Warteschlange seit ${e.added_at}</div>
+        </div>
+        <div class="history-actions">
+          <button class="btn-mini" onclick="openAssignModal('queue','${printerId}','${e.job_id}')">Zuweisen</button>
+          <button class="btn-mini btn-delete" onclick="deleteQueueEntry('${printerId}','${e.job_id}')">Loeschen</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function moveQueueEntry(printerId, jobId, direction){
+  let entries;
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue');
+    entries = await res.json();
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  const ids = entries.map(e => e.job_id);
+  const idx = ids.indexOf(jobId);
+  const newIdx = idx + direction;
+  if(idx < 0 || newIdx < 0 || newIdx >= ids.length) return;
+  [ids[idx], ids[newIdx]] = [ids[newIdx], ids[idx]];
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue/reorder', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({order: ids})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Reihenfolge konnte nicht geaendert werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  await refreshQueueModal();
+}
+
+async function deleteQueueEntry(printerId, jobId){
+  if(!confirm('Diesen Auftrag wirklich aus der Warteschlange entfernen?')) return;
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue/' + jobId, { method:'DELETE' });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Fehler beim Loeschen.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Loeschen.', 'err');
+    return;
+  }
+  await refreshQueueModal();
+}
+
+// MK6 v2.1.0: gemeinsame Upload-Logik fuer "Datei auswaehlen" (addFileToQueue)
+// UND Drag&Drop (dzDropQueue) im Warteschlangen-Modal - vermeidet doppelten
+// Code fuer beide Wege, eine Datei in die Warteschlange zu legen.
+async function uploadFileToQueue(printerId, file){
+  if(!file || !printerId) return;
+  const form = new FormData();
+  form.append('file', file);
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue', { method:'POST', body: form });
+    const data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Fehler beim Hinzufuegen zur Warteschlange.', 'err');
+    } else {
+      showToast('Datei wurde in die Warteschlange gelegt.', 'ok');
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Hochladen.', 'err');
+  }
+  await refreshQueueModal();
+}
+
+async function addFileToQueue(printerId, fileInput){
+  const file = fileInput.files && fileInput.files[0];
+  if(!file || !printerId) return;
+  try{
+    await uploadFileToQueue(printerId, file);
+  } finally {
+    fileInput.value = '';
+  }
+}
+
+// MK6 v2.1.0: Drag&Drop einer Datei auf die Drop-Zone im Warteschlangen-Modal -
+// analog zu dzDrop()/dzDropUltimaker() auf der Drucker-Kachel selbst. Die
+// erwartete Dateiendung haengt vom Druckertyp des gerade geoeffneten Modals ab.
+async function dzDropQueue(ev){
+  ev.preventDefault();
+  const zone = ev.currentTarget;
+  zone.classList.remove('dragover');
+  const printerId = queueModalPrinterId;
+  if(!printerId) return;
+  const files = ev.dataTransfer.files;
+  if(!files || files.length === 0) return;
+  const file = files[0];
+
+  const p = lastPrinterList.find(x => x.id === printerId);
+  const isUltimaker = p && p.type === 'ultimaker';
+  const name = file.name.toLowerCase();
+  const okExt = isUltimaker ? name.endsWith('.gcode') : name.endsWith('.gcode.3mf');
+  if(!okExt){
+    showToast(isUltimaker ? 'Nur .gcode-Dateien werden unterstuetzt.' : 'Nur .gcode.3mf-Dateien werden unterstuetzt.', 'err');
+    return;
+  }
+
+  zone.classList.add('uploading');
+  try{
+    await uploadFileToQueue(printerId, file);
+  } finally {
+    zone.classList.remove('uploading');
+  }
+}
+
+async function sendNextQueued(printerId){
+  if(!printerId) return;
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/queue/next', { method: 'POST' });
+    const data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Naechster Auftrag konnte nicht gesendet werden.', 'err');
+      return;
+    }
+    closeQueueModal();
+    if(data.mode === 'ultimaker'){
+      showToast('Naechster Druckauftrag wird gesendet ...', 'ok');
+      await pollUltimakerProgress(printerId, data.job_id, { classList: { add(){}, remove(){} } });
+    } else {
+      openAmsModal(printerId, data);
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Senden.', 'err');
+  }
+}
+
+// MK6 v1.2.0: Auftrag (Verlauf oder Warteschlange) einem anderen Drucker
+// im Dashboard zuweisen -----------------------------------------------
+let assignContext = null; // {kind: 'history'|'queue', printerId, jobId}
+
+function openAssignModal(kind, printerId, jobId){
+  assignContext = { kind, printerId, jobId };
+  const sourceP = lastPrinterList.find(p => p.id === printerId);
+  const sourceType = sourceP ? sourceP.type : null;
+  // MK6 v2.1.0: bei Bambu Lab darf nur einem Drucker DERSELBEN Druckerfamilie
+  // zugewiesen werden (z.B. nur A1 untereinander, nur X1 untereinander) -
+  // analog zur Pruefung in _validate_assign_target() im Backend.
+  const sourceFamily = sourceP ? sourceP.bambu_family : null;
+  const sel = document.getElementById('assignTargetSelect');
+  sel.innerHTML = lastPrinterList
+    .filter(p => p.id !== printerId && p.type === sourceType &&
+                 (sourceType !== 'bambu' || p.bambu_family === sourceFamily))
+    .map(p => `<option value="${p.id}">${p.name} (${p.type === 'bambu' ? 'Bambu Lab' : 'Ultimaker'})</option>`)
+    .join('');
+  if(!sel.options.length){
+    showToast(sourceType === 'bambu'
+      ? 'Kein anderer Bambu-Lab-Drucker derselben Druckerfamilie im Dashboard vorhanden.'
+      : 'Kein anderer passender Drucker im Dashboard vorhanden.', 'err');
+    assignContext = null;
+    return;
+  }
+  document.getElementById('assignModal').classList.add('show');
+}
+
+function closeAssignModal(){
+  document.getElementById('assignModal').classList.remove('show');
+  assignContext = null;
+}
+
+async function confirmAssign(){
+  if(!assignContext) return;
+  const targetId = document.getElementById('assignTargetSelect').value;
+  const { kind, printerId, jobId } = assignContext;
+  const url = (kind === 'queue')
+    ? `/api/printers/${printerId}/queue/${jobId}/assign`
+    : `/api/printers/${printerId}/history/${jobId}/queue`;
+  try{
+    const res = await fetch(url, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({target_printer_id: targetId})
+    });
+    const data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Zuweisung fehlgeschlagen.', 'err');
+      return;
+    }
+    showToast('Auftrag wurde zugewiesen.', 'ok');
+    closeAssignModal();
+    if(kind === 'queue') await refreshQueueModal();
+    else await refreshHistoryModal();
+  } catch(e){
+    showToast('Netzwerkfehler bei der Zuweisung.', 'err');
+  }
+}
+
 async function extraCommand(printerId, extraId, action){
   await fetch(`/api/printers/${printerId}/extras/${extraId}/command`, {
     method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})
   });
 }
+
+// v2.0.1: JS-Spiegel von PRINTER_BUSY_STATES (app.py) - fuer
+// updateQueueSendButtonState() (nicht-Bambu-Zweig). Bei Aenderung dort
+// auch hier nachziehen.
+const PRINTER_BUSY_STATES_JS = ['RUNNING','PRINTING','WASHING','CURING','BUSY','OPERATIONAL','PAUSE','PAUSED'];
 
 function stateClass(state){
   if(!state) return '';
@@ -3780,6 +4871,16 @@ function formatRemaining(totalMinutes){
     return `${h} h ${m} min verbleibend`;
   }
   return `${m} min verbleibend`;
+}
+
+// v2.1.0: rundet eine Temperaturangabe auf HOECHSTENS 2 Nachkommastellen
+// (weniger, falls die Zahl von sich aus glatt ist - "23" statt "23.00").
+// Manche Backends (v. a. Bambu-MQTT) liefern Temperaturen mit deutlich
+// mehr Nachkommastellen, als fuer die Anzeige sinnvoll ist.
+function formatTemp(v){
+  if(v === undefined || v === null) return '–';
+  const n = Math.round(v * 100) / 100;
+  return Number.isFinite(n) ? n : '–';
 }
 
 function renderAms(ams){
@@ -3818,9 +4919,19 @@ function renderExtras(printerId, extras){
   </div>`;
 }
 
+// MK6 v1.2.0: letzte Druckerliste aus refresh() - wird ohne erneuten
+// Netzwerk-Request fuer den Zuweisen-Dialog (openAssignModal()) genutzt,
+// damit dort eine aktuelle Auswahl an Ziel-Druckern zur Verfuegung steht.
+let lastPrinterList = [];
+
 async function refresh(){
   const res = await fetch('/api/status');
   const printers = await res.json();
+  lastPrinterList = printers;
+  // v2.0.1: haelt den "Druckraum leer"-Knopf live aktuell, falls die
+  // Warteschlange gerade offen ist (z. B. der Nutzer wartet darauf, dass
+  // ein Bambu-Lab-Drucker fertig wird, ohne das Modal zu schliessen).
+  if(queueModalPrinterId) updateQueueSendButtonState();
   const list = document.getElementById('printerList');
 
   if(printers.length === 0){
@@ -3857,6 +4968,7 @@ function renderBambuCard(p){
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          ${renderQueueIcon(p)}
           <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
@@ -3873,9 +4985,9 @@ function renderBambuCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Kammer <b>${p.chamber_temp ?? '–'}&deg;C</b></div>
-            <div class="temp-chip">Duese <b>${p.nozzle_temp ?? '–'}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${p.bed_temp ?? '–'}&deg;C</b></div>
+            <div class="temp-chip">Kammer <b>${formatTemp(p.chamber_temp)}&deg;C</b></div>
+            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
+            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
           </div>
         </div>
         <div>
@@ -3933,6 +5045,12 @@ async function dzDrop(ev, printerId){
     const data = await res.json();
     if(!res.ok){
       showToast(data.error || 'Fehler beim Vorbereiten des Druckauftrags.', 'err');
+      return;
+    }
+    // MK6 v1.2.0: Drucker war beschaeftigt - Datei wurde automatisch in
+    // die Warteschlange gelegt, statt den AMS-Dialog zu oeffnen.
+    if(data.mode === 'queued'){
+      showToast('Drucker ist beschaeftigt - Datei wurde in die Warteschlange gelegt.', 'ok');
       return;
     }
     openAmsModal(printerId, data);
@@ -4238,8 +5356,8 @@ function renderOctoPrintCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Duese <b>${p.nozzle_temp ?? '–'}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${p.bed_temp ?? '–'}&deg;C</b></div>
+            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
+            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -4286,9 +5404,9 @@ function renderCrealityCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            ${hasChamber ? `<div class="temp-chip">Kammer <b>${p.chamber_temp}&deg;C</b></div>` : ''}
-            <div class="temp-chip">Duese <b>${p.nozzle_temp ?? '–'}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${p.bed_temp ?? '–'}&deg;C</b></div>
+            ${hasChamber ? `<div class="temp-chip">Kammer <b>${formatTemp(p.chamber_temp)}&deg;C</b></div>` : ''}
+            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
+            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -4318,6 +5436,7 @@ function renderUltimakerCard(p){
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          ${renderQueueIcon(p)}
           <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
@@ -4334,8 +5453,8 @@ function renderUltimakerCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Duese <b>${p.nozzle_temp ?? '–'}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${p.bed_temp ?? '–'}&deg;C</b></div>
+            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
+            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -4437,6 +5556,13 @@ async function dzDropUltimaker(ev, printerId){
     const data = await res.json();
     if(!res.ok){
       showToast(data.error || 'Fehler beim Senden des Druckauftrags.', 'err');
+      zone.classList.remove('uploading');
+      return;
+    }
+    // MK6 v1.2.0: Drucker war beschaeftigt - Datei wurde automatisch in
+    // die Warteschlange gelegt, statt sofort gedruckt zu werden.
+    if(data.mode === 'queued'){
+      showToast('Drucker ist beschaeftigt - Datei wurde in die Warteschlange gelegt.', 'ok');
       zone.classList.remove('uploading');
       return;
     }

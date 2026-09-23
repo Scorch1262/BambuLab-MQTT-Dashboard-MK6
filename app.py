@@ -45,7 +45,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
 # Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
 # README Abschnitt 0a beschriebenen Automatik hergeleitet).
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.3"
 
 import os
 import sys
@@ -168,11 +168,17 @@ PRINTER_BUSY_STATES = {
 # bereitet bereits den naechsten, ihm intern bekannten Vorgang vor bzw.
 # raeumt noch auf) sind zwar nicht in PRINTER_BUSY_STATES, aber ebenfalls
 # NICHT "fertig". DashboardApp.is_ready_for_next_print() verlangt bei
-# Bambu deshalb EXPLIZIT einen dieser beiden Zustaende: "FINISH" (Druck
-# soeben abgeschlossen) oder "IDLE" (Drucker war zuvor gar nicht am
-# Drucken - z. B. frisch gestarteter/verbundener Drucker mit bereits
-# vorbefuellter Warteschlange).
-BAMBU_READY_FOR_NEXT_STATES = {"FINISH", "IDLE"}
+# Bambu deshalb EXPLIZIT einen dieser Zustaende: "FINISH" (Druck soeben
+# abgeschlossen), "IDLE" (Drucker war zuvor gar nicht am Drucken - z. B.
+# frisch gestarteter/verbundener Drucker mit bereits vorbefuellter
+# Warteschlange) oder "FAILED" (Druck abgebrochen/fehlgeschlagen - seit
+# v2.1.1: der Druckraum ist dann GENAUSO frei wie nach "FINISH", der
+# Nutzer muss nur wie gewohnt selbst pruefen/aufraeumen, bevor er
+# "Druckraum leer" klickt. Ohne diesen Zustand blieb die Warteschlange
+# nach einem fehlgeschlagenen Druck dauerhaft blockiert, da der Drucker
+# in "FAILED" verharrt, bis der naechste Druckauftrag gestartet wird -
+# ein tatsaechlicher Bug, kein Uebergangszustand wie "PREPARE"/"SLICING").
+BAMBU_READY_FOR_NEXT_STATES = {"FINISH", "IDLE", "FAILED"}
 
 
 def _extract_thumbnail(local_path: str, filename: str):
@@ -595,7 +601,8 @@ class PrinterConnection:
             "nozzle_temp": None,
             "bed_temp": None,
             "remaining_min": None,
-            "ams": []
+            "ams": [],
+            "ams_units": [],  # v2.2.1: Luftfeuchtigkeit je AMS-Einheit, siehe _apply_print_report()
         }
         self._client = None
         self._stop = False
@@ -725,8 +732,30 @@ class PrinterConnection:
             s["file_name"] = p["subtask_name"]
         elif "gcode_file" in p and p["gcode_file"]:
             s["file_name"] = p["gcode_file"]
+        # v2.2.0: Diagnose fuer "Kammertemperatur zeigt immer -degC" bei
+        # Druckern, die laut Druckerfamilie eigentlich einen Kammersensor
+        # haben (X1-Serie; A1 hat generell keinen, siehe README/Frontend-
+        # Ausblendung fuer bambu_family=="a1"). "chamber_temper" ist der
+        # bekannte (getippte) Feldname im offiziellen Bambu-MQTT-Protokoll
+        # - als defensiver Fallback wird zusaetzlich der (theoretisch
+        # denkbare, in manchen Firmware-Staenden kolportierte) Feldname
+        # OHNE den Tippfehler akzeptiert, falls "chamber_temper" fehlt.
+        # Liefert WEDER das eine NOCH das andere Feld einen Wert, obwohl
+        # die konfigurierte Druckerfamilie einen Kammersensor haben sollte,
+        # wird das EINMALIG pro Verbindung geloggt (Server-Konsole) - das
+        # ist die Grundlage, um mit einer echten Rohnutzlast (kompletter
+        # "print"-Report dieses Druckers) den tatsaechlichen Feldnamen zu
+        # verifizieren, statt hier ungeprueft weiterzuraten.
         if "chamber_temper" in p:
             s["chamber_temp"] = p["chamber_temper"]
+        elif "chamber_temp" in p:
+            s["chamber_temp"] = p["chamber_temp"]
+        elif self.cfg.get("bambu_family", "x1") != "a1" and not getattr(self, "_chamber_missing_logged", False):
+            self._chamber_missing_logged = True
+            print(f"[MK6] Hinweis: Drucker '{self.cfg.get('name', self.id)}' "
+                  f"(Familie: {self.cfg.get('bambu_family', 'x1')}) liefert kein "
+                  f"'chamber_temper'/'chamber_temp'-Feld im MQTT-Report. Rohreport-"
+                  f"Schluessel in diesem Update: {sorted(p.keys())}")
         if "nozzle_temper" in p:
             s["nozzle_temp"] = p["nozzle_temper"]
         if "bed_temper" in p:
@@ -737,6 +766,7 @@ class PrinterConnection:
         ams_root = p.get("ams", {}).get("ams")
         if isinstance(ams_root, list):
             slots = []
+            units = []
             for unit in ams_root:
                 for tray in unit.get("tray", []):
                     slots.append({
@@ -745,7 +775,23 @@ class PrinterConnection:
                         "color": _argb_to_css(tray.get("tray_color")),
                         "remain": tray.get("remain", -1)
                     })
+                # v2.2.1: Luftfeuchtigkeit je AMS-Einheit (nicht je Fach) -
+                # community-dokumentiertes Feld "humidity" im Bambu-MQTT-
+                # Protokoll (u. a. genutzt von der Home-Assistant-Bambu-
+                # Lab-Integration), eine STUFE von 1 (trocken) bis 5
+                # (feucht) - KEIN Prozentwert. Defensiv geparst: fehlt das
+                # Feld oder ist es nicht als Zahl auswertbar, wird die
+                # Einheit einfach ohne Feuchte-Angabe gefuehrt, statt zu
+                # raten.
+                humidity = None
+                try:
+                    if unit.get("humidity") is not None:
+                        humidity = int(unit["humidity"])
+                except (TypeError, ValueError):
+                    humidity = None
+                units.append({"id": unit.get("id", "0"), "humidity": humidity})
             s["ams"] = slots
+            s["ams_units"] = units
 
     # ------------------------------------------------------------------
     # Druckauftrag per Drag & Drop senden
@@ -2633,6 +2679,24 @@ class DashboardApp:
             # noetig. Guenstig genug (kleine JSON-Datei einlesen), um bei
             # jedem Status-Abruf frisch berechnet zu werden.
             item["queue_count"] = len(self.queue.list_entries(p["id"]))
+            # MK6 v2.2.0: Vorschaubild des aktuellen/zuletzt gestarteten
+            # Druckauftrags fuer die Anzeige neben dem Fortschrittsbalken.
+            # Quelle: der NEUESTE Verlaufseintrag dieses Druckers (Verlauf
+            # wird bereits bei jedem erfolgreich ueber das Dashboard
+            # gesendeten Auftrag befuellt, siehe PrintHistoryStore/
+            # _record_history_after_send() - kein neuer Speicherort noetig,
+            # kein zusaetzlicher Aufruf an den Drucker selbst). Ist bewusst
+            # NICHT auf "druckt gerade" beschraenkt - bei OctoPrint/
+            # Creality/Formlabs (kein Versand ueber das Dashboard moeglich)
+            # bleibt der Verlauf ohnehin leer, das Bild erscheint dort also
+            # gar nicht erst.
+            latest_history = self.history.list_entries(p["id"])
+            if latest_history:
+                item["current_thumb_job_id"] = latest_history[0]["job_id"]
+                item["current_thumb_has_image"] = bool(latest_history[0].get("has_image"))
+            else:
+                item["current_thumb_job_id"] = None
+                item["current_thumb_has_image"] = False
             out.append(item)
         return out
 
@@ -2841,9 +2905,10 @@ class DashboardApp:
         fortgesetzt werden darf ("Druckraum leer"-Knopf). Bei Bambu Lab
         strenger als is_printer_busy(): reicht "nicht beschaeftigt" allein
         NICHT - verlangt EXPLIZIT einen der BAMBU_READY_FOR_NEXT_STATES
-        ("FINISH" oder "IDLE"), siehe Kommentar dort. Uebergangszustaende
-        wie "PREPARE"/"SLICING" gelten damit bewusst NICHT als bereit,
-        obwohl sie nicht in PRINTER_BUSY_STATES stehen. Fuer alle anderen
+        ("FINISH", "IDLE" oder seit v2.1.1 auch "FAILED"), siehe Kommentar
+        dort. Uebergangszustaende wie "PREPARE"/"SLICING" gelten damit
+        bewusst NICHT als bereit, obwohl sie nicht in PRINTER_BUSY_STATES
+        stehen. Fuer alle anderen
         Druckertypen (aktuell nur Ultimaker relevant, da nur diese Typen
         eine Warteschlange haben) bleibt es bei der bisherigen, einfachen
         Regel "nicht beschaeftigt" - dafuer wurde keine Verschaerfung
@@ -3210,9 +3275,10 @@ class DashboardApp:
             return False, "Drucker nicht gefunden.", None
         if not self.is_ready_for_next_print(printer_id):
             if p.get("type", "bambu") == "bambu":
-                return False, ("Dieser Bambu-Lab-Drucker ist noch nicht fertig (Status muss FINISH "
-                                "oder IDLE sein) - die Warteschlange kann erst fortgesetzt werden, "
-                                "wenn der aktuelle Druck abgeschlossen ist."), None
+                return False, ("Dieser Bambu-Lab-Drucker ist noch nicht fertig (Status muss FINISH, "
+                                "IDLE oder FAILED sein) - die Warteschlange kann erst fortgesetzt "
+                                "werden, wenn der aktuelle Druck abgeschlossen oder abgebrochen "
+                                "ist."), None
             return False, ("Dieser Drucker druckt (oder pausiert) noch - die Warteschlange kann "
                             "erst fortgesetzt werden, wenn der aktuelle Druck abgeschlossen ist."), None
         entries = self.queue.list_entries(printer_id)
@@ -3774,6 +3840,7 @@ INDEX_HTML = r"""
     --accent:#ff9142;
     --accent-2:#3ddc97;
     --danger:#ff5d5d;
+    --info:#4aa3ff; /* v2.2.2: AMS-Luftfeuchtigkeit (Sparkline + Massstab) */
     --mono: 'JetBrains Mono', 'Consolas', 'SFMono-Regular', monospace;
     --sans: 'Inter', 'Segoe UI', system-ui, sans-serif;
   }
@@ -3902,6 +3969,14 @@ INDEX_HTML = r"""
   }
 
   .progress-row{ display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+  /* v2.2.0: Vorschaubild des aktuellen/zuletzt gestarteten Druckauftrags
+     neben dem Fortschrittsbalken (siehe progressThumb()) - dieselbe
+     Bildquelle wie im Verlaufs-Fenster, daher dieselbe Bildproportion
+     (object-fit:cover, quadratisch zugeschnitten). */
+  .progress-thumb{
+    width:40px; height:40px; border-radius:6px; object-fit:cover;
+    border:1px solid var(--border); flex-shrink:0; background:#1b2027;
+  }
   .progress-track{
     flex:1; height:10px; border-radius:5px; background:#20252c; overflow:hidden;
     border:1px solid var(--border);
@@ -3916,11 +3991,48 @@ INDEX_HTML = r"""
   .temp-chip{
     background:#1b2027; border:1px solid var(--border); border-radius:6px;
     padding:8px 12px; font-family:var(--mono); font-size:12.5px; color:var(--text-dim);
+    display:flex; align-items:center; gap:8px;
   }
   .temp-chip b{ color:var(--text); font-size:13px; }
+  /* v2.2.0: kleines Verlaufsdiagramm (Sparkline) je Temperaturanzeige -
+     rein client-seitig aus den letzten Status-Umfragen aufgebaut (siehe
+     tempHistory/sparklineSvg() im Skript), kein Backend-Speicher noetig.
+     "currentColor" (siehe SVG-<polyline> in sparklineSvg()) uebernimmt
+     diese Farbe. v2.2.1: auf ausdruecklichen Wunsch des Nutzers als rote
+     Linie dargestellt (vorher gedimmte Chip-Textfarbe). v2.2.2: die AMS-
+     Luftfeuchtigkeit (humidityChip()) nutzt jetzt eine EIGENE Klasse
+     (.humidity-spark, blau) statt .temp-spark, um sie optisch von den
+     Temperatur-Sparklines zu unterscheiden - siehe dort. */
+  .temp-spark{ color:var(--danger); flex-shrink:0; opacity:0.9; }
+  .humidity-spark{ color:var(--info); flex-shrink:0; opacity:0.9; }
+
+  /* v2.2.2: kleiner 1-5-Massstab neben dem Feuchte-Rohwert (siehe
+     humidityScale()) - gefuellte Punkte bis einschliesslich der
+     aktuellen Stufe, damit die Zahl ohne Nachschlagen eingeordnet werden
+     kann. v2.2.3 - NUTZER-FEEDBACK: einheitliches Blau liess nicht
+     erkennen, ob ein Wert gut oder schlecht ist - die Punkte werden
+     jetzt zusaetzlich in Ampelfarbe eingefaerbt (gruen/gelb/rot je nach
+     Stufe, siehe HUMIDITY_LEVELS im Skript), die Sparkline-Linie selbst
+     bleibt bewusst blau (siehe .humidity-spark oben). */
+  .humidity-scale{ display:inline-flex; align-items:center; gap:2px; flex-shrink:0; }
+  .humidity-dot{
+    width:6px; height:6px; border-radius:50%; background:#232a33;
+    border:1px solid var(--border); display:inline-block;
+  }
+  .humidity-dot.filled.good{ background:var(--accent-2); border-color:var(--accent-2); }
+  .humidity-dot.filled.mid{ background:#e8b23d; border-color:#e8b23d; }
+  .humidity-dot.filled.bad{ background:var(--danger); border-color:var(--danger); }
+  /* v2.2.3: Wort-Label ("trocken"/"feucht"/...) neben dem Zahlenwert,
+     siehe humidityLabel() - dieselbe Ampelfarbe wie der Massstab. */
+  .humidity-label{ font-family:var(--sans); font-size:11px; font-weight:600; }
+  .humidity-label.good{ color:var(--accent-2); }
+  .humidity-label.mid{ color:#e8b23d; }
+  .humidity-label.bad{ color:var(--danger); }
 
   .ams-title{ font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:var(--text-dim); margin-bottom:10px;}
   .ams-slot{ display:flex; align-items:center; gap:10px; margin-bottom:9px; }
+  /* v2.2.1: Luftfeuchtigkeit je AMS-Einheit, unterhalb der Fach-Liste */
+  .ams-humidity-row{ margin-top:4px; }
   .ams-swatch{ width:14px; height:14px; border-radius:3px; border:1px solid #000a; flex-shrink:0;}
   .ams-meta{ font-family:var(--mono); font-size:11.5px; color:var(--text-dim); width:110px; flex-shrink:0;}
   .ams-track{ flex:1; height:8px; border-radius:4px; background:#20252c; overflow:hidden; border:1px solid var(--border);}
@@ -4579,14 +4691,20 @@ function closeQueueModal(){
 
 // v2.0.1: Aktiviert/deaktiviert den "Druckraum leer"-Knopf anhand des
 // zuletzt bekannten Druckerstatus (aus lastPrinterList, siehe refresh())
-// - bei Bambu Lab wird dafuer EXPLIZIT der Status FINISH oder IDLE
-// verlangt (nicht nur "nicht am Drucken"), siehe DashboardApp.
-// is_ready_for_next_print() fuer die serverseitige Gegenpruefung, die in
-// jedem Fall zusaetzlich greift. Wird sowohl nach jedem Laden/Aendern der
-// Warteschlange als auch bei jedem regulaeren 2,5-Sekunden-Status-Poll
-// aufgerufen (siehe refresh()), damit der Knopf automatisch aktiv wird,
-// sobald der laufende Druck fertig ist, ohne dass der Nutzer das Modal
-// schliessen/neu oeffnen muss.
+// - bei Bambu Lab wird dafuer EXPLIZIT der Status FINISH, IDLE oder (seit
+// v2.1.1) FAILED verlangt (nicht nur "nicht am Drucken"), siehe
+// DashboardApp.is_ready_for_next_print() fuer die serverseitige
+// Gegenpruefung, die in jedem Fall zusaetzlich greift. Wird sowohl nach
+// jedem Laden/Aendern der Warteschlange als auch bei jedem regulaeren
+// 2,5-Sekunden-Status-Poll aufgerufen (siehe refresh()), damit der Knopf
+// automatisch aktiv wird, sobald der laufende Druck fertig ist oder
+// fehlgeschlagen ist, ohne dass der Nutzer das Modal schliessen/neu
+// oeffnen muss.
+// v2.1.1 - BUGFIX: vorher fehlte "FAILED" in dieser Liste (obwohl
+// BAMBU_READY_FOR_NEXT_STATES es serverseitig bereits erlaubte) - ein
+// fehlgeschlagener Druck liess den Knopf dauerhaft deaktiviert stehen,
+// die Warteschlange war damit blockiert, bis ein neuer Druck ausserhalb
+// der Warteschlange gestartet wurde.
 function updateQueueSendButtonState(){
   const btn = document.getElementById('queueSendNextBtn');
   const hint = document.getElementById('queueSendHint');
@@ -4594,7 +4712,7 @@ function updateQueueSendButtonState(){
   const p = lastPrinterList.find(x => x.id === queueModalPrinterId);
   const state = (p && p.gcode_state) ? String(p.gcode_state).toUpperCase() : '';
   const isBambu = p && p.type === 'bambu';
-  const ready = isBambu ? ['FINISH', 'IDLE'].includes(state) : !PRINTER_BUSY_STATES_JS.includes(state);
+  const ready = isBambu ? ['FINISH', 'IDLE', 'FAILED'].includes(state) : !PRINTER_BUSY_STATES_JS.includes(state);
 
   if(!queueModalHasEntries){
     btn.disabled = true;
@@ -4883,11 +5001,140 @@ function formatTemp(v){
   return Number.isFinite(n) ? n : '–';
 }
 
-function renderAms(ams){
+// v2.2.0: kleines Verlaufsdiagramm je Temperaturanzeige -----------------
+// Rein client-seitig im Browser-Speicher (kein Backend-Persistieren, kein
+// zusaetzlicher API-Endpunkt noetig) - fuellt sich aus den ohnehin schon
+// alle 2,5 Sekunden abgerufenen Status-Werten (siehe refresh()). Geht beim
+// Neuladen der Seite verloren, das ist fuer eine kleine "Trend"-Anzeige
+// bewusst in Ordnung (kein Anspruch auf dauerhafte Temperaturhistorie).
+const tempHistory = {}; // printerId -> { [feldname]: number[] }
+const TEMP_HISTORY_MAX_POINTS = 40; // ~100 Sekunden bei 2,5s-Poll-Takt
+
+function recordTempHistory(printerId, field, value){
+  if(value === undefined || value === null) return;
+  const n = Number(value);
+  if(!Number.isFinite(n)) return;
+  if(!tempHistory[printerId]) tempHistory[printerId] = {};
+  const bucket = tempHistory[printerId];
+  const arr = bucket[field] || (bucket[field] = []);
+  arr.push(n);
+  if(arr.length > TEMP_HISTORY_MAX_POINTS) arr.shift();
+}
+
+// Baut ein kleines Inline-SVG-Liniendiagramm aus den zuletzt erfassten
+// Werten - bewusst ohne externe Chart-Bibliothek (das Dashboard bleibt
+// eine einzelne Datei / PyInstaller-onefile-tauglich, siehe Kommentar am
+// Dateianfang). Liefert einen leeren String, solange weniger als 2 Punkte
+// vorliegen (noch keine sinnvolle Linie moeglich, z. B. direkt nach dem
+// Start des Dashboards).
+// v2.2.2: "cssClass" waehlt die Farbe der Linie aus (siehe CSS -
+// "temp-spark" = rot fuer Temperaturen, "humidity-spark" = blau fuer die
+// AMS-Luftfeuchtigkeit) - beide nutzen denselben currentColor-Mechanismus,
+// nur die jeweilige Klasse setzt eine andere Textfarbe.
+function sparklineSvg(values, cssClass){
+  if(!values || values.length < 2) return '';
+  const w = 54, h = 18, pad = 2;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = (max - min) || 1; // vermeidet Division durch 0 bei konstanter Temperatur
+  const step = (w - pad * 2) / (values.length - 1);
+  const points = values.map((v, i) => {
+    const x = pad + i * step;
+    const y = h - pad - ((v - min) / range) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  return `<svg class="${cssClass || 'temp-spark'}" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">` +
+         `<polyline points="${points}" fill="none" stroke="currentColor" stroke-width="1.5" ` +
+         `stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+// Gemeinsamer Baustein fuer alle Temperatur-Chips (Bambu/OctoPrint/
+// Creality/Ultimaker) - erfasst den aktuellen Wert in tempHistory UND
+// rendert Chip + Sparkline in einem Aufwasch, damit das nicht in jeder
+// Karten-Renderfunktion einzeln dupliziert werden muss.
+function tempChip(printerId, field, label, value){
+  recordTempHistory(printerId, field, value);
+  const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
+  return `<div class="temp-chip">${label} <b>${formatTemp(value)}&deg;C</b>${sparklineSvg(history)}</div>`;
+}
+
+// v2.2.0: kleines Vorschaubild des aktuellen/zuletzt gestarteten
+// Druckauftrags neben dem Fortschrittsbalken - Quelle ist der neueste
+// Verlaufseintrag dieses Druckers (current_thumb_job_id/
+// current_thumb_has_image, siehe DashboardApp.all_status()), also
+// dieselbe Vorschau wie im Verlaufs-Fenster. Bleibt leer, wenn (noch)
+// kein ueber das Dashboard gesendeter Auftrag im Verlauf existiert -
+// betrifft z. B. OctoPrint/Creality/Formlabs (kein Versand ueber das
+// Dashboard moeglich) oder einen frisch angelegten Drucker.
+function progressThumb(p){
+  if(!p.current_thumb_has_image || !p.current_thumb_job_id) return '';
+  return `<img class="progress-thumb" src="/api/printers/${p.id}/history/${p.current_thumb_job_id}/thumbnail" ` +
+         `alt="" title="Vorschau des aktuellen/letzten Druckauftrags">`;
+}
+
+// v2.2.3: Woertliche Einordnung der Bambu-Feuchte-Stufe (1 = trocken/gut
+// bis 5 = feucht/schlecht - dieselbe Skala wie zuvor nur im Tooltip
+// genannt). NUTZER-FEEDBACK v2.2.2: der Rohwert allein ("4") war ohne
+// Hover auf den Massstab nicht als "eher schlecht" erkennbar - deshalb
+// jetzt ZUSAETZLICH als sichtbares Wort neben der Zahl, nicht nur im
+// Tooltip. "severity" steuert zusaetzlich die Ampelfarbe der Punkte
+// (siehe humidityScale()).
+const HUMIDITY_LEVELS = {
+  1: { label: 'trocken',      severity: 'good' },
+  2: { label: 'leicht feucht', severity: 'good' },
+  3: { label: 'mittel',       severity: 'mid'  },
+  4: { label: 'feucht',       severity: 'bad'  },
+  5: { label: 'sehr feucht',  severity: 'bad'  },
+};
+
+// v2.2.2 (erweitert in v2.2.3 um Ampelfarbe + Wort-Label): kleiner 1-5-
+// Massstab neben dem Feuchte-Rohwert, damit die Zahl allein eingeordnet
+// werden kann. Fuenf Punkte, gefuellt bis einschliesslich der aktuellen
+// Stufe UND in Ampelfarbe (gruen=trocken/gut, gelb=mittel, rot=feucht/
+// schlecht) statt einheitlich blau - damit "gut oder schlecht" auch ohne
+// Hover sofort erkennbar ist. Ein Tooltip nennt die Skala zusaetzlich in
+// Worten.
+function humidityScale(value){
+  if(value === undefined || value === null) return '';
+  const level = HUMIDITY_LEVELS[value];
+  const severity = level ? level.severity : '';
+  const dots = [1, 2, 3, 4, 5].map(i =>
+    `<span class="humidity-dot${i <= value ? ' filled ' + severity : ''}"></span>`
+  ).join('');
+  return `<span class="humidity-scale" title="Feuchte-Stufe: 1 = trocken/gut, 5 = feucht/schlecht">${dots}</span>`;
+}
+
+// v2.2.3: sichtbares Wort-Label ("trocken"/"feucht"/...) direkt neben dem
+// Zahlenwert, in derselben Ampelfarbe wie der Massstab - siehe
+// HUMIDITY_LEVELS oben fuer den Hintergrund dieser Ergaenzung.
+function humidityLabel(value){
+  const level = HUMIDITY_LEVELS[value];
+  if(!level) return '';
+  return `<span class="humidity-label ${level.severity}">${level.label}</span>`;
+}
+
+// v2.2.1: Chip fuer die AMS-Luftfeuchtigkeit - nutzt bewusst dieselbe
+// tempHistory-Infrastruktur wie tempChip() (generischer Werteverlauf,
+// nicht spezifisch fuer Temperaturen), da eine Sparkline hier identisch
+// funktioniert. Der Rohwert ist eine Bambu-eigene Stufe von 1 (trocken)
+// bis 5 (feucht), KEIN Prozentwert - daher ohne Einheit angezeigt, dafuer
+// seit v2.2.2 mit humidityScale() als Einordnungshilfe direkt daneben.
+// v2.2.2: Sparkline-Linie in Blau (eigene CSS-Klasse "humidity-spark"),
+// auf ausdruecklichen Nutzerwunsch von der roten Temperatur-Sparkline
+// unterschieden.
+function humidityChip(printerId, field, label, value){
+  recordTempHistory(printerId, field, value);
+  const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
+  const display = (value === undefined || value === null) ? '–' : value;
+  return `<div class="temp-chip">${label} <b>${display}</b>${humidityLabel(value)}${humidityScale(value)}` +
+         `${sparklineSvg(history, 'humidity-spark')}</div>`;
+}
+
+function renderAms(printerId, ams, amsUnits){
   if(!ams || ams.length === 0){
     return '<div class="empty-ams">Kein AMS erkannt / keine Fach-Daten.</div>';
   }
-  return ams.map(t => {
+  const slots = ams.map(t => {
     const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '–' : t.remain + '%';
     const width = (t.remain && t.remain > 0) ? t.remain : 0;
     return `<div class="ams-slot">
@@ -4897,6 +5144,16 @@ function renderAms(ams){
       <div class="ams-remain">${remain}</div>
     </div>`;
   }).join('');
+  // v2.2.1: Luftfeuchtigkeit je AMS-Einheit, mit Verlaufsdiagramm - nur
+  // Einheiten mit tatsaechlich vorhandenem Wert werden angezeigt (manche
+  // AMS-Firmwarestaende liefern das Feld nicht, siehe _apply_print_report()).
+  const units = (amsUnits || []).filter(u => u.humidity !== undefined && u.humidity !== null);
+  const humidityRow = units.length
+    ? `<div class="temps ams-humidity-row">${units.map(u =>
+        humidityChip(printerId, `ams_humidity_${u.id}`, `Feuchte AMS ${u.id}`, u.humidity)
+      ).join('')}</div>`
+    : '';
+  return slots + humidityRow;
 }
 
 function renderExtras(printerId, extras){
@@ -4979,20 +5236,21 @@ function renderBambuCard(p){
 
           <div class="field-label">Fortschritt</div>
           <div class="progress-row">
+            ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
           </div>
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Kammer <b>${formatTemp(p.chamber_temp)}&deg;C</b></div>
-            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
+            ${p.bambu_family === 'a1' ? '' : tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp)}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
           </div>
         </div>
         <div>
           <div class="ams-title">AMS / Filament</div>
-          ${renderAms(p.ams)}
+          ${renderAms(p.id, p.ams, p.ams_units)}
           ${renderDropZone(p.id)}
         </div>
       </div>
@@ -5350,14 +5608,15 @@ function renderOctoPrintCard(p){
 
           <div class="field-label">Fortschritt</div>
           <div class="progress-row">
+            ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
           </div>
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5398,15 +5657,16 @@ function renderCrealityCard(p){
 
           <div class="field-label">Fortschritt</div>
           <div class="progress-row">
+            ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
           </div>
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            ${hasChamber ? `<div class="temp-chip">Kammer <b>${formatTemp(p.chamber_temp)}&deg;C</b></div>` : ''}
-            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
+            ${hasChamber ? tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp) : ''}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5447,14 +5707,15 @@ function renderUltimakerCard(p){
 
           <div class="field-label">Fortschritt</div>
           <div class="progress-row">
+            ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
           </div>
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            <div class="temp-chip">Duese <b>${formatTemp(p.nozzle_temp)}&deg;C</b></div>
-            <div class="temp-chip">Bett <b>${formatTemp(p.bed_temp)}&deg;C</b></div>
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5624,6 +5885,7 @@ function renderFormlabsCard(p){
 
           <div class="field-label">Fortschritt</div>
           <div class="progress-row">
+            ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
           </div>

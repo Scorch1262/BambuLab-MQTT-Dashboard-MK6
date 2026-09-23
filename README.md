@@ -37,6 +37,7 @@ ist (siehe [Abschnitt 3j](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)).
 - [3h. Druckauftrags-Verlauf (neu seit MK6)](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)
 - [3i. Kartenlayout: 1/2/3-spaltig (neu seit MK6 v1.1.0)](#3i-kartenlayout-123-spaltig-neu-seit-mk6-v110)
 - [3j. Warteschlange je Drucker (neu seit MK6 v1.2.0)](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)
+- [3k. Temperatur-Verlaufsdiagramme & Druckbild (neu seit MK6 v2.2.0)](#3k-temperatur-verlaufsdiagramme--druckbild-neu-seit-mk6-v220)
 - [4. Bambu Lab: Voraussetzungen](#4-voraussetzungen-auf-seite-der-bambu-lab-drucker)
 - [4a. Bambu Lab: Drag & Drop drucken](#4a-bambu-lab-druckauftrag-per-drag--drop-senden)
 - [5. Funktionsumfang](#5-funktionsumfang)
@@ -402,8 +403,9 @@ leer" kann dann einfach erneut geklickt werden.
 
 > ⚠️ **Bei Bambu Lab (seit v2.0.1) ist die Schaltflaeche erst klickbar,
 > wenn der Drucker WIRKLICH fertig ist** — der Status muss `FINISH`
-> (Druck soeben abgeschlossen) oder `IDLE` (Drucker hat noch gar nichts
-> gedruckt) sein. Solange der Drucker noch druckt, pausiert oder sich in
+> (Druck soeben abgeschlossen), `IDLE` (Drucker hat noch gar nichts
+> gedruckt) oder `FAILED` (Druck abgebrochen/fehlgeschlagen — seit
+> v2.1.1) sein. Solange der Drucker noch druckt, pausiert oder sich in
 > einem Uebergangszustand befindet (z. B. `PREPARE`/`SLICING`), bleibt der
 > Knopf ausgegraut und ein Hinweistext zeigt den aktuellen Status an —
 > das Dashboard aktualisiert das automatisch alle 2,5 Sekunden, ohne dass
@@ -412,6 +414,13 @@ leer" kann dann einfach erneut geklickt werden.
 > Druckauftrag also nicht versehentlich vorzeitig auf den Drucker
 > schicken. Fuer Ultimaker gilt weiterhin die einfachere Regel "Drucker
 > ist nicht beschaeftigt".
+>
+> **Bugfix v2.1.1:** vorher blieb die Warteschlange nach einem
+> fehlgeschlagenen Druck dauerhaft blockiert, da der Drucker in diesem
+> Fall im Status `FAILED` verharrt (weder `FINISH` noch `IDLE`) — der
+> Knopf liess sich dann gar nicht mehr klicken, bis ausserhalb der
+> Warteschlange ein neuer Druck gestartet wurde. `FAILED` zaehlt jetzt
+> ebenfalls als "bereit fuer den naechsten Druck".
 
 **Auftraege aus dem Verlauf hinzufuegen/zuweisen:** im Verlauf
 ([3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)) legen die
@@ -435,6 +444,52 @@ Eintrag korrekt.
 > Weiteres auf eine A1. Die Auswahlliste im "Zuweisen"-Dialog zeigt von
 > vornherein nur passende Drucker an; die Pruefung erfolgt zusaetzlich
 > serverseitig.
+
+## 3k. Temperatur-Verlaufsdiagramme & Druckbild (neu seit MK6 v2.2.0)
+
+**Kleines Verlaufsdiagramm je Temperaturanzeige:** jeder Temperatur-Chip
+(Duese/Bett/Kammer, ueberall dort wo Temperaturen angezeigt werden) zeigt
+zusaetzlich eine kleine Sparkline mit dem Verlauf der letzten Werte —
+seit v2.2.1 als **rote Linie**. Diese wird rein im Browser aus den
+ohnehin alle 2,5 Sekunden abgerufenen Status-Werten aufgebaut — es gibt
+keine dauerhafte, serverseitig gespeicherte Temperaturhistorie, und der
+Verlauf geht beim Neuladen der Seite verloren (bewusst, siehe
+[6](#6-hinweise--grenzen): das Dashboard speichert grundsaetzlich keine
+Zeitreihen).
+
+**AMS-Luftfeuchtigkeit (neu seit v2.2.1):** je AMS-Einheit (nicht je
+Fach) wird zusaetzlich die vom AMS gemeldete Luftfeuchtigkeits-**Stufe**
+angezeigt (1 = trocken bis 5 = feucht — ein von Bambu Lab selbst
+definierter Indexwert, **kein Prozentwert**), ebenfalls mit
+Verlaufsdiagramm — seit v2.2.2 als **blaue Linie** (Temperaturen bleiben
+rot, damit beide auf einen Blick unterscheidbar sind). Erscheint nur fuer
+AMS-Einheiten, die dieses Feld tatsaechlich melden — bei mehreren
+angeschlossenen AMS-Einheiten wird jede einzeln aufgefuehrt ("Feuchte AMS
+0", "Feuchte AMS 1", ...).
+
+**Massstab zur Einordnung (neu seit v2.2.2, um ein Wort-Label erweitert
+seit v2.2.3):** direkt neben dem Feuchte-Rohwert steht jetzt zusaetzlich
+ein sichtbares Wort ("trocken", "leicht feucht", "mittel", "feucht",
+"sehr feucht") sowie eine kleine Punktreihe (1 bis 5, gefuellt bis zur
+aktuellen Stufe) — beide in Ampelfarbe (gruen = trocken/gut, gelb =
+mittel, rot = feucht/schlecht), damit auf einen Blick erkennbar ist, ob
+der aktuelle Wert unproblematisch ist oder ein Wechsel des Trockenmittels
+sinnvoll waere. Ein Mauszeiger auf der Punktreihe nennt zusaetzlich die
+Bedeutung der Skala in Worten ("1 = trocken/gut, 5 = feucht/schlecht").
+
+**Keine Kammertemperatur bei der A1-Familie:** die A1-Serie (A1, A1 Mini)
+hat keinen Kammertemperatursensor. Der entsprechende Chip wird deshalb bei
+Druckern mit Druckerfamilie "A1-Serie" (siehe
+[4](#4-voraussetzungen-auf-seite-der-bambu-lab-drucker)) generell nicht
+mehr angezeigt, statt dauerhaft `-°C` zu zeigen.
+
+**Druckbild neben dem Fortschrittsbalken:** zeigt das Vorschaubild des
+zuletzt ueber das Dashboard gesendeten Druckauftrags (Bambu Lab/
+Ultimaker) — dieselbe Vorschau wie im Verlauf
+([3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)). Erscheint
+nicht, solange fuer diesen Drucker noch kein Auftrag ueber das Dashboard
+gesendet wurde (z. B. frisch angelegter Drucker, oder OctoPrint/Creality/
+Formlabs — dort ist kein Druckversand ueber das Dashboard moeglich).
 
 ## 4. Voraussetzungen auf Seite der Bambu Lab Drucker
 
@@ -540,7 +595,7 @@ Druckauftraege per Drag & Drop gibt es nur fuer **Bambu Lab** und
 | Aktuelle Datei | mit typspezifischer Bezeichnung (z. B. "Aktueller Waschzyklus" bei Wash L) |
 | Kamera | Bambu Lab, OctoPrint, Creality, Ultimaker |
 | AMS-Anzeige | Bambu Lab: Fuellstand je Fach als Balken (Farbe = Filamentfarbe) + Materialsorte |
-| Temperaturen | Duese/Bett bei Bambu/OctoPrint/Creality/Ultimaker; Kammer bei Bambu immer, bei Creality falls im Klipper-Setup konfiguriert (bei Ultimaker nicht verfuegbar — kein Sensor); Anzeige seit v2.1.0 immer auf max. 2 Nachkommastellen gerundet |
+| Temperaturen | Duese/Bett bei Bambu/OctoPrint/Creality/Ultimaker; Kammer bei Bambu ausser bei der A1-Familie (kein Kammersensor, seit v2.2.0 generell ausgeblendet), bei Creality falls im Klipper-Setup konfiguriert (bei Ultimaker nicht verfuegbar — kein Sensor); Anzeige seit v2.1.0 immer auf max. 2 Nachkommastellen gerundet; seit v2.2.0 mit kleinem Verlaufsdiagramm je Temperaturanzeige ([3k](#3k-temperatur-verlaufsdiagramme--druckbild-neu-seit-mk6-v220)) |
 | Material | Formlabs: aktuell geladenes Harz |
 | Restzeit | Bambu Lab, OctoPrint, Ultimaker |
 | Fehleranzeige | roter Klartext-Hinweis direkt auf der Karte bei Verbindungsproblemen |
@@ -548,6 +603,7 @@ Druckauftraege per Drag & Drop gibt es nur fuer **Bambu Lab** und
 | **Druckauftrags-Verlauf** | **neu seit MK6** — automatischer Ordner je Drucker, Einsehen/Erneut drucken/Loeschen ([3h](#3h-druckauftrags-verlauf-je-drucker-neu-seit-mk6)) |
 | **Kartenlayout** | **neu seit MK6 v1.1.0** — wahlweise 1/2/3-spaltig, Auswahl je Browser gespeichert ([3i](#3i-kartenlayout-123-spaltig-neu-seit-mk6-v110)) |
 | **Warteschlange** | **neu seit MK6 v1.2.0** — Bambu Lab/Ultimaker: automatisches Einreihen bei beschaeftigtem Drucker, manuell bearbeitbar (Reihenfolge/Loeschen/Hinzufuegen), Zuweisen an andere Drucker ([3j](#3j-warteschlange-je-drucker-neu-seit-mk6-v120)) |
+| **Druckbild neben Fortschrittsbalken** | **neu seit MK6 v2.2.0** — Vorschaubild des zuletzt ueber das Dashboard gesendeten Druckauftrags (Bambu Lab/Ultimaker) ([3k](#3k-temperatur-verlaufsdiagramme--druckbild-neu-seit-mk6-v220)) |
 | Aktualisierung | automatisch alle 2,5 Sekunden im Browser |
 
 ## 6. Hinweise / Grenzen
@@ -574,6 +630,16 @@ Druckauftraege per Drag & Drop gibt es nur fuer **Bambu Lab** und
   Einschraenkungen der jeweiligen Hersteller, keine Design-Entscheidung
   dieses Programms. "Creality OS" ohne Klipper wird bewusst nicht
   unterstuetzt (keine dokumentierte lokale API).
+- **Bekanntes, noch ungeklaertes Problem (Stand v2.2.0): Kammertemperatur
+  bei X1-Serie zeigt weiterhin `-°C`.** Der Server prueft seit v2.2.0
+  zusaetzlich zum bekannten Feldnamen `chamber_temper` defensiv auch
+  `chamber_temp` (siehe `PrinterConnection._apply_print_report()`) — liegt
+  aber trotzdem kein Wert vor, wird das EINMALIG pro Verbindung auf der
+  Server-Konsole geloggt (inkl. der tatsaechlich im MQTT-Report
+  vorhandenen Schluessel). Betroffene Nutzer: bitte den entsprechenden
+  Konsolen-Hinweis nach `[MK6] Hinweis: ... liefert kein 'chamber_temper'/
+  'chamber_temp'-Feld ...` melden, damit der tatsaechliche Feldname
+  anhand echter Rohdaten (statt Vermutungen) ermittelt werden kann.
 - OctoPrint-Kamera nimmt die mjpg-streamer-Standard-URL an, falls keine
   eigene Webcam-URL gesetzt ist.
 - Ultimaker braucht keine zusaetzliche Software — die lokale API ist von

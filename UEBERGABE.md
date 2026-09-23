@@ -2735,6 +2735,181 @@ Learned) - sie wird hier nicht dupliziert, nur fortgesetzt.
      bereits clientseitig entsprechend vor.
   Siehe Abschnitt 5 (Unterabschnitt "Warteschlange je Drucker") fuer die
   Einordnung dieser Erweiterungen in den Gesamtkontext des Feature.
+- **v2.1.1 (MK6): Bugfix.** Nach einem fehlgeschlagenen Druck (Bambu-Status
+  `FAILED`) liess sich der naechste Warteschlangen-Auftrag NICHT mehr
+  ueber "Druckraum leer" starten - `BAMBU_READY_FOR_NEXT_STATES` enthielt
+  bisher nur `FINISH`/`IDLE` (siehe v2.0.1-Eintrag oben), `FAILED` fehlte.
+  Der Drucker verharrt nach einem Fehlschlag dauerhaft in diesem Status
+  (anders als die dort beschriebenen, tatsaechlich VORUEBERGEHENDEN
+  Uebergangszustaende wie `PREPARE`/`SLICING`), die Warteschlange war also
+  bis zu einem manuell ausserhalb der Warteschlange gestarteten Druck
+  komplett blockiert. Fix: `FAILED` zu `BAMBU_READY_FOR_NEXT_STATES`
+  hinzugefuegt (Backend, `DashboardApp.is_ready_for_next_print()`) UND zur
+  identisch dupliziert gefuehrten Zustandsliste im Frontend
+  (`updateQueueSendButtonState()`, vorher hart codiert `['FINISH','IDLE']`)
+  - beide Stellen muessen synchron gehalten werden, da das Frontend den
+  Knopf-Zustand rein optisch vorab spiegelt, die tatsaechliche Pruefung
+  aber weiterhin serverseitig erfolgt. Fehlermeldungstext bei blockiertem
+  Klick ebenfalls angepasst ("... FINISH, IDLE oder FAILED sein ...").
+  Getestet: `is_ready_for_next_print()`/`is_printer_busy()` fuer alle
+  relevanten Zustaende (`FINISH`, `IDLE`, `FAILED`, `RUNNING`, `PREPARE`,
+  `PAUSE`) einzeln durchgespielt - `FAILED` liefert jetzt `ready=True`,
+  `PREPARE` weiterhin `ready=False` (kein versehentliches Aufweichen der
+  v2.0.1-Uebergangszustands-Sperre); `start_next_queued_print()` bei
+  Status `FAILED` durchlaeuft die Bereitschaftspruefung jetzt bis zum
+  eigentlichen Druckversand, statt vorher mit der Blockiermeldung
+  abzubrechen; identische JS-Logik der Frontend-Kopie isoliert mit
+  Node.js nachgebildet und bestaetigt.
+
+- **v2.2.0 (MK6):** Drei additive Features plus eine Diagnose-Erweiterung
+  fuer ein noch ungeklaertes Problem:
+  1. **Temperatur-Verlaufsdiagramme (Sparklines):** neue gemeinsame
+     Frontend-Funktion `tempChip(printerId, field, label, value)` ersetzt
+     die bisher in jeder Karten-Renderfunktion (Bambu/OctoPrint/Creality/
+     Ultimaker) duplizierten `<div class="temp-chip">`-Templates. Erfasst
+     bei jedem Aufruf den aktuellen Wert in `tempHistory` (reines
+     Browser-Gedaechtnis, `TEMP_HISTORY_MAX_POINTS = 40` bei 2,5s-Poll-
+     Takt entspricht ca. 100 Sekunden) und rendert zusaetzlich eine kleine
+     Inline-SVG-Sparkline (`sparklineSvg()`, min/max-skaliert, keine
+     externe Chart-Bibliothek noetig - Projekt bleibt eine einzelne
+     Datei/PyInstaller-onefile-tauglich). Keine serverseitige Persistenz,
+     geht beim Neuladen der Seite bewusst verloren.
+  2. **Keine Kammertemperatur-Anzeige bei der A1-Familie:** die Bambu-
+     Karte blendet den Kammer-Chip jetzt komplett aus, wenn
+     `p.bambu_family === 'a1'` (A1-Serie hat keinen Kammersensor) - vorher
+     wurde unabhaengig von der Familie immer ein Chip gerendert, der bei
+     fehlendem Sensor dauerhaft `-°C` zeigte.
+  3. **Druckbild neben dem Fortschrittsbalken:** `DashboardApp.
+     all_status()` liefert je Drucker zusaetzlich `current_thumb_job_id`/
+     `current_thumb_has_image`, ermittelt aus dem NEUESTEN Verlaufseintrag
+     dieses Druckers (`PrintHistoryStore.list_entries()[0]`, kein neuer
+     Speicherort/keine neue Drucker-Anfrage noetig). Frontend-Funktion
+     `progressThumb(p)` rendert daraus ein `<img>` (ueber die bereits
+     bestehende Verlaufs-Thumbnail-Route), eingefuegt in JEDEN
+     `progress-row`-Block (Bambu/OctoPrint/Creality/Ultimaker/Formlabs) -
+     bei Druckertypen ohne Dashboard-Versand (OctoPrint/Creality/
+     Formlabs) bleibt der Verlauf leer, das Bild erscheint dort also gar
+     nicht erst (kein Sonderfall im Markup noetig).
+  4. **Diagnose-Erweiterung fuer "X1-Kammertemperatur zeigt weiterhin
+     -°C" (Nutzer-gemeldet, NICHT abschliessend geloest):**
+     `_apply_print_report()` akzeptiert jetzt defensiv zusaetzlich zum
+     bekannten (getippten) Feldnamen `chamber_temper` auch den Feldnamen
+     OHNE Tippfehler (`chamber_temp`), falls dieser stattdessen im Report
+     vorkommt - rein additiver Fallback, kein bestehendes Verhalten
+     geaendert. Liefert WEDER das eine NOCH das andere Feld einen Wert,
+     obwohl die konfigurierte Druckerfamilie (alles ausser "a1") einen
+     Kammersensor haben sollte, wird das EINMALIG pro Verbindung auf der
+     Server-Konsole geloggt, inklusive der tatsaechlich im Report
+     vorhandenen Schluessel (`sorted(p.keys())`) - bewusst KEINE weitere
+     Vermutung ueber den echten Feldnamen ohne reale Rohdaten (siehe
+     Lessons Learned Punkt 1 "keine Endpunkte/Felder raten"). Der Nutzer
+     wurde gebeten, eine echte `.gcode.3mf`/den Konsolen-Log-Ausschnitt
+     bereitzustellen, sobald das Problem weiter eingegrenzt ist.
+  Getestet: `_apply_print_report()` fuer drei Faelle durchgespielt (kein
+  Kammerfeld bei X1 -> Log-Ausgabe + `chamber_temp=None`; kein Kammerfeld
+  bei A1 -> KEIN Log, da A1 laut Konfiguration ohnehin keinen Sensor haben
+  sollte; Fallback-Feldname `chamber_temp` vorhanden -> uebernommen);
+  `all_status()` end-to-end mit einer echten (synthetisch gebauten)
+  `.gcode.3mf`-Datei inkl. eingebettetem Vorschaubild durch
+  `PrintHistoryStore.add_entry()` geschickt und bestaetigt, dass
+  `current_thumb_job_id`/`current_thumb_has_image` korrekt gesetzt werden
+  UND die bestehende Thumbnail-Route (`GET /api/printers/<id>/history/
+  <job>/thumbnail`) darueber ein gueltiges PNG liefert; `tempChip()`/
+  `sparklineSvg()`/`progressThumb()` isoliert mit Node.js getestet
+  (Verlaufs-Array-Aufbau, Sparkline-Punktberechnung, leeres Ergebnis bei
+  < 2 Punkten bzw. fehlendem Vorschaubild). Zusaetzlich `python3 -m
+  py_compile app.py`, `node --check` auf dem vollstaendigen extrahierten
+  `<script>`-Block, sowie ein Flask-Test-Client-Check, dass `GET /` alle
+  neuen Marker (`tempChip(`, `progressThumb(`, `sparklineSvg(`,
+  `bambu_family === 'a1'`, `current_thumb_has_image`) enthaelt.
+
+- **v2.2.1 (MK6):** Zwei Ergaenzungen zu den v2.2.0-Sparklines:
+  1. **Sparklines jetzt rot:** `.temp-spark` (SVG-`<polyline stroke=
+     "currentColor">`) von `color:var(--text-dim)` auf `color:
+     var(--danger)` umgestellt, auf ausdruecklichen Nutzerwunsch. Gilt
+     fuer ALLE Sparklines (Temperatur UND die neue Luftfeuchtigkeit
+     unten), da beide dieselbe CSS-Klasse verwenden.
+  2. **AMS-Luftfeuchtigkeit inkl. Verlaufsdiagramm:** `PrinterConnection.
+     _apply_print_report()` liest zusaetzlich zu den Fach-Daten je
+     AMS-EINHEIT (nicht je Fach) das Feld `"humidity"` aus dem Bambu-
+     MQTT-`ams`-Objekt - ein community-dokumentierter Indexwert 1
+     (trocken) bis 5 (feucht), KEIN Prozentwert (u. a. von der Home-
+     Assistant-Bambu-Lab-Integration in gleicher Bedeutung genutzt).
+     Defensiv geparst (`int(unit["humidity"])` in `try/except`) - fehlt
+     das Feld oder ist es nicht numerisch, wird die Einheit einfach ohne
+     Feuchte-Angabe gefuehrt statt zu raten. Neues Statusfeld
+     `ams_units` (Liste `{id, humidity}` je Einheit, Default `[]` im
+     initialen `PrinterConnection.status`). Frontend: neue Funktion
+     `humidityChip()` nutzt bewusst dieselbe `tempHistory`/
+     `sparklineSvg()`-Infrastruktur wie `tempChip()` (generischer
+     Werteverlauf, nicht auf Temperaturen beschraenkt) - `renderAms()`
+     bekam dafuer zwei neue Parameter (`printerId`, `amsUnits`), Aufrufer
+     entsprechend angepasst (`renderAms(p.id, p.ams, p.ams_units)`).
+     Nur Einheiten mit tatsaechlich vorhandenem (nicht-`null`) Wert
+     werden angezeigt.
+  Getestet: `_apply_print_report()` mit zwei AMS-Einheiten durchgespielt
+  (gueltiger String-Wert `"3"` -> `int` 3 uebernommen; ungueltiger Wert
+  `"not-a-number"` -> `None`, kein Absturz); `all_status()` gibt
+  `ams_units` korrekt weiter; `renderAms()` isoliert mit Node.js
+  getestet (zeigt nur die Einheit mit gueltigem Wert, filtert `null`
+  korrekt heraus; leere AMS-Liste weiterhin `"Kein AMS erkannt"`).
+  Zusaetzlich `python3 -m py_compile app.py`, `node --check` auf dem
+  vollstaendigen extrahierten `<script>`-Block, sowie ein
+  Flask-Test-Client-Check, dass `GET /` die neuen Marker
+  (`humidityChip(`, `ams_units`, `color:var(--danger)`,
+  `renderAms(p.id, p.ams, p.ams_units)`) enthaelt.
+
+- **v2.2.2 (MK6):** Zwei Ergaenzungen zur v2.2.1-Luftfeuchtigkeit:
+  1. **Sparkline der AMS-Luftfeuchtigkeit jetzt blau:** `sparklineSvg()`
+     bekam einen zweiten, optionalen Parameter `cssClass` (Default
+     `'temp-spark'`, weiterhin rot fuer Temperaturen) - `humidityChip()`
+     uebergibt jetzt explizit die neue Klasse `'humidity-spark'`
+     (`color:var(--info)`, neue blaue CSS-Variable). Rein additive
+     Signatur-Erweiterung, `tempChip()` (ruft `sparklineSvg()` weiterhin
+     ohne zweites Argument auf) unveraendert.
+  2. **1-5-Massstab neben dem Feuchte-Rohwert:** neue Funktion
+     `humidityScale(value)` rendert fuenf kleine Punkte, gefuellt bis
+     einschliesslich der aktuellen Stufe (Tooltip nennt zusaetzlich die
+     Bedeutung in Worten: "1 = trocken, 5 = feucht") - platziert
+     zwischen dem Zahlenwert und der Sparkline in `humidityChip()`, damit
+     die reine Zahl (1-5) ohne Nachschlagen im README eingeordnet werden
+     kann.
+  Getestet: `sparklineSvg()` mit und ohne `cssClass`-Argument isoliert
+  mit Node.js getestet (liefert die jeweils erwartete CSS-Klasse);
+  `humidityScale()` fuer alle Stufen 1-5 sowie `undefined`/`null`
+  durchgespielt (korrekte Anzahl gefuellter Punkte, leerer String bei
+  fehlendem Wert); `humidityChip()` end-to-end bestaetigt Zahlenwert +
+  Massstab + blaue Sparkline in korrekter Reihenfolge. Zusaetzlich
+  `python3 -m py_compile app.py`, `node --check` auf dem vollstaendigen
+  extrahierten `<script>`-Block, sowie ein Flask-Test-Client-Check, dass
+  `GET /` die neuen Marker (`humidityScale(`, `humidity-spark`,
+  `--info:`, `.humidity-dot`) enthaelt.
+
+- **v2.2.3 (MK6):** Nutzer-Feedback zur v2.2.2-Luftfeuchtigkeits-Anzeige:
+  der reine Zahlenwert ("4") war ohne Hover auf den Massstab nicht als
+  "eher schlecht" erkennbar. Fix (rein additiv, kein bestehendes
+  Verhalten geaendert):
+  - Neue Konstante `HUMIDITY_LEVELS` (1-5 -> `{label, severity}`,
+    `severity` ∈ `good`/`mid`/`bad`) ordnet jeder Stufe ein Wort
+    ("trocken", "leicht feucht", "mittel", "feucht", "sehr feucht") UND
+    eine Ampelfarbe zu.
+  - Neue Funktion `humidityLabel(value)` rendert das Wort-Label direkt
+    neben dem Zahlenwert (in `humidityChip()` zwischen `<b>Wert</b>` und
+    dem Massstab eingefuegt).
+  - `humidityScale()` faerbt die gefuellten Punkte jetzt in derselben
+    Ampelfarbe statt einheitlich blau (CSS `.humidity-dot.filled.good/
+    .mid/.bad`) - die Sparkline-Linie selbst (`.humidity-spark`) bleibt
+    bewusst blau, wie in v2.2.2 explizit gewuenscht; nur der Massstab
+    bekommt die zusaetzliche Ampelfarbe.
+  Getestet: `humidityLabel()`/`humidityScale()` fuer alle Stufen 1-5
+  sowie `undefined` isoliert mit Node.js durchgespielt (korrektes
+  Label/korrekte Severity-Klasse je Stufe, leerer String bei fehlendem
+  Wert); `humidityChip()` end-to-end bestaetigt Reihenfolge Zahl -> Wort-
+  Label -> Massstab -> blaue Sparkline. Zusaetzlich `python3 -m
+  py_compile app.py`, `node --check` auf dem vollstaendigen extrahierten
+  `<script>`-Block, sowie ein Flask-Test-Client-Check, dass `GET /` die
+  neuen Marker (`humidityLabel(`, `HUMIDITY_LEVELS`, `.humidity-label`)
+  enthaelt.
 
 **Regel für die Weiterarbeit (unveraendert seit MK5): bei jeder
 ausgelieferten Änderung `APP_VERSION` in `app.py` erhöhen (semantisch:

@@ -45,7 +45,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
 # Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
 # README Abschnitt 0a beschriebenen Automatik hergeleitet).
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.18"
 
 import os
 import sys
@@ -75,6 +75,33 @@ from datetime import datetime
 from flask import Flask, jsonify, request, Response, render_template_string, redirect, send_file
 from werkzeug.utils import secure_filename
 import paho.mqtt.client as mqtt
+
+# v2.2.8: Nutzer-gemeldet: die eigens fuer Fehlerdiagnose eingebauten
+# print()-Konsolenzeilen (u. a. "[MK6] Druckstart angefordert: ...", seit
+# v2.2.7) erschienen im OpenWrt-Systemlog (logread) eines per procd-
+# Autostart betriebenen Routers ueberhaupt nicht, obwohl Flasks eigene
+# Zugriffs-Logzeilen (GET /api/status usw.) zuverlaessig ankamen. Ursache
+# (Python-Standardverhalten, keine Vermutung): schreibt ein Python-
+# Programm auf eine Standardausgabe, die KEIN Terminal ist (z. B. weil
+# procd sie in eine Pipe/den Log-Daemon umleitet), puffert Python
+# `sys.stdout` standardmaessig BLOCKWEISE (mehrere KB) statt zeilenweise
+# - print()-Aufrufe koennen dadurch lange im Puffer haengen bleiben, statt
+# sofort geschrieben zu werden. Flasks Zugriffs-Log laeuft dagegen ueber
+# das `logging`-Modul auf `sys.stderr`, das von dieser Umstellung nicht
+# betroffen war und deshalb schon vorher zuverlaessig ankam. Fix: direkt
+# beim Programmstart `sys.stdout`/`sys.stderr` explizit auf zeilenweise
+# Pufferung umgestellt (`reconfigure()`, seit Python 3.7 verfuegbar) -
+# betrifft ALLE bestehenden und kuenftigen print()-Diagnosezeilen im
+# gesamten Programm, nicht nur die neuen aus v2.2.7, und aendert am
+# Verhalten sonst nichts (nur WANN eine Zeile geschrieben wird, nicht WAS).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    # z. B. wenn stdout/stderr umgeleitet und kein TextIOWrapper mehr ist
+    # (kommt bei manchen eingebetteten/eingefrorenen Umgebungen vor) -
+    # dann lieber ohne Zeilenpufferung weiterlaufen als abzustuerzen.
+    pass
 
 
 # ----------------------------------------------------------------------
@@ -221,6 +248,88 @@ def _extract_thumbnail(local_path: str, filename: str):
     return None
 
 
+# v2.2.14: geschaetzte Druckzeit fuer Verlaufs-/Warteschlangeneintraege
+# (siehe README Abschnitt 3h/3j sowie UEBERGABE.md). Rein informativ, wie
+# schon bei _extract_thumbnail() oben - ein Fehlschlag liefert bewusst
+# None statt eine Ausnahme, der Eintrag wird dadurch nicht ungueltig.
+_CURA_TIME_RE = re.compile(rb"^\s*;\s*TIME\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.MULTILINE)
+_CURA_TIME_SCAN_BYTES = 65536  # das Zeitkommentar steht bei Cura im Kopfbereich
+
+
+def _extract_print_duration_seconds(local_path: str, filename: str):
+    """Versucht, die vom Slicer geschaetzte Druckzeit (in Sekunden) aus
+    der Datei zu lesen. Rein informativ (siehe PrintHistoryStore/
+    PrintQueueStore) - liefert None statt einer Ausnahme, wenn nichts
+    Passendes gefunden wird.
+
+    Bambu (.gcode.3mf): "Metadata/slice_info.config" (dieselbe XML-Datei,
+    die bereits fuer die Filamentzuordnung ausgewertet wird, siehe
+    _parse_plate1_used_filament_indices()) enthaelt pro <plate> ein
+    <metadata key="prediction" value="..."/> - dokumentiert als
+    geschaetzte Druckzeit in SEKUNDEN fuer diese Plate (Community-
+    dokumentiertes 3mf-Format, siehe UEBERGABE.md). Es wird gezielt die
+    Plate mit index=1 verwendet (dieselbe, die das Dashboard tatsaechlich
+    druckt, siehe PrinterConnection._request_print()).
+
+    Ultimaker (.gcode, Cura-Export): Cura schreibt im Kopfbereich des
+    gcode unabhaengig von der gewaehlten Gcode-Variante eine Zeile
+    ";TIME:<sekunden>" (die von CuraEngine berechnete Gesamtdruckzeit,
+    von der zeilenweisen ";TIME_ELAPSED:..."-Fortschrittsangabe
+    innerhalb des Codes zu unterscheiden). Es werden defensiv nur die
+    ersten 64 KB der Datei durchsucht (der Kommentar steht im
+    Kopfbereich, ein voller Scan waere bei grossen Dateien unnoetig
+    teuer) - wird dort nichts gefunden, wird NICHT im gesamten Rest der
+    Datei weitergesucht, sondern None zurueckgegeben (kein Ratefeld)."""
+    lower = filename.lower()
+    if lower.endswith(".gcode.3mf"):
+        try:
+            with zipfile.ZipFile(local_path) as zf:
+                with zf.open("Metadata/slice_info.config") as f:
+                    root = ET.parse(f).getroot()
+        except Exception:
+            return None
+        for plate in root.findall("plate"):
+            index_val = None
+            prediction_val = None
+            for meta in plate.findall("metadata"):
+                key = meta.get("key")
+                if key == "index":
+                    index_val = meta.get("value")
+                elif key == "prediction":
+                    prediction_val = meta.get("value")
+            if index_val == "1" and prediction_val is not None:
+                try:
+                    return int(round(float(prediction_val)))
+                except (TypeError, ValueError):
+                    return None
+        return None
+    if lower.endswith(".gcode"):
+        try:
+            with open(local_path, "rb") as f:
+                head = f.read(_CURA_TIME_SCAN_BYTES)
+        except Exception:
+            return None
+        m = _CURA_TIME_RE.search(head)
+        if not m:
+            return None
+        try:
+            return int(round(float(m.group(1))))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _format_duration_hm(seconds):
+    """Formatiert Sekunden als 'Xh Ymin'-Kurzform fuers Backend-Logging
+    (das Frontend formatiert dieselben Rohsekunden fuer die Anzeige
+    unabhaengig selbst, siehe formatDuration() im <script>-Block)."""
+    if seconds is None:
+        return "unbekannt"
+    total_min = max(0, int(round(seconds / 60)))
+    h, m = divmod(total_min, 60)
+    return f"{h}h {m}min" if h else f"{m}min"
+
+
 class PrintHistoryStore:
     """Verwaltet pro Drucker einen eigenen Ordner mit den zuletzt ueber
     das Dashboard an ihn gesendeten Druckauftraegen, damit sie spaeter
@@ -313,12 +422,18 @@ class PrintHistoryStore:
             except Exception:
                 has_image = False
 
+            try:
+                duration_sec = _extract_print_duration_seconds(local_path, filename)
+            except Exception:
+                duration_sec = None
+
             entry = {
                 "job_id": job_id,
                 "filename": filename,
                 "file_ext": ext,
                 "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "has_image": has_image,
+                "duration_sec": duration_sec,
             }
             with self._lock:
                 entries = self._load_index(printer_id)
@@ -489,6 +604,11 @@ class PrintQueueStore:
             except Exception:
                 has_image = False
 
+            try:
+                duration_sec = _extract_print_duration_seconds(local_path, filename)
+            except Exception:
+                duration_sec = None
+
             entry = {
                 "job_id": job_id,
                 "filename": filename,
@@ -496,6 +616,7 @@ class PrintQueueStore:
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "has_image": has_image,
                 "history_ref": history_ref,
+                "duration_sec": duration_sec,
             }
             with self._lock:
                 entries = self._load_index(printer_id)
@@ -750,12 +871,44 @@ class PrinterConnection:
             s["chamber_temp"] = p["chamber_temper"]
         elif "chamber_temp" in p:
             s["chamber_temp"] = p["chamber_temp"]
-        elif self.cfg.get("bambu_family", "x1") != "a1" and not getattr(self, "_chamber_missing_logged", False):
-            self._chamber_missing_logged = True
-            print(f"[MK6] Hinweis: Drucker '{self.cfg.get('name', self.id)}' "
-                  f"(Familie: {self.cfg.get('bambu_family', 'x1')}) liefert kein "
-                  f"'chamber_temper'/'chamber_temp'-Feld im MQTT-Report. Rohreport-"
-                  f"Schluessel in diesem Update: {sorted(p.keys())}")
+        else:
+            # v2.2.13: Nutzer-Vorschlag (noch NICHT extern/per Quelle
+            # bestaetigt, siehe UEBERGABE.md): fuer X1C und H2S soll die
+            # Kammertemperatur unter "device.ctc.info.temp" liegen ("ctc"
+            # vermutlich "Chamber Temperature Control"). Struktur von
+            # "info" (Objekt oder Liste) ist nicht gesichert bekannt -
+            # daher rein defensiv, beide Formen versucht, und bei Erfolg
+            # EINMALIG geloggt (nicht stillschweigend uebernommen), damit
+            # sich der Wert gegen die tatsaechliche Kammertemperatur am
+            # Drucker pruefen laesst, bevor er als endgueltig geloest gilt.
+            ctc_temp = None
+            try:
+                info = p.get("device", {}).get("ctc", {}).get("info")
+                if isinstance(info, dict):
+                    ctc_temp = info.get("temp")
+                elif isinstance(info, list):
+                    for entry in info:
+                        if isinstance(entry, dict) and entry.get("temp") is not None:
+                            ctc_temp = entry.get("temp")
+                            break
+            except (AttributeError, TypeError):
+                ctc_temp = None
+            if ctc_temp is not None:
+                s["chamber_temp"] = ctc_temp
+                if not getattr(self, "_chamber_ctc_logged", False):
+                    self._chamber_ctc_logged = True
+                    print(f"[MK6] Kammertemperatur ueber 'device.ctc.info.temp' "
+                          f"gefunden: Drucker='{self.cfg.get('name', self.id)}' "
+                          f"Wert={ctc_temp!r} - bitte pruefen, ob das mit der "
+                          f"tatsaechlichen Kammertemperatur am Drucker uebereinstimmt "
+                          f"(noch nicht extern bestaetigtes Feld, siehe UEBERGABE.md).")
+            elif self.cfg.get("bambu_family", "x1") != "a1" and not getattr(self, "_chamber_missing_logged", False):
+                self._chamber_missing_logged = True
+                print(f"[MK6] Hinweis: Drucker '{self.cfg.get('name', self.id)}' "
+                      f"(Familie: {self.cfg.get('bambu_family', 'x1')}) liefert kein "
+                      f"'chamber_temper'/'chamber_temp'/'device.ctc.info.temp'-Feld im "
+                      f"MQTT-Report. Rohreport-Schluessel in diesem Update: "
+                      f"{sorted(p.keys())}")
         if "nozzle_temper" in p:
             s["nozzle_temp"] = p["nozzle_temper"]
         if "bed_temper" in p:
@@ -789,7 +942,26 @@ class PrinterConnection:
                         humidity = int(unit["humidity"])
                 except (TypeError, ValueError):
                     humidity = None
-                units.append({"id": unit.get("id", "0"), "humidity": humidity})
+                # v2.2.7: Nutzer meldete, dass ein H2S (AMS 2 Pro) die
+                # Luftfeuchte tatsaechlich als 44% anzeigt, das Dashboard
+                # aber nur "1" zeigte. Recherche (u. a. greghesp/ha-bambulab
+                # Issue #1235 und maziggy/bambuddy Issue #3140) ergab: das
+                # aeltere AMS (vier Slots) liefert NUR "humidity" (Stufe
+                # 1-5). Das neuere AMS 2 Pro liefert ZUSAETZLICH das Feld
+                # "humidity_raw" - den tatsaechlichen Prozentwert (0-100).
+                # Beide Felder koennen parallel vorhanden sein. Ebenfalls
+                # defensiv geparst, keine Annahme ueber Wertebereich.
+                humidity_raw = None
+                try:
+                    if unit.get("humidity_raw") is not None:
+                        humidity_raw = int(unit["humidity_raw"])
+                except (TypeError, ValueError):
+                    humidity_raw = None
+                units.append({
+                    "id": unit.get("id", "0"),
+                    "humidity": humidity,
+                    "humidity_raw": humidity_raw,
+                })
             s["ams"] = slots
             s["ams_units"] = units
 
@@ -970,6 +1142,36 @@ class PrinterConnection:
                 return
             except (OSError, RuntimeError, subprocess.SubprocessError) as e:
                 attempts.append(f"Versuch {attempt} ({label}): {e}")
+                # v2.2.6: "553 Could not create file" ist KEIN Verbindungs-/
+                # TLS-Problem, sondern eine inhaltliche Ablehnung durch den
+                # FTP-Server des Druckers (Anmeldung und TLS haben also
+                # funktioniert) - weitere Versuche mit anderem TLS-Profil
+                # sind sinnlos. Typische Ursache: am Drucker ist kein
+                # beschreibbarer Speicher eingebunden. Bei der H2-Serie
+                # (H2D/H2S, ebenso P2S) erreicht FTPS AUSSCHLIESSLICH den
+                # USB-Stick, NICHT den internen Speicher (Bambu Studio
+                # nutzt fuer den internen Speicher einen eigenen,
+                # undokumentierten Weg) - ohne eingesteckten USB-Stick
+                # scheitert jeder FTPS-Upload genau so. Quellen:
+                # synman/bambu-printer-manager Issue #64 ("FTPS reaches the
+                # USB stick and nothing else"), Bambu-Wiki "Failed to send
+                # print files" (Speichermedium fehlt/voll/zu langsam).
+                if "553" in str(e):
+                    raise RuntimeError(
+                        f"Der Drucker hat das Anlegen der Datei abgelehnt "
+                        f"(FTP 553 \"Could not create file\") - die Verbindung "
+                        f"selbst funktioniert, aber am Drucker ist kein "
+                        f"beschreibbarer Speicher verfuegbar.\n"
+                        f"Bei H2D/H2S (und P2S): Uploads per LAN/FTPS landen "
+                        f"AUSSCHLIESSLICH auf einem eingesteckten USB-Stick, "
+                        f"nicht im internen Speicher - bitte einen USB-Stick "
+                        f"(FAT32 oder exFAT, mind. USB 2.0) einstecken und am "
+                        f"Druckerdisplay pruefen, dass er erkannt wird.\n"
+                        f"Bei X1/P1/A1: pruefen, ob eine microSD-Karte "
+                        f"eingesteckt, erkannt und nicht voll/schreibgeschuetzt "
+                        f"ist.\n"
+                        f"Details: Versuch {attempt} ({label}): {e}"
+                    )
                 if attempt < 3:
                     time.sleep(1.5 * attempt)
         attempts_text = "\n".join(attempts)
@@ -1054,6 +1256,16 @@ class PrinterConnection:
                             on_progress(msg.get("sent", 0), msg.get("total", total_size))
                         except Exception:
                             pass
+                elif msg.get("type") == "diag":
+                    # v2.2.9: FTPS-Verzeichnislisting aus dem Upload-
+                    # Subprozess (Helfer-exe oder Selbstaufruf-Fallback,
+                    # siehe dortiger Kommentar) - dient ausschliesslich der
+                    # Fehlersuche zum offenen H2S-Druckstart-Problem
+                    # ("Nicht unterstuetzter Pfad oder Name der
+                    # Druckdatei", siehe UEBERGABE.md v2.2.6/v2.2.7) und
+                    # aendert am Upload-Ablauf selbst nichts.
+                    print(f"[MK6] FTPS-Diagnose (Drucker='{self.cfg.get('name', self.id)}', "
+                          f"Profil={profile_name}): {msg.get('message')}")
                 elif msg.get("type") in ("done", "error"):
                     result = msg
         finally:
@@ -1112,12 +1324,41 @@ class PrinterConnection:
         # beiden Quellen fuer lokale (nicht Cloud-)Drucke unkritisch mit
         # "0" bzw. "auto" zu befuellen.
         job_name = os.path.splitext(os.path.splitext(remote_name)[0])[0] or remote_name
+        # v2.2.10: Nutzer lieferte fuer einen H2S mit eingestecktem
+        # USB-Stick den vollstaendigen Beweis: das FTPS-Verzeichnislisting
+        # (v2.2.9-Diagnose) zeigt die hochgeladene Datei DIREKT im
+        # FTP-Wurzelverzeichnis (kein "cache"-Unterordner, widerlegt die
+        # in UEBERGABE.md v2.2.9 dokumentierte Cache-Vermutung) - der
+        # bisher gesendete Pfad "file:///sdcard/<datei>" zeigt also exakt
+        # dorthin, wo die Datei tatsaechlich liegt, und trotzdem lehnt der
+        # Drucker ihn mit "Nicht unterstuetzter Pfad oder Name der
+        # Druckdatei" ab. Naheliegende Erklaerung: der Alias "sdcard"
+        # selbst ist bei der H2-Serie (kein physischer SD-Kartenslot,
+        # anders als X1/P1/A1) nicht gueltig. Die aktiv gepflegte
+        # Referenzbibliothek bambulabs_api (in diesem Projekt bereits seit
+        # v1.5.6 als vertrauenswuerdige Quelle fuer andere project_file-
+        # Felder genutzt, OHNE eigene H2/X1-Fallunterscheidung) verwendet
+        # fuer ALLE Modelle einheitlich "ftp:///<datei>" statt eines
+        # storage-spezifischen Alias - passt exakt zu unserem Datei-Layout
+        # (Datei liegt flach im FTP-Wurzelverzeichnis, kein Unterordner).
+        # Um das seit MK5 bestaetigt funktionierende Verhalten bei X1/A1/
+        # P1/X2 NICHT zu riskieren, wird diese Umstellung bewusst nur fuer
+        # die Familien angewendet, bei denen der bisherige Pfad
+        # nachweislich scheitert bzw. dieselbe Speicher-Eigenart wie H2
+        # hat (P2S laut Bambu selbst technisch mit H2D/H2S verwandt, siehe
+        # BAMBU_FAMILY_TO_FTPS_PROFILE oben) - experimentell, bis der
+        # Nutzer den tatsaechlichen Druckstart bestaetigt oder verwirft.
+        bambu_family = self.cfg.get("bambu_family", "x1")
+        if bambu_family in ("h2", "p2"):
+            print_url = f"ftp:///{remote_name}"
+        else:
+            print_url = f"file:///sdcard/{remote_name}"
         payload = {
             "print": {
                 "sequence_id": "0",
                 "command": "project_file",
                 "param": "Metadata/plate_1.gcode",
-                "url": f"file:///sdcard/{remote_name}",
+                "url": print_url,
                 "bed_type": "auto",
                 "project_id": "0",
                 "profile_id": "0",
@@ -1147,6 +1388,26 @@ class PrinterConnection:
         }
         if ams_summary.get("mapping") is not None:
             payload["print"]["ams_mapping"] = ams_summary["mapping"]
+        # v2.2.7: Nutzer meldete bei einem H2S (mit frisch eingestecktem
+        # USB-Stick) den Druckerfehler "Nicht unterstuetzter Pfad oder
+        # Name der Druckdatei" nach einem erfolgreichen FTPS-Upload.
+        # Recherche (u. a. bambulab/BambuStudio Issue #8091 "Unable to
+        # send file to Local Storage on H2S with properly formatted USB
+        # drive", greghesp/ha-bambulab Issues #1512/#1520/#1521, Forum-
+        # Thread "Inconsistent MQTT paths compared with FTP access")
+        # zeigt: das exakte Pfad-/URL-Format, das die H2-Serie bei einem
+        # USB-Stick (statt internem Speicher) fuer den MQTT-Druckstart-
+        # Befehl erwartet, ist selbst in den aktivsten Community-Projekten
+        # und laut Issue #8091 sogar in Bambu Studio selbst noch ungeklaert
+        # (Stand dieser Recherche: offene, ungeloeste Issues ohne
+        # bestaetigtes Ergebnis). Ein geratenes Pfad-Format wuerde gegen
+        # die Projekt-Konvention verstossen, keine undokumentierten
+        # Protokolldetails zu erfinden. Stattdessen: der tatsaechlich
+        # gesendete Befehl wird protokolliert, damit bei einem erneuten
+        # Fehlschlag echte Beweisdaten (statt Vermutungen) vorliegen.
+        print(f"[MK6] Druckstart angefordert: Drucker='{self.cfg.get('name', self.id)}' "
+              f"(Familie: {self.cfg.get('bambu_family', 'x1')}) url='{payload['print']['url']}' "
+              f"param='{payload['print']['param']}' subtask_name='{job_name}'")
         req_topic = f"device/{self.cfg['serial']}/request"
         result = self._client.publish(req_topic, json.dumps(payload))
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -1424,6 +1685,21 @@ def _run_ftps_upload_worker(argv):
         ftp.login("bblp", access_code)
         ftp.prot_p()
         ftp.set_pasv(True)
+        # v2.2.9: identische Diagnose wie in ftps_upload_helper.py (dort
+        # die primaer verwendete Implementierung) - siehe Kommentar dort
+        # fuer die Begruendung. Dieser Pfad ist nur der Selbstaufruf-
+        # Fallback, falls die Helfer-exe nicht gefunden wird.
+        try:
+            listing = ftp.nlst()
+            print(json.dumps({
+                "type": "diag",
+                "message": f"FTPS-Verzeichnis vor Upload (NLST): {listing}",
+            }), flush=True)
+        except Exception as e:
+            print(json.dumps({
+                "type": "diag",
+                "message": f"FTPS-Verzeichnislisting nicht moeglich: {e}",
+            }), flush=True)
         with open(local_path, "rb") as f:
             if profile["skip_unwrap"]:
                 _storbinary_no_unwrap(ftp, f"STOR {remote_name}", f, blocksize=8192, callback=_progress_cb)
@@ -2524,6 +2800,21 @@ class ExtrasMqttManager:
             return None
         return self.values.get(topic)
 
+    def list_topics(self, limit=300):
+        """v2.2.15: liefert die zuletzt empfangenen Topic/Wert-Paare (durch
+        das breite "#"-Abo in _on_connect() bereits ALLE Topics dieses
+        Brokers, nicht nur konfigurierte Sensoren) - dient dem
+        "MQTT-Sensoren"-Dialog im Frontend als Hilfe beim Einrichten: der
+        Nutzer sieht die tatsaechlich ankommenden Topics/Werte, statt das
+        Topic blind abtippen zu muessen (haeufigste Fehlerquelle bei der
+        bisherigen reinen config.json-Konfiguration, siehe UEBERGABE.md).
+        Alphabetisch sortiert, auf `limit` Eintraege begrenzt (rein zum
+        Schutz vor einer sehr "geschwaetzigen" Broker-Installation mit
+        tausenden Topics - eine Momentaufnahme, kein Anspruch auf
+        Vollstaendigkeit)."""
+        items = sorted(self.values.items())[:limit]
+        return [{"topic": t, "value": v} for t, v in items]
+
     def publish(self, topic, payload):
         if not self._client:
             return False
@@ -2653,6 +2944,160 @@ class DashboardApp:
                 item["value"] = self.extras.get_value(ex.get("topic"))
             out.append(item)
         return out
+
+    # ------------------------------------------------------------------
+    # v2.2.15: Verwaltung des zweiten MQTT-Brokers ("extras_mqtt") und der
+    # daran haengenden Sensoren/Schalter je Drucker ueber die Web-
+    # Oberflaeche - vorher nur per manueller config.json-Bearbeitung
+    # moeglich (siehe README Abschnitt 2 vor v2.2.15). Ergaenzt bewusst
+    # nur die Verwaltung, das Laufzeitverhalten von ExtrasMqttManager
+    # (Sensor-Anzeige, Schalter-Befehle) bleibt unveraendert.
+    # ------------------------------------------------------------------
+    def get_extras_mqtt_settings(self):
+        return dict(self.cfg.get("extras_mqtt") or {})
+
+    def update_extras_mqtt_settings(self, data):
+        """Speichert die Broker-Einstellungen und baut die Verbindung
+        SOFORT mit den neuen Werten neu auf (alte ExtrasMqttManager-
+        Instanz wird gestoppt, eine neue erstellt/gestartet) - vorher war
+        dafuer ein kompletter Neustart des Dashboards/der exe noetig, was
+        vermutlich mit ein Grund war, warum eine Aenderung an config.json
+        von Hand "nicht funktioniert hat" (siehe Chat-Verlauf): ohne
+        Neustart blieben alte, ggf. falsche Einstellungen bis zum
+        naechsten Programmstart aktiv."""
+        enabled = bool(data.get("enabled"))
+        host = (data.get("host") or "").strip()
+        try:
+            port = int(data.get("port") or 1883)
+        except (TypeError, ValueError):
+            return False, "Ungueltiger Port.", None
+        if enabled and not host:
+            return False, "Broker-Adresse ist bei aktiviertem Broker ein Pflichtfeld.", None
+        username = (data.get("username") or "").strip()
+        # Passwort bleibt unveraendert, wenn das Feld im Formular leer
+        # gelassen wurde (z. B. weil der Nutzer nur den Host aendern
+        # wollte) - ein "password": "" im Request loescht es dagegen
+        # bewusst (leerer String ist ein gueltiger, expliziter Wert).
+        if "password" in data and data.get("password") is not None:
+            password = data.get("password")
+        else:
+            password = (self.cfg.get("extras_mqtt") or {}).get("password", "")
+        tls = bool(data.get("tls"))
+
+        self.cfg["extras_mqtt"] = {
+            "enabled": enabled, "host": host, "port": port,
+            "username": username, "password": password, "tls": tls,
+        }
+        save_config(self.cfg)
+
+        old_extras = self.extras
+        self.extras = ExtrasMqttManager(self.cfg)
+        self.extras.start()
+        try:
+            old_extras.stop()
+        except Exception:
+            pass
+        return True, None, self.get_extras_mqtt_settings()
+
+    def get_discovered_mqtt_topics(self):
+        return self.extras.list_topics()
+
+    def _get_extras_list(self, printer_id):
+        """Liefert (printer_cfg, extras_liste) oder (None, None), wenn der
+        Drucker nicht existiert. Die Liste ist eine Referenz auf
+        printer_cfg["extras"] - Aenderungen daran wirken sich direkt auf
+        self.cfg aus, muessen aber trotzdem explizit mit save_config()
+        persistiert werden (wie ueberall sonst in dieser Klasse)."""
+        p = self.get_printer_cfg(printer_id)
+        if not p:
+            return None, None
+        return p, p.setdefault("extras", [])
+
+    @staticmethod
+    def _validate_extra_fields(data, existing_kind=None):
+        """Prueft/normalisiert die Felder eines Sensor-/Schalter-Eintrags.
+        `existing_kind` wird beim Bearbeiten uebergeben - die Art
+        (Sensor/Schalter) laesst sich nachtraeglich bewusst NICHT mehr
+        aendern (ein Schalter hat strukturell andere Pflichtfelder als
+        ein Sensor), nur ihre Werte. Gibt (None, error) oder
+        (entry_dict_ohne_id, None) zurueck."""
+        kind = existing_kind or (data.get("kind") or "").strip().lower()
+        if kind not in ("sensor", "switch"):
+            return None, "'kind' muss 'sensor' oder 'switch' sein."
+        label = (data.get("label") or "").strip()
+        if not label:
+            return None, "Bezeichnung ist ein Pflichtfeld."
+        entry = {"label": label, "kind": kind}
+        if kind == "sensor":
+            topic = (data.get("topic") or "").strip()
+            if not topic:
+                return None, "MQTT-Topic ist bei einem Sensor ein Pflichtfeld."
+            entry["topic"] = topic
+            unit = (data.get("unit") or "").strip()
+            if unit:
+                entry["unit"] = unit
+            # v2.2.16: legt fest, WO der Sensor auf der Drucker-Karte
+            # erscheint - "generic" (Standard) im bisherigen "Sensoren &
+            # Schalter"-Bereich unten, "temperature"/"humidity" dagegen
+            # direkt in der Temperaturen-Zeile, GENAUSO wie die vom
+            # Drucker selbst gelieferten Werte (Duese/Bett/Kammer bzw.
+            # AMS-Feuchte) - inklusive derselben Sparkline-Infrastruktur
+            # (siehe extraChip() im Frontend). Ein unbekannter/leerer Wert
+            # faellt defensiv auf "generic" zurueck statt einen Fehler zu
+            # werfen - so bleiben auch vor v2.2.16 angelegte Eintraege
+            # (ohne dieses Feld) unveraendert im gewohnten Bereich.
+            display = (data.get("display") or "generic").strip().lower()
+            if display not in ("generic", "temperature", "humidity"):
+                display = "generic"
+            entry["display"] = display
+        else:
+            command_topic = (data.get("command_topic") or "").strip()
+            payload_on = data.get("payload_on")
+            payload_off = data.get("payload_off")
+            if not command_topic:
+                return None, "Befehls-Topic ist bei einem Schalter ein Pflichtfeld."
+            if payload_on is None or payload_on == "" or payload_off is None or payload_off == "":
+                return None, "Payload fuer 'Ein' und 'Aus' sind bei einem Schalter Pflichtfelder."
+            entry["command_topic"] = command_topic
+            entry["payload_on"] = payload_on
+            entry["payload_off"] = payload_off
+        return entry, None
+
+    def add_extra(self, printer_id, data):
+        p, extras = self._get_extras_list(printer_id)
+        if p is None:
+            return False, "Drucker nicht gefunden.", None
+        entry, err = self._validate_extra_fields(data)
+        if err:
+            return False, err, None
+        entry["id"] = uuid.uuid4().hex[:10]
+        extras.append(entry)
+        save_config(self.cfg)
+        return True, None, entry
+
+    def update_extra(self, printer_id, extra_id, data):
+        p, extras = self._get_extras_list(printer_id)
+        if p is None:
+            return False, "Drucker nicht gefunden.", None
+        existing = next((e for e in extras if e.get("id") == extra_id), None)
+        if not existing:
+            return False, "Eintrag nicht gefunden.", None
+        entry, err = self._validate_extra_fields(data, existing_kind=existing.get("kind"))
+        if err:
+            return False, err, None
+        entry["id"] = extra_id
+        extras[extras.index(existing)] = entry
+        save_config(self.cfg)
+        return True, None, entry
+
+    def delete_extra(self, printer_id, extra_id):
+        p, extras = self._get_extras_list(printer_id)
+        if p is None:
+            return False
+        before = len(extras)
+        p["extras"] = [e for e in extras if e.get("id") != extra_id]
+        save_config(self.cfg)
+        return len(p["extras"]) != before
 
     def all_status(self):
         out = []
@@ -3444,6 +3889,54 @@ def api_extra_command(printer_id, extra_id):
     return jsonify({"ok": True})
 
 
+# v2.2.15: Verwaltung des zweiten MQTT-Brokers und der Sensoren/Schalter
+# je Drucker ueber die Web-Oberflaeche (siehe DashboardApp-Methoden
+# oben) - vorher nur per manueller config.json-Bearbeitung moeglich.
+@app.route("/api/extras_mqtt", methods=["GET"])
+def api_get_extras_mqtt():
+    return jsonify(dash.get_extras_mqtt_settings())
+
+
+@app.route("/api/extras_mqtt", methods=["POST"])
+def api_update_extras_mqtt():
+    data = request.get_json(force=True) or {}
+    ok, err, settings = dash.update_extras_mqtt_settings(data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify(settings)
+
+
+@app.route("/api/extras_mqtt/discovered", methods=["GET"])
+def api_extras_mqtt_discovered():
+    return jsonify(dash.get_discovered_mqtt_topics())
+
+
+@app.route("/api/printers/<printer_id>/extras", methods=["POST"])
+def api_add_extra(printer_id):
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.add_extra(printer_id, data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify(entry), 201
+
+
+@app.route("/api/printers/<printer_id>/extras/<extra_id>", methods=["PUT"])
+def api_update_extra(printer_id, extra_id):
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.update_extra(printer_id, extra_id, data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify(entry)
+
+
+@app.route("/api/printers/<printer_id>/extras/<extra_id>", methods=["DELETE"])
+def api_delete_extra(printer_id, extra_id):
+    ok = dash.delete_extra(printer_id, extra_id)
+    if not ok:
+        return jsonify({"error": "Eintrag nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
 @app.route("/api/printers/<printer_id>/print/prepare", methods=["POST"])
 def api_print_prepare(printer_id):
     """Schritt 1: Nimmt eine per Drag & Drop hochgeladene, bereits
@@ -4064,6 +4557,20 @@ INDEX_HTML = r"""
   }
 
   .ams-modal{ width:480px; }
+  .mqtt-modal{ width:560px; }
+  .mqtt-extra-row{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:8px 0; border-bottom:1px solid var(--border);
+  }
+  .mqtt-extra-row:last-child{ border-bottom:none; }
+  .mqtt-extra-row .mqtt-extra-info{ font-size:12px; }
+  .mqtt-extra-row .mqtt-extra-info .mqtt-extra-sub{ color:var(--text-dim); font-size:11px; margin-top:2px; }
+  .mqtt-discovered-row{
+    display:flex; justify-content:space-between; gap:10px; padding:4px 0;
+    cursor:pointer; font-family:var(--mono); font-size:11px;
+  }
+  .mqtt-discovered-row:hover{ color:var(--accent); }
+  .mqtt-discovered-list{ max-height:160px; overflow-y:auto; }
   .ams-row{
     display:flex; align-items:flex-start; gap:12px; padding:12px 0;
     border-bottom:1px solid var(--border);
@@ -4166,7 +4673,21 @@ INDEX_HTML = r"""
   }
 
   /* MK6: Druckauftrags-Verlauf */
-  .history-modal{ width:460px; }
+  /* v2.2.4: eigenes Scroll-Verhalten fuer Verlaufs-/Warteschlangen-Modal -
+     Kopfbereich (Ueberschrift, Aktions-Knoepfe, Werkzeuge/Drop-Zone)
+     bleibt fest sichtbar, NUR die Liste selbst (.history-modal-scroll)
+     scrollt bei vielen Eintraegen. Vorher scrollte das gesamte .modal
+     als ein Block (siehe .modal{overflow-y:auto}), wodurch "Schliessen"/
+     "Druckraum leer" am Fuss einer langen Liste nur nach vollstaendigem
+     Durchscrollen erreichbar war. */
+  .history-modal{
+    width:460px; display:flex; flex-direction:column; overflow:hidden;
+  }
+  .history-modal .modal-actions-top{ flex-shrink:0; margin-top:0; margin-bottom:14px; }
+  .history-modal .history-modal-tools{ flex-shrink:0; }
+  .history-modal .hint-text{ flex-shrink:0; margin:0 0 10px 0; }
+  .history-modal .queue-drop-zone{ flex-shrink:0; }
+  .history-modal-scroll{ overflow-y:auto; min-height:0; }
   .history-empty{ font-size:12px; color:var(--text-dim); font-style:italic; padding:10px 0; }
   .history-item{
     display:flex; gap:12px; align-items:center; padding:12px 0;
@@ -4205,7 +4726,7 @@ INDEX_HTML = r"""
     font-weight:700; font-family:var(--mono); display:flex; align-items:center; justify-content:center;
   }
   .history-modal-tools{
-    display:flex; justify-content:flex-end; margin:-8px 0 10px 0; gap:8px;
+    display:flex; justify-content:flex-end; margin:0 0 10px 0; gap:8px;
   }
   .queue-item{ align-items:center; }
   .queue-order-btns{ display:flex; flex-direction:column; gap:2px; flex-shrink:0; }
@@ -4228,6 +4749,7 @@ INDEX_HTML = r"""
       <button type="button" class="layout-btn" data-cols="2" onclick="setLayoutCols(2)">2</button>
       <button type="button" class="layout-btn" data-cols="3" onclick="setLayoutCols(3)">3</button>
     </div>
+    <button class="btn btn-ghost" onclick="openMqttModal()">MQTT-Sensoren</button>
     <button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button>
   </div>
 </header>
@@ -4336,6 +4858,88 @@ INDEX_HTML = r"""
   </div>
 </div>
 
+<!-- Modal: MQTT-Sensoren & Schalter (v2.2.15) - Broker-Einstellungen und
+     Sensor-/Schalter-Verwaltung je Drucker ueber die Web-Oberflaeche,
+     siehe README Abschnitt 2 -->
+<div class="modal-backdrop" id="mqttModal">
+  <div class="modal mqtt-modal">
+    <h2>MQTT-Sensoren &amp; Schalter</h2>
+    <div class="error-msg" id="mqttError"></div>
+
+    <div class="field-label">Zweiter MQTT-Broker (unabhaengig von den Druckern)</div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="mq_enabled">
+      <label style="margin:0;">Aktiviert</label>
+    </div>
+    <label>Broker-Adresse</label>
+    <input id="mq_host" placeholder="192.168.1.5">
+    <label>Port</label>
+    <input id="mq_port" placeholder="1883">
+    <label>Benutzername (optional)</label>
+    <input id="mq_user" placeholder="">
+    <label>Passwort (optional, leer lassen = unveraendert)</label>
+    <input id="mq_pass" type="password" placeholder="">
+    <div class="checkbox-row">
+      <input type="checkbox" id="mq_tls">
+      <label style="margin:0;">TLS verwenden</label>
+    </div>
+    <div class="modal-actions" style="justify-content:flex-start; margin-bottom:6px;">
+      <button class="btn" onclick="saveExtrasMqttSettings()">Broker-Einstellungen speichern</button>
+    </div>
+    <div class="hint-text" id="mqttStatusHint" style="margin-top:-2px;"></div>
+
+    <div class="field-label" style="margin-top:10px;" id="mqttFormTitle">Neuen Eintrag hinzufuegen</div>
+    <label>Drucker</label>
+    <select id="mq_printer"></select>
+    <label>Art</label>
+    <select id="mq_kind" onchange="toggleMqttKindFields()">
+      <option value="sensor">Sensor (Anzeige)</option>
+      <option value="switch">Schalter (Ein/Aus)</option>
+    </select>
+    <label>Bezeichnung</label>
+    <input id="mq_label" placeholder="z. B. Temperatur Werkstatt">
+
+    <div id="mqttSensorFields">
+      <label>MQTT-Topic</label>
+      <input id="mq_topic" placeholder="home/werkstatt/temperature">
+      <label>Einheit (optional)</label>
+      <input id="mq_unit" placeholder="&deg;C">
+      <label>Anzeigebereich</label>
+      <select id="mq_display">
+        <option value="generic">Generisch (eigener Bereich "Sensoren &amp; Schalter")</option>
+        <option value="temperature">Bei Temperaturen anzeigen (mit Verlaufsdiagramm, wie Duese/Bett/Kammer)</option>
+        <option value="humidity">Bei Luftfeuchtigkeit anzeigen (mit Verlaufsdiagramm, wie AMS-Feuchte)</option>
+      </select>
+    </div>
+    <div id="mqttSwitchFields" style="display:none;">
+      <label>Befehls-Topic</label>
+      <input id="mq_cmd_topic" placeholder="home/werkstatt/licht/set">
+      <label>Payload "Ein"</label>
+      <input id="mq_payload_on" placeholder="ON">
+      <label>Payload "Aus"</label>
+      <input id="mq_payload_off" placeholder="OFF">
+    </div>
+    <div class="modal-actions" style="justify-content:flex-start;">
+      <button class="btn" id="mqttSubmitBtn" onclick="submitMqttExtra()">Hinzufuegen</button>
+      <button class="btn btn-ghost" id="mqttCancelEditBtn" style="display:none;" onclick="cancelMqttExtraEdit()">Bearbeiten abbrechen</button>
+    </div>
+
+    <div class="field-label" style="margin-top:14px;">Vorhandene Eintraege</div>
+    <div id="mqttExtrasList" class="hint-text">Noch keine Sensoren/Schalter angelegt.</div>
+
+    <div class="field-label" style="margin-top:14px;">
+      Zuletzt vom Broker empfangene Topics (anklicken, um das Topic-Feld zu uebernehmen)
+    </div>
+    <div id="mqttDiscoveredList" class="mqtt-discovered-list hint-text">
+      Noch keine Nachrichten vom Broker empfangen.
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeMqttModal()">Schliessen</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: Kamera -->
 <div class="modal-backdrop cam-modal" id="camModal">
   <span class="cam-close" onclick="closeCam()">&times;</span>
@@ -4365,13 +4969,19 @@ INDEX_HTML = r"""
 <div class="modal-backdrop" id="historyModal">
   <div class="modal history-modal">
     <h2>Druckauftrags-Verlauf</h2>
+    <!-- v2.2.4: Schliessen-Schaltflaeche jetzt OBEN statt unten - bei
+         langen Verlaufslisten war der Knopf am Ende der (langen) Liste
+         nur nach vollstaendigem Durchscrollen erreichbar. Siehe auch
+         .history-modal{display:flex...}/.history-modal-scroll weiter
+         unten im CSS: nur die Liste selbst scrollt jetzt, Kopf- und
+         Aktionsbereich bleiben stets sichtbar. -->
+    <div class="modal-actions modal-actions-top">
+      <button class="btn btn-ghost" onclick="closeHistoryModal()">Schliessen</button>
+    </div>
     <div class="history-modal-tools">
       <button class="btn-mini" id="historySortBtn" onclick="toggleHistorySort()">Sortierung: Neueste zuerst</button>
     </div>
-    <div id="historyModalBody"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeHistoryModal()">Schliessen</button>
-    </div>
+    <div id="historyModalBody" class="history-modal-scroll"></div>
   </div>
 </div>
 
@@ -4379,6 +4989,15 @@ INDEX_HTML = r"""
 <div class="modal-backdrop" id="queueModal">
   <div class="modal history-modal">
     <h2>Warteschlange</h2>
+    <!-- v2.2.4: siehe Kommentar bei historyModal oben - Schliessen UND
+         "Druckraum leer" sind jetzt OBEN, bleiben also bei langen
+         Warteschlangen ohne Scrollen erreichbar. -->
+    <div class="modal-actions modal-actions-top">
+      <button class="btn btn-ghost" onclick="closeQueueModal()">Schliessen</button>
+      <button class="btn" id="queueSendNextBtn" onclick="sendNextQueued(queueModalPrinterId)">Druckraum leer - naechsten senden</button>
+    </div>
+    <!-- v2.0.1: Hinweistext + Deaktivierung siehe updateQueueSendButtonState() -->
+    <div class="hint-text" id="queueSendHint"></div>
     <!-- v2.1.0: Datei kann per Drag & Drop hierher gezogen werden -
          genau wie auf die Drucker-Kachel selbst (dzDrop()/dzDropUltimaker()) -
          oder ueber den Datei-Auswahl-Button darin. -->
@@ -4395,13 +5014,7 @@ INDEX_HTML = r"""
         </label>
       </div>
     </div>
-    <div id="queueModalBody"></div>
-    <!-- v2.0.1: Hinweistext + Deaktivierung siehe updateQueueSendButtonState() -->
-    <div class="hint-text" id="queueSendHint" style="margin-top:10px;"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeQueueModal()">Schliessen</button>
-      <button class="btn" id="queueSendNextBtn" onclick="sendNextQueued(queueModalPrinterId)">Druckraum leer - naechsten senden</button>
-    </div>
+    <div id="queueModalBody" class="history-modal-scroll"></div>
   </div>
 </div>
 
@@ -4427,6 +5040,21 @@ const HIST_ICON = `<svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 1 0 8.94 10h-2.
 const FILE_ICON = `<svg viewBox="0 0 24 24"><path d="M6 2h9l5 5v15H6zm8 1.5V8h4.5z"/></svg>`;
 // MK6 v1.2.0: Warteschlangen-Symbol (Listen-Icon) fuer die Kachel.
 const QUEUE_ICON = `<svg viewBox="0 0 24 24"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h12v2H3z"/></svg>`;
+
+// v2.2.14: formatiert die vom Backend gelieferten Rohsekunden
+// ("duration_sec", siehe _extract_print_duration_seconds() in app.py)
+// als kurze "Xh Ymin"-Anzeige fuer Verlaufs-/Warteschlangeneintraege.
+// Liefert eine leere Zeichenkette, wenn keine Dauer bekannt ist (aeltere
+// Eintraege ohne "duration_sec", oder wenn sich aus der Datei keine
+// Schaetzung extrahieren liess) - der Aufrufer zeigt dann einfach keinen
+// Zeit-Hinweis an, statt "unbekannt" o. ae. anzuzeigen.
+function formatDuration(sec){
+  if(sec === undefined || sec === null || isNaN(sec)) return '';
+  const totalMin = Math.max(0, Math.round(sec / 60));
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}min` : `${m}min`;
+}
 
 // MK6 v1.2.0: nur fuer Bambu/Ultimaker relevant (nur diese unterstuetzen
 // Druckauftraege per Dashboard-Upload, siehe PrintQueueStore-Kommentar) -
@@ -4513,6 +5141,236 @@ async function submitAdd(){
   refresh();
 }
 
+// ----------------------------------------------------------------------
+// v2.2.15: MQTT-Sensoren & Schalter komplett ueber die Web-Oberflaeche
+// verwalten (Broker-Einstellungen + je Drucker Sensor-/Schalter-
+// Eintraege) - vorher nur per manueller config.json-Bearbeitung
+// moeglich. mqttEditState haelt fest, ob das Formular gerade einen
+// bestehenden Eintrag bearbeitet (dann PUT statt POST beim Absenden).
+// ----------------------------------------------------------------------
+let mqttEditState = null; // { printerId, extraId } oder null (= "neu anlegen")
+
+function toggleMqttKindFields(){
+  const kind = document.getElementById('mq_kind').value;
+  document.getElementById('mqttSensorFields').style.display = (kind === 'sensor') ? 'block' : 'none';
+  document.getElementById('mqttSwitchFields').style.display = (kind === 'switch') ? 'block' : 'none';
+}
+
+function populateMqttPrinterSelect(selectedId){
+  const sel = document.getElementById('mq_printer');
+  sel.innerHTML = lastPrinterList.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+  if(selectedId) sel.value = selectedId;
+}
+
+function renderMqttExtrasList(){
+  const list = document.getElementById('mqttExtrasList');
+  const rows = [];
+  lastPrinterList.forEach(p => {
+    (p.extras || []).forEach(e => {
+      const displayLabel = { generic: 'Sensoren-Bereich', temperature: 'Temperaturen-Bereich', humidity: 'Feuchte-Bereich' }[e.display] || 'Sensoren-Bereich';
+      const sub = (e.kind === 'switch')
+        ? `Schalter &middot; Befehls-Topic: ${e.command_topic}`
+        : `Sensor &middot; Topic: ${e.topic}${e.unit ? ' &middot; Einheit: ' + e.unit : ''} &middot; Anzeige: ${displayLabel}`;
+      rows.push(`<div class="mqtt-extra-row">
+        <div class="mqtt-extra-info">
+          <div><b>${e.label}</b> (${p.name})</div>
+          <div class="mqtt-extra-sub">${sub}</div>
+        </div>
+        <div>
+          <button class="btn-mini" onclick="startEditMqttExtra('${p.id}','${e.id}')">Bearbeiten</button>
+          <button class="btn-mini btn-delete" onclick="deleteMqttExtra('${p.id}','${e.id}')">Loeschen</button>
+        </div>
+      </div>`);
+    });
+  });
+  list.innerHTML = rows.length ? rows.join('') : 'Noch keine Sensoren/Schalter angelegt.';
+}
+
+async function refreshMqttDiscovered(){
+  const list = document.getElementById('mqttDiscoveredList');
+  try{
+    const res = await fetch('/api/extras_mqtt/discovered');
+    const topics = await res.json();
+    if(!topics || topics.length === 0){
+      list.innerHTML = 'Noch keine Nachrichten vom Broker empfangen.';
+      return;
+    }
+    list.innerHTML = topics.map(t =>
+      `<div class="mqtt-discovered-row" onclick="useDiscoveredTopic('${t.topic}')">
+        <span>${t.topic}</span><span>${t.value}</span>
+      </div>`
+    ).join('');
+  } catch(e){
+    list.innerHTML = 'Themenliste konnte nicht geladen werden.';
+  }
+}
+
+function useDiscoveredTopic(topic){
+  // Nur beim Sensor sinnvoll (Schalter-Topics werden von diesem
+  // Dashboard selbst veroeffentlicht, nicht empfangen) - schaltet bei
+  // Bedarf automatisch auf "Sensor" um, damit das richtige Feld sichtbar ist.
+  document.getElementById('mq_kind').value = 'sensor';
+  toggleMqttKindFields();
+  document.getElementById('mq_topic').value = topic;
+}
+
+async function openMqttModal(){
+  document.getElementById('mqttError').style.display = 'none';
+  document.getElementById('mqttStatusHint').textContent = '';
+  cancelMqttExtraEdit();
+  populateMqttPrinterSelect();
+  renderMqttExtrasList();
+  refreshMqttDiscovered();
+  try{
+    const res = await fetch('/api/extras_mqtt');
+    const cfg = await res.json();
+    document.getElementById('mq_enabled').checked = !!cfg.enabled;
+    document.getElementById('mq_host').value = cfg.host || '';
+    document.getElementById('mq_port').value = cfg.port || 1883;
+    document.getElementById('mq_user').value = cfg.username || '';
+    document.getElementById('mq_pass').value = '';
+    document.getElementById('mq_tls').checked = !!cfg.tls;
+  } catch(e){
+    // Broker-Einstellungen konnten nicht geladen werden - Formular
+    // bleibt leer, Sensor-/Schalter-Verwaltung funktioniert trotzdem.
+  }
+  document.getElementById('mqttModal').classList.add('show');
+}
+
+function closeMqttModal(){
+  document.getElementById('mqttModal').classList.remove('show');
+}
+
+async function saveExtrasMqttSettings(){
+  const body = {
+    enabled: document.getElementById('mq_enabled').checked,
+    host: document.getElementById('mq_host').value.trim(),
+    port: document.getElementById('mq_port').value.trim() || 1883,
+    username: document.getElementById('mq_user').value.trim(),
+    tls: document.getElementById('mq_tls').checked,
+  };
+  const pass = document.getElementById('mq_pass').value;
+  if(pass !== '') body.password = pass; // leer gelassen = Passwort unveraendert (siehe Backend)
+
+  const res = await fetch('/api/extras_mqtt', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  const err = document.getElementById('mqttError');
+  if(!res.ok){
+    err.textContent = data.error || 'Fehler beim Speichern.';
+    err.style.display = 'block';
+    return;
+  }
+  err.style.display = 'none';
+  document.getElementById('mq_pass').value = '';
+  document.getElementById('mqttStatusHint').textContent =
+    'Gespeichert - Verbindung wird neu aufgebaut. Empfangene Topics erscheinen nach kurzer Zeit unten.';
+  setTimeout(refreshMqttDiscovered, 3000);
+}
+
+function resetMqttExtraForm(){
+  document.getElementById('mq_kind').value = 'sensor';
+  document.getElementById('mq_label').value = '';
+  document.getElementById('mq_topic').value = '';
+  document.getElementById('mq_unit').value = '';
+  document.getElementById('mq_display').value = 'generic';
+  document.getElementById('mq_cmd_topic').value = '';
+  document.getElementById('mq_payload_on').value = '';
+  document.getElementById('mq_payload_off').value = '';
+  toggleMqttKindFields();
+}
+
+function cancelMqttExtraEdit(){
+  mqttEditState = null;
+  document.getElementById('mqttFormTitle').textContent = 'Neuen Eintrag hinzufuegen';
+  document.getElementById('mqttSubmitBtn').textContent = 'Hinzufuegen';
+  document.getElementById('mqttCancelEditBtn').style.display = 'none';
+  document.getElementById('mq_kind').disabled = false;
+  document.getElementById('mq_printer').disabled = false;
+  resetMqttExtraForm();
+}
+
+function startEditMqttExtra(printerId, extraId){
+  const p = lastPrinterList.find(x => x.id === printerId);
+  const e = p && (p.extras || []).find(x => x.id === extraId);
+  if(!e) return;
+  mqttEditState = { printerId, extraId };
+  populateMqttPrinterSelect(printerId);
+  document.getElementById('mq_printer').disabled = true; // Zuordnung zum Drucker aendert sich beim Bearbeiten nicht
+  document.getElementById('mq_kind').value = e.kind;
+  document.getElementById('mq_kind').disabled = true; // Art (Sensor/Schalter) laesst sich nachtraeglich nicht wechseln
+  toggleMqttKindFields();
+  document.getElementById('mq_label').value = e.label || '';
+  if(e.kind === 'switch'){
+    document.getElementById('mq_cmd_topic').value = e.command_topic || '';
+    document.getElementById('mq_payload_on').value = e.payload_on || '';
+    document.getElementById('mq_payload_off').value = e.payload_off || '';
+  } else {
+    document.getElementById('mq_topic').value = e.topic || '';
+    document.getElementById('mq_unit').value = e.unit || '';
+    document.getElementById('mq_display').value = e.display || 'generic';
+  }
+  document.getElementById('mqttFormTitle').textContent = 'Eintrag bearbeiten';
+  document.getElementById('mqttSubmitBtn').textContent = 'Aktualisieren';
+  document.getElementById('mqttCancelEditBtn').style.display = 'inline-block';
+}
+
+async function submitMqttExtra(){
+  const kind = document.getElementById('mq_kind').value;
+  const body = {
+    kind: kind,
+    label: document.getElementById('mq_label').value.trim(),
+  };
+  if(kind === 'sensor'){
+    body.topic = document.getElementById('mq_topic').value.trim();
+    body.unit = document.getElementById('mq_unit').value.trim();
+    body.display = document.getElementById('mq_display').value;
+  } else {
+    body.command_topic = document.getElementById('mq_cmd_topic').value.trim();
+    body.payload_on = document.getElementById('mq_payload_on').value.trim();
+    body.payload_off = document.getElementById('mq_payload_off').value.trim();
+  }
+
+  const err = document.getElementById('mqttError');
+  let res;
+  if(mqttEditState){
+    res = await fetch('/api/printers/' + mqttEditState.printerId + '/extras/' + mqttEditState.extraId, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+  } else {
+    const printerId = document.getElementById('mq_printer').value;
+    if(!printerId){
+      err.textContent = 'Bitte zuerst einen Drucker anlegen.';
+      err.style.display = 'block';
+      return;
+    }
+    res = await fetch('/api/printers/' + printerId + '/extras', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+  }
+  const data = await res.json();
+  if(!res.ok){
+    err.textContent = data.error || 'Fehler beim Speichern.';
+    err.style.display = 'block';
+    return;
+  }
+  err.style.display = 'none';
+  cancelMqttExtraEdit();
+  await refresh();
+  renderMqttExtrasList();
+}
+
+async function deleteMqttExtra(printerId, extraId){
+  if(!confirm('Diesen Eintrag wirklich loeschen?')) return;
+  await fetch('/api/printers/' + printerId + '/extras/' + extraId, { method:'DELETE' });
+  if(mqttEditState && mqttEditState.printerId === printerId && mqttEditState.extraId === extraId){
+    cancelMqttExtraEdit();
+  }
+  await refresh();
+  renderMqttExtrasList();
+}
+
 async function deletePrinter(id){
   if(!confirm('Diesen Drucker wirklich entfernen?')) return;
   await fetch('/api/printers/' + id, { method:'DELETE' });
@@ -4592,12 +5450,14 @@ function renderHistoryEntries(){
     const thumb = e.has_image
       ? `<img class="history-thumb" src="/api/printers/${printerId}/history/${e.job_id}/thumbnail" alt="">`
       : `<div class="history-thumb-placeholder">${FILE_ICON}</div>`;
+    const durText = formatDuration(e.duration_sec);
+    const durHtml = durText ? ` &middot; Druckzeit ca. ${durText}` : '';
     return `
       <div class="history-item">
         ${thumb}
         <div class="history-body">
           <div class="history-filename">${e.filename}</div>
-          <div class="history-date">${e.sent_at}</div>
+          <div class="history-date">${e.sent_at}${durHtml}</div>
         </div>
         <div class="history-actions">
           <button class="btn-mini" onclick="reprintHistoryEntry('${printerId}','${e.job_id}')">Erneut drucken</button>
@@ -4755,6 +5615,8 @@ async function refreshQueueModal(){
       ? `<img class="history-thumb" src="/api/printers/${printerId}/queue/${e.job_id}/thumbnail" alt="">`
       : `<div class="history-thumb-placeholder">${FILE_ICON}</div>`;
     const label = (i === 0) ? '<b>Naechster:</b> ' : '';
+    const durText = formatDuration(e.duration_sec);
+    const durHtml = durText ? ` &middot; Druckzeit ca. ${durText}` : '';
     return `
       <div class="history-item queue-item">
         <div class="queue-order-btns">
@@ -4764,7 +5626,7 @@ async function refreshQueueModal(){
         ${thumb}
         <div class="history-body">
           <div class="history-filename">${label}${e.filename}</div>
-          <div class="history-date">In Warteschlange seit ${e.added_at}</div>
+          <div class="history-date">In Warteschlange seit ${e.added_at}${durHtml}</div>
         </div>
         <div class="history-actions">
           <button class="btn-mini" onclick="openAssignModal('queue','${printerId}','${e.job_id}')">Zuweisen</button>
@@ -5122,15 +5984,88 @@ function humidityLabel(value){
 // v2.2.2: Sparkline-Linie in Blau (eigene CSS-Klasse "humidity-spark"),
 // auf ausdruecklichen Nutzerwunsch von der roten Temperatur-Sparkline
 // unterschieden.
-function humidityChip(printerId, field, label, value){
-  recordTempHistory(printerId, field, value);
+// v2.2.7: Nutzer meldete bei einem H2S (AMS 2 Pro), dass der Drucker
+// selbst 44% Luftfeuchte anzeigt, das Dashboard aber nur die Stufe "1"
+// zeigte - fuer sich genommen nicht falsch, aber ohne die 1-5-Skala im
+// Kopf nicht einzuordnen. Recherche ergab: das AMS 2 Pro liefert
+// zusaetzlich zur Stufe ("humidity") den tatsaechlichen Prozentwert im
+// Feld "humidity_raw" (aeltere AMS-Einheiten liefern dieses Feld gar
+// nicht). Ist rawPercent vorhanden, wird JETZT der selbsterklaerende
+// Prozentwert als Hauptanzeige verwendet (und auch im Verlaufsdiagramm
+// aufgezeichnet) - Wort-Label und Ampel-Punkte bleiben dabei an der
+// vom Drucker gelieferten Stufe ("value") ausgerichtet, da nur diese
+// die vom Hersteller vorgesehene gut/mittel/schlecht-Einordnung traegt.
+// v2.2.12: Nutzer bemerkte eine widerspruechliche Anzeige zwischen zwei
+// Druckern - u. a. einen H2-Wert von 41% als "trocken", aber einen
+// X1-Wert von 24% als "feucht" (obwohl 24% RH fuer sich genommen eher
+// trockener wirkt als 41%). Ursache: Wort-Label und Ampel-Punkte wurden
+// bisher IMMER aus der 1-5-Stufe ("value") abgeleitet, auch wenn
+// zusaetzlich ein Prozentwert ("rawPercent") vorlag - beide Felder sind
+// aber laut Recherche (maziggy/bambuddy Issue #3140) NICHT notwendig
+// gleich skaliert: es gibt einen dokumentierten Bug/Eigenheit, wonach die
+// 1-5-Rohstufe je nach AMS-Generation in ANDERER Reihenfolge gemeldet
+// wird (mal 1=trocken...5=feucht, mal umgekehrt) - welche Richtung ein
+// konkretes Geraet tatsaechlich meldet, ist nicht zuverlaessig bekannt
+// und wird hier bewusst NICHT geraten (siehe UEBERGABE.md fuer die volle
+// Herleitung). Ist ein Prozentwert vorhanden, ist er die praezisere,
+// selbsterklaerende Angabe (kein Rate-Massstab noetig) - Wort-Label und
+// Punkte werden deshalb JETZT NUR NOCH angezeigt, wenn KEIN Prozentwert
+// vorliegt (aeltere AMS-Einheiten ohne humidity_raw). Damit widersprechen
+// sich Anzeige und Einordnung nicht mehr.
+function humidityChip(printerId, field, label, value, rawPercent){
+  const hasRaw = (rawPercent !== undefined && rawPercent !== null);
+  const recordedValue = hasRaw ? rawPercent : value;
+  recordTempHistory(printerId, field, recordedValue);
   const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
-  const display = (value === undefined || value === null) ? '–' : value;
-  return `<div class="temp-chip">${label} <b>${display}</b>${humidityLabel(value)}${humidityScale(value)}` +
+  const display = hasRaw ? `${rawPercent}%` : ((value === undefined || value === null) ? '–' : value);
+  const levelKnown = !hasRaw && (value !== undefined && value !== null && HUMIDITY_LEVELS[value]);
+  return `<div class="temp-chip">${label} <b>${display}</b>${levelKnown ? humidityLabel(value) : ''}${levelKnown ? humidityScale(value) : ''}` +
          `${sparklineSvg(history, 'humidity-spark')}</div>`;
 }
 
-function renderAms(printerId, ams, amsUnits){
+// v2.2.16: Chip fuer einen MQTT-Extra-Sensor mit "display": "temperature"
+// oder "humidity" (siehe Backend-Feld in _validate_extra_fields()) -
+// nutzt bewusst dieselbe tempHistory/sparklineSvg-Infrastruktur wie
+// tempChip()/humidityChip() oben, damit ein eigener MQTT-Temperatur-
+// oder Feuchtesensor GENAUSO aussieht und sich GENAUSO verhaelt wie die
+// vom Drucker selbst gelieferten Werte (Nutzerwunsch: "genau wie die vom
+// Drucker uebermittelten Sensordaten"). Der Feld-Schluessel fuer
+// tempHistory ist "extra_<id>" - eigener Namensraum, kollidiert also
+// nicht mit den festen Feldern "nozzle"/"bed"/"chamber"/"ams_humidity_*".
+// Der Rohwert kommt als Text vom zweiten MQTT-Broker (ExtrasMqttManager)
+// und wird nur dann als Zahl behandelt/aufgezeichnet, wenn er sich auch
+// tatsaechlich in eine Zahl umwandeln laesst (z. B. "23.4") - ein
+// nicht-numerischer Sensorwert wird stattdessen unveraendert als Text
+// angezeigt, OHNE Sparkline (die braeuchte zwingend Zahlen).
+function extraChip(printerId, extra){
+  const field = 'extra_' + extra.id;
+  const raw = extra.value;
+  const num = (raw === undefined || raw === null || raw === '') ? NaN : Number(raw);
+  const isNumeric = Number.isFinite(num);
+  if(isNumeric) recordTempHistory(printerId, field, num);
+  const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
+  const shown = isNumeric ? formatTemp(num) : ((raw === undefined || raw === null || raw === '') ? '–' : raw);
+  const unitSuffix = extra.unit ? extra.unit : '';
+  const sparkClass = (extra.display === 'humidity') ? 'humidity-spark' : 'temp-spark';
+  return `<div class="temp-chip">${extra.label} <b>${shown}${unitSuffix}</b>${isNumeric ? sparklineSvg(history, sparkClass) : ''}</div>`;
+}
+
+// Liefert die Chips ALLER Sensor-Extras eines Druckers, deren "display"
+// auf "temperature" oder "humidity" gesetzt ist - zum Einfuegen direkt in
+// die bestehende "Temperaturen"-Zeile jeder Karte (renderBambuCard etc.),
+// bzw. bei Formlabs (kein eigener Temperaturen-Bereich) fuer eine
+// eigens dafuer eingeblendete Zeile. renderExtras() unten blendet
+// dieselben Eintraege bewusst aus dem generischen "Sensoren & Schalter"-
+// Bereich aus, damit nichts doppelt erscheint.
+function extraTempChips(printerId, extras){
+  if(!extras || extras.length === 0) return '';
+  return extras
+    .filter(e => e.kind === 'sensor' && (e.display === 'temperature' || e.display === 'humidity'))
+    .map(e => extraChip(printerId, e))
+    .join('');
+}
+
+function renderAms(printerId, ams, amsUnits, bambuFamily){
   if(!ams || ams.length === 0){
     return '<div class="empty-ams">Kein AMS erkannt / keine Fach-Daten.</div>';
   }
@@ -5144,13 +6079,28 @@ function renderAms(printerId, ams, amsUnits){
       <div class="ams-remain">${remain}</div>
     </div>`;
   }).join('');
+  // v2.2.5: Bei der A1-Familie wird das "AMS Lite" verbaut, das (anders
+  // als das vollwertige AMS der X1-Serie) KEINEN Feuchtesensor besitzt.
+  // Auf ausdruecklichen Nutzerwunsch wird die Feuchteanzeige deshalb bei
+  // bambuFamily === 'a1' GRUNDSAETZLICH unterdrueckt - unabhaengig davon,
+  // ob/was das AMS Lite an "humidity"-Rohwert meldet (manche Firmware-
+  // Staende liefern dort einen bedeutungslosen Platzhalterwert statt gar
+  // kein Feld, siehe _apply_print_report() - der reine "Feld vorhanden?"-
+  // Filter unten reicht bei der A1-Familie also nicht aus). Analog zur
+  // bereits bestehenden Kammertemperatur-Ausblendung fuer A1 (v2.2.0).
+  const isA1 = bambuFamily === 'a1';
   // v2.2.1: Luftfeuchtigkeit je AMS-Einheit, mit Verlaufsdiagramm - nur
   // Einheiten mit tatsaechlich vorhandenem Wert werden angezeigt (manche
   // AMS-Firmwarestaende liefern das Feld nicht, siehe _apply_print_report()).
-  const units = (amsUnits || []).filter(u => u.humidity !== undefined && u.humidity !== null);
+  // v2.2.7: Einheit auch anzeigen, wenn NUR humidity_raw (Prozentwert,
+  // AMS 2 Pro) vorhanden ist, ohne die aeltere Stufe "humidity".
+  const units = isA1 ? [] : (amsUnits || []).filter(u =>
+    (u.humidity !== undefined && u.humidity !== null) ||
+    (u.humidity_raw !== undefined && u.humidity_raw !== null)
+  );
   const humidityRow = units.length
     ? `<div class="temps ams-humidity-row">${units.map(u =>
-        humidityChip(printerId, `ams_humidity_${u.id}`, `Feuchte AMS ${u.id}`, u.humidity)
+        humidityChip(printerId, `ams_humidity_${u.id}`, `Feuchte AMS ${u.id}`, u.humidity, u.humidity_raw)
       ).join('')}</div>`
     : '';
   return slots + humidityRow;
@@ -5158,10 +6108,18 @@ function renderAms(printerId, ams, amsUnits){
 
 function renderExtras(printerId, extras){
   if(!extras || extras.length === 0) return '';
+  // v2.2.16: Sensoren mit "display": "temperature"/"humidity" erscheinen
+  // stattdessen direkt in der Temperaturen-Zeile (siehe extraTempChips())
+  // - hier ausblenden, damit sie nicht zusaetzlich ein zweites Mal im
+  // generischen "Sensoren & Schalter"-Bereich auftauchen. Schalter sind
+  // von dieser Unterscheidung nicht betroffen (kein "display"-Feld,
+  // bleiben immer hier).
+  const visible = extras.filter(e => !(e.kind === 'sensor' && (e.display === 'temperature' || e.display === 'humidity')));
+  if(visible.length === 0) return '';
   return `<div class="extras-section">
     <div class="field-label">Sensoren &amp; Schalter</div>
     <div class="extras-row">
-      ${extras.map(e => {
+      ${visible.map(e => {
         if(e.kind === 'switch'){
           return `<div class="extra-switch">
             <span>${e.label}</span>
@@ -5246,11 +6204,12 @@ function renderBambuCard(p){
             ${p.bambu_family === 'a1' ? '' : tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp)}
             ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
             ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${extraTempChips(p.id, p.extras)}
           </div>
         </div>
         <div>
           <div class="ams-title">AMS / Filament</div>
-          ${renderAms(p.id, p.ams, p.ams_units)}
+          ${renderAms(p.id, p.ams, p.ams_units, p.bambu_family)}
           ${renderDropZone(p.id)}
         </div>
       </div>
@@ -5617,6 +6576,7 @@ function renderOctoPrintCard(p){
           <div class="temps">
             ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
             ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5667,6 +6627,7 @@ function renderCrealityCard(p){
             ${hasChamber ? tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp) : ''}
             ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
             ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5716,6 +6677,7 @@ function renderUltimakerCard(p){
           <div class="temps">
             ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
             ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
         </div>
@@ -5863,6 +6825,12 @@ function renderFormlabsCard(p){
   const online = p.connected;
   const pct = p.progress || 0;
   const labels = FL_LABELS[p.type] || FL_LABELS.formlabs;
+  // v2.2.16: Formlabs hat (anders als Bambu/OctoPrint/Creality/Ultimaker)
+  // von Haus aus KEINE eigene Temperaturen-Zeile - wird nur eingeblendet,
+  // wenn tatsaechlich mindestens ein MQTT-Extra-Sensor mit "display":
+  // "temperature"/"humidity" an diesem Drucker haengt (sonst leere
+  // Ueberschrift ohne Inhalt).
+  const extraTemps = extraTempChips(p.id, p.extras);
   return `
     <div class="printer-card">
       <div class="card-head">
@@ -5893,6 +6861,11 @@ function renderFormlabsCard(p){
           ${labels.showMaterial ? `
           <div class="field-label">Geladenes Harz / Material</div>
           <div class="file-name">${p.material || '-'}</div>
+          ` : ''}
+
+          ${extraTemps ? `
+          <div class="field-label">Temperaturen</div>
+          <div class="temps">${extraTemps}</div>
           ` : ''}
 
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}

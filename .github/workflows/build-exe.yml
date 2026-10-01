@@ -15,9 +15,19 @@ name: Build
 #     PyInstaller --onefile, auf einem macos-14-Runner (die GitHub-
 #     gehosteten macos-14-Runner sind seit deren Einfuehrung native
 #     Apple-Silicon-Maschinen - kein Cross-Compiling noetig)
-# Bei einem Tag-Push (Format "vX.Y.Z") werden beide Artefakte zusaetzlich
-# an ein GitHub Release angehaengt, benannt nach der Version in
-# APP_VERSION (app.py) bzw. dem Tag.
+#
+# v2.2.13: Bei JEDEM Lauf (Push auf main, manueller Tag-Push, oder
+# manueller "Run workflow"-Klick) wird automatisch ein GitHub Release
+# erstellt bzw. aktualisiert - ein manueller `git tag`/`git push --tags`
+# ist NICHT mehr noetig. Der Tag-Name (Format "vX.Y.Z") wird direkt aus
+# `APP_VERSION` in `app.py` abgeleitet (`tag_name`, siehe unten), nicht
+# aus dem Git-Ref - GitHub legt diesen Tag automatisch am gebauten
+# Commit an, falls er noch nicht existiert. Wird mehrfach ohne
+# Versionserhoehung gepusht (z. B. reine Doku-Fixes ausserhalb des
+# normalen "jede Aenderung erhoeht APP_VERSION"-Ablaufs), aktualisiert
+# das lediglich das bestehende Release mit demselben Tag statt ein
+# neues anzulegen. Ein manueller Tag-Push auf einen aelteren Commit
+# bleibt weiterhin moeglich und funktioniert unveraendert.
 
 on:
   push:
@@ -85,10 +95,11 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-      - name: An GitHub Release anhaengen (nur bei Tag-Push)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: An GitHub Release anhaengen (immer, siehe Kommentar oben)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          target_commitish: ${{ github.sha }}
           files: out/*
           name: "v${{ steps.version.outputs.version }}"
           generate_release_notes: true

@@ -198,6 +198,27 @@ def main():
         ftp.login("bblp", access_code)
         ftp.prot_p()
         ftp.set_pasv(True)
+        # v2.2.9: rein diagnostisch (Nutzer-gemeldet: Druckstart nach
+        # erfolgreichem Upload scheitert bei H2S mit "Nicht unterstuetzter
+        # Pfad oder Name der Druckdatei" - offene Frage seit v2.2.6/v2.2.7,
+        # siehe UEBERGABE.md). Listet das FTPS-Wurzelverzeichnis VOR dem
+        # eigentlichen Upload, um zu sehen, wohin STOR tatsaechlich
+        # schreibt (z. B. ob dort bereits ein "cache"-Unterordner besteht -
+        # siehe Recherche in UEBERGABE.md zu H2-Serie/eMMC-Cache-Pfaden).
+        # Bewusst als eigener, best-effort try/except: ein fehlschlagendes
+        # Listing (z. B. NLST vom Drucker nicht unterstuetzt) darf den
+        # eigentlichen Upload NICHT verhindern oder verzoegern.
+        try:
+            listing = ftp.nlst()
+            print(json.dumps({
+                "type": "diag",
+                "message": f"FTPS-Verzeichnis vor Upload (NLST): {listing}",
+            }), flush=True)
+        except Exception as e:
+            print(json.dumps({
+                "type": "diag",
+                "message": f"FTPS-Verzeichnislisting nicht moeglich: {e}",
+            }), flush=True)
         with open(local_path, "rb") as f:
             if profile["skip_unwrap"]:
                 _storbinary_no_unwrap(ftp, f"STOR {remote_name}", f, blocksize=8192, callback=_progress_cb)

@@ -28,6 +28,20 @@ name: Build
 # das lediglich das bestehende Release mit demselben Tag statt ein
 # neues anzulegen. Ein manueller Tag-Push auf einen aelteren Commit
 # bleibt weiterhin moeglich und funktioniert unveraendert.
+#
+# v2.2.19: `permissions: contents: write` ergaenzt. Ohne diesen Block
+# bekommt der von GitHub automatisch erzeugte GITHUB_TOKEN je nach
+# Repo-/Organisations-Einstellung ("Workflow permissions" ->
+# "Read repository contents and packages permissions", seit 2023 oft
+# die Voreinstellung fuer neue Repos) nur Lesezugriff - der Release-
+# Schritt (softprops/action-gh-release) schlug dadurch mit
+# "403 Resource not accessible by integration" fehl, weil Anlegen eines
+# Release/Tags Schreibzugriff auf "contents" braucht. Mit explizitem
+# `permissions`-Block im Workflow ist der Token-Scope unabhaengig von
+# der Repo-Voreinstellung immer ausreichend.
+
+permissions:
+  contents: write
 
 on:
   push:

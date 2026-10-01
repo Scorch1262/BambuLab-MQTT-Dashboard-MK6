@@ -19,7 +19,7 @@ Druckauftraege) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.2.18).
+> den aktuellen Stand (v2.2.19).
 
 ---
 
@@ -52,7 +52,12 @@ git push -u origin main
 ```
 Danach: Tab **Actions** abwarten (2-4 Min), fertige Zips unter
 **Releases**. Kein manueller Tag noetig, kein zusaetzliches Secret
-(`GITHUB_TOKEN` liefert GitHub Actions automatisch).
+(`GITHUB_TOKEN` liefert GitHub Actions automatisch). Falls der
+Release-Schritt mit `403 Resource not accessible by integration`
+fehlschlaegt: unter **Settings → Actions → General → Workflow
+permissions** "Read and write permissions" aktivieren (der Workflow
+fordert seit v2.2.19 zwar selbst Schreibzugriff an, manche
+Organisations-Einstellungen koennen das aber weiterhin einschraenken).
 
 **macOS/Gatekeeper** (Binaries sind unsigniert): Finder → Rechtsklick →
 "Oeffnen" → "Trotzdem oeffnen", oder `xattr -dr com.apple.quarantine <Datei>`.

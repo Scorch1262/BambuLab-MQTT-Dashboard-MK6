@@ -45,7 +45,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
 # Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
 # README Abschnitt 0a beschriebenen Automatik hergeleitet).
-APP_VERSION = "2.2.18"
+APP_VERSION = "2.2.19"
 
 import os
 import sys

@@ -4,6 +4,7 @@
     "port": 8000
   },
   "preform_server": "http://localhost:44388",
+  "history_max_jobs": 30,
   "extras_mqtt": {
     "enabled": false,
     "host": "",

@@ -39,6 +39,48 @@ name: Build
 # Release/Tags Schreibzugriff auf "contents" braucht. Mit explizitem
 # `permissions`-Block im Workflow ist der Token-Scope unabhaengig von
 # der Repo-Voreinstellung immer ausreichend.
+#
+# v2.2.22: FFmpeg wird jetzt zusaetzlich automatisch heruntergeladen und
+# NEBEN die Haupt-exe gelegt - gebraucht fuer den neuen RTSPS-Kamera-
+# Stream der X1/P1/P2/H2/X2-Serie (siehe _find_ffmpeg_binary() und
+# bambu_rtsp_mjpeg_generator() in app.py). FFmpeg ist eine eigenstaendige,
+# in C geschriebene Programmdatei - KEIN Python-Paket, deshalb genuegt
+# "pip install" dafuer nicht, es wird als fertiges Binary besorgt:
+#   - Windows: "GyanD/codexffmpeg" (github.com/GyanD/codexffmpeg) - ein
+#     GitHub-Repository, das dieselben, seit Jahren etablierten Windows-
+#     Builds von gyan.dev (www.gyan.dev/ffmpeg/builds) zusaetzlich als
+#     normale GitHub-Releases bereitstellt. Vorteil gegenueber einem
+#     direkten Download von gyan.dev: ueber die GitHub-REST-API laesst
+#     sich der Asset-Name des JEWEILS AKTUELLEN Releases zuverlaessig
+#     ermitteln (der Dateiname enthaelt die FFmpeg-Versionsnummer, z. B.
+#     "ffmpeg-9.0.2-essentials_build.zip", aendert sich also bei jedem
+#     FFmpeg-Release) - der Workflow fragt deshalb bewusst erst die API
+#     nach dem aktuellen Asset-Namen ab, statt einen Dateinamen/eine
+#     Versionsnummer fest einzutragen, die spaeter veraltet waere.
+#   - macOS: "evermeet.cx/ffmpeg" (evermeet.cx/ffmpeg) - bietet laut
+#     eigener Dokumentation eine stabile, IMMER auf die aktuelle Version
+#     zeigende Download-API-URL (".../ffmpeg/getrelease/zip"), die direkt
+#     ohne Versionsermittlung verwendet werden kann.
+#     WICHTIGE EINSCHRAENKUNG (siehe README/UEBERGABE.md fuer die an den
+#     Nutzer kommunizierte Fassung): evermeet.cx baut nach eigener Aussage
+#     AUSDRUECKLICH KEINE native Apple-Silicon(arm64)-Version, nur Intel
+#     (x86_64) - obwohl der "macos-14"-Build-Runner selbst natives arm64
+#     ist und die Haupt-exe als natives arm64-Binary erzeugt. Das
+#     Herunterladen/Einbetten im Workflow ist trotzdem unproblematisch
+#     (der Build-Runner fuehrt das x86_64-FFmpeg nicht aus, bettet es nur
+#     ein) - auf dem Mac des Nutzers laeuft dieses x86_64-FFmpeg dann
+#     unter Rosetta 2 (von macOS bei Bedarf automatisch zur Installation
+#     angeboten, meist einmalig und transparent).
+#   - Beide Plattformen: nach dem Entpacken wird NICHT auf einen fest
+#     angenommenen Pfad innerhalb des Archivs vertraut (der je nach
+#     FFmpeg-Version in einem anders benannten Unterordner liegen kann),
+#     sondern die ffmpeg(.exe)-Datei per Suche im entpackten Ordner
+#     gefunden - robuster als ein geratener Pfad.
+#
+# Lizenzhinweis: die mitgelieferte FFmpeg-Datei ist ein eigenstaendiges
+# Open-Source-Projekt unter eigener Lizenz (siehe ffmpeg.org/legal.html) -
+# das Mitliefern einer vorgefertigten FFmpeg-Programmdatei in einer
+# Anwendung ist uebliche Praxis (u. a. OBS Studio, HandBrake, yt-dlp).
 
 permissions:
   contents: write
@@ -88,19 +130,56 @@ jobs:
       - name: FTPS-Upload-Helfer mit PyInstaller bauen
         run: pyinstaller --onefile --name FtpsUploadHelper --console ftps_upload_helper.py
 
-      - name: macOS - ausfuehrbar machen + beide zusammen zippen (bewahrt Exec-Bit)
+      - name: Windows - FFmpeg herunterladen (siehe Kommentar oben)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          # Angehaengt an die API-Abfrage unten, um das niedrige Rate-Limit
+          # fuer NICHT authentifizierte GitHub-API-Aufrufe (60/Stunde, von
+          # allen gleichzeitig laufenden Actions-Runnern geteilt) zu
+          # vermeiden - der von GitHub automatisch bereitgestellte
+          # GITHUB_TOKEN reicht dafuer aus, braucht keine zusaetzlichen
+          # Rechte ueber das ohnehin schon gesetzte "contents: write".
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path ffmpeg_dl | Out-Null
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest" -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -like "*essentials_build.zip" } | Select-Object -First 1
+          if (-not $asset) { throw "Kein 'essentials_build.zip'-Asset im aktuellen GyanD/codexffmpeg-Release gefunden." }
+          Write-Host "FFmpeg-Asset: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ffmpeg_dl/ffmpeg.zip
+          Expand-Archive -Path ffmpeg_dl/ffmpeg.zip -DestinationPath ffmpeg_dl/extracted
+          $exe = Get-ChildItem -Path ffmpeg_dl/extracted -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "ffmpeg.exe im entpackten Archiv nicht gefunden." }
+          Copy-Item $exe.FullName dist/ffmpeg.exe
+
+      - name: macOS - FFmpeg herunterladen (siehe Kommentar oben)
         if: runner.os == 'macOS'
         run: |
-          chmod +x dist/DruckerDashboard dist/FtpsUploadHelper
-          mkdir -p out
-          cd dist && zip -j "../out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip" DruckerDashboard FtpsUploadHelper
+          mkdir -p ffmpeg_dl/extracted
+          curl -sL "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg_dl/ffmpeg.zip
+          unzip -o ffmpeg_dl/ffmpeg.zip -d ffmpeg_dl/extracted
+          FFMPEG_BIN=$(find ffmpeg_dl/extracted -type f -name "ffmpeg" | head -n 1)
+          if [ -z "$FFMPEG_BIN" ]; then
+            echo "ffmpeg-Binary im entpackten Archiv nicht gefunden." >&2
+            exit 1
+          fi
+          cp "$FFMPEG_BIN" dist/ffmpeg
+          chmod +x dist/ffmpeg
 
-      - name: Windows - beide exes zusammen zippen
+      - name: macOS - ausfuehrbar machen + alle drei zusammen zippen (bewahrt Exec-Bit)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x dist/DruckerDashboard dist/FtpsUploadHelper dist/ffmpeg
+          mkdir -p out
+          cd dist && zip -j "../out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip" DruckerDashboard FtpsUploadHelper ffmpeg
+
+      - name: Windows - alle drei zusammen zippen
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Compress-Archive -Path "dist/DruckerDashboard.exe", "dist/FtpsUploadHelper.exe" -DestinationPath "out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip"
+          Compress-Archive -Path "dist/DruckerDashboard.exe", "dist/FtpsUploadHelper.exe", "dist/ffmpeg.exe" -DestinationPath "out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip"
 
       - name: Als Build-Artifact hochladen
         uses: actions/upload-artifact@v4
@@ -126,10 +205,12 @@ jobs:
 # fuer Nutzer: im Finder Rechtsklick -> "Oeffnen" -> "Trotzdem oeffnen",
 # oder im Terminal: xattr -dr com.apple.quarantine DruckerDashboard
 #
-# WICHTIG: Beide exes/Binaries (DruckerDashboard + FtpsUploadHelper)
-# muessen nach dem Entpacken im SELBEN Ordner bleiben - das Hauptprogramm
-# sucht die Helfer-exe direkt neben sich selbst (siehe
-# _find_ftps_upload_helper() in app.py). Fehlt die Helfer-exe, faellt
-# das Programm automatisch auf einen langsameren Fallback-Mechanismus
-# zurueck (Selbstaufruf mit Sentinel-Flag) - funktioniert weiterhin,
-# ist aber genau das Verhalten, das seit v1.5.3 vermieden werden soll.
+# WICHTIG: Alle drei exes/Binaries (DruckerDashboard + FtpsUploadHelper +
+# ffmpeg) muessen nach dem Entpacken im SELBEN Ordner bleiben - das
+# Hauptprogramm sucht beide Helfer-Dateien direkt neben sich selbst
+# (siehe _find_ftps_upload_helper() bzw. _find_ffmpeg_binary() in
+# app.py). Fehlt die FtpsUploadHelper-exe, faellt das Programm auf einen
+# langsameren Fallback-Mechanismus zurueck (funktioniert weiterhin).
+# Fehlt ffmpeg(.exe), funktioniert NUR die Kamera der X1/P1/P2/H2/X2-
+# Serie nicht (klare Fehlermeldung im Dashboard statt Absturz) - alle
+# anderen Funktionen (inkl. A1-Kamera) bleiben unberuehrt.

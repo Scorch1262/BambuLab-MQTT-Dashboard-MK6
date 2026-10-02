@@ -13,13 +13,14 @@ Python-Skript (`app.py`), keine Cloud, kein Account.
 | **Creality** (K1/K1C/K1 Max/K1 SE, Klipper) | Moonraker | ✅ | – |
 | **Formlabs** (Drucker/Wash L/Cure L) | Local API | – | – |
 
-Jeder Drucker bekommt automatisch einen **Verlauf** (letzte 30
-Druckauftraege) sowie Bambu Lab/Ultimaker zusaetzlich eine
+Jeder Drucker bekommt automatisch einen **Verlauf** (standardmaessig
+letzte 30 Druckauftraege, ueber `config.json` einstellbar - siehe
+Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 **Warteschlange** fuer beschaeftigte Drucker.
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.2.19).
+> den aktuellen Stand (v2.2.28).
 
 ---
 
@@ -39,9 +40,19 @@ Druckauftraege) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 `.github/workflows/build-exe.yml` baut bei **jedem Push** automatisch
 Windows- und macOS-arm64-Zips (`DruckerDashboard-v<Version>-...zip`,
-je zwei Dateien: `DruckerDashboard.exe` + `FtpsUploadHelper.exe` - **im
-selben Ordner halten**) und veroeffentlicht sie automatisch als
-**GitHub Release** (benannt nach `APP_VERSION` in `app.py`).
+je **drei** Dateien: `DruckerDashboard.exe` + `FtpsUploadHelper.exe` +
+`ffmpeg.exe` - **im selben Ordner halten**) und veroeffentlicht sie
+automatisch als **GitHub Release** (benannt nach `APP_VERSION` in
+`app.py`).
+
+**FFmpeg** (seit v2.2.22, fuer die Kamera der X1/P1/P2/H2/X2-Serie,
+siehe Abschnitt 2) wird vom Workflow automatisch von einer jeweils
+aktuellen, oeffentlich verfuegbaren Quelle heruntergeladen und mit ins
+Zip gepackt - **kein manueller Schritt noetig**. Fuer macOS gibt es
+dabei keine native Apple-Silicon(arm64)-FFmpeg-Variante, deshalb wird
+dort die Intel(x86_64)-Version mitgeliefert; sie laeuft auf Apple-
+Silicon-Macs ueber **Rosetta 2**, das macOS beim ersten Start bei Bedarf
+automatisch zur Installation anbietet (einmalig, braucht kurz Internet).
 
 **Setup:**
 ```bash
@@ -69,6 +80,12 @@ automatisch.
 
 ## 1. Lokal einrichten/starten
 
+Benoetigt **Python 3.9 oder neuer**. Bei direktem Start per `python3
+app.py` (ohne gebaute exe) auf ungewoehnlichen/eingebetteten Systemen
+(z. B. OpenWrt-Router) vorher `python3 --version` pruefen. Fuer eine
+vollstaendige Installation auf einem Linux-/OpenWrt-Geraet (Autostart,
+FFmpeg fuer musl-Systeme, Fehlerbehebung) siehe `LINUX-INSTALL.md`.
+
 ```bash
 python -m venv venv && venv\Scripts\activate   # Windows
 pip install -r requirements.txt                # flask, paho-mqtt (1.6.1!), pyinstaller
@@ -81,8 +98,17 @@ pyinstaller --onefile --name DruckerDashboard --console app.py
 pyinstaller --onefile --name FtpsUploadHelper --console ftps_upload_helper.py
 ```
 Beide `dist/*.exe` werden zum Weitergeben benoetigt (gleicher Ordner).
-`config.json` entsteht automatisch beim ersten Start. Funktioniert
-identisch auf Apple Silicon (kein Rosetta, kein `--add-data` noetig).
+Fuer die Kamera der X1/P1/P2/H2/X2-Serie zusaetzlich eine `ffmpeg(.exe)`
+in denselben Ordner legen (siehe Abschnitt 0) - ohne sie funktioniert
+nur diese Kamera-Variante nicht, alles andere (inkl. A1-Kamera)
+unveraendert. `config.json` entsteht automatisch beim ersten Start.
+Funktioniert identisch auf Apple Silicon (kein Rosetta fuer das
+Hauptprogramm selbst noetig, kein `--add-data` noetig).
+
+**Im Entwicklungsbetrieb** (direkter Start per `python app.py`, keine
+gebaute exe) reicht fuer die RTSPS-Kamera alternativ eine separat
+installierte, ueber PATH erreichbare FFmpeg-Installation (z. B. per
+Paketmanager) - das Dashboard findet sie automatisch.
 
 ## 2. Drucker hinzufuegen
 
@@ -94,9 +120,22 @@ identisch auf Apple Silicon (kein Rosetta, kein `--add-data` noetig).
 | **Creality** (K1/K1C/K1 Max/K1 SE, Klipper) | IP, Moonraker-Port (7125), optional API-Key/Webcam-URL | Moonraker muss installiert sein (werksseitig nicht vorhanden, z. B. per [Creality-Helper-Script](https://github.com/Guilouz/Creality-Helper-Script-Wiki)). "Creality OS" ohne Klipper wird nicht unterstuetzt. |
 | **Formlabs** (Drucker/Wash L/Cure L) | Name, IP | Braucht laufenden **PreFormServer** (`PreFormServer.exe --port 44388`) auf einem PC im selben Netz. "Form Wash/Cure" ohne "L" werden nicht unterstuetzt (keine Netzwerkfunktion). |
 
-**Bambu-Druckerfamilie** bestimmt nur, welches FTPS-/Druckstart-Profil
+**Bambu-Druckerfamilie** bestimmt, welches FTPS-/Druckstart-Profil
 zuerst probiert wird (X1-Serie, A1-Serie, H2-Serie, P1-Serie, P2-Serie,
-X2-Serie) - eine falsche Wahl verhindert den Druck nicht zwingend.
+X2-Serie) - eine falsche Wahl verhindert den Druck nicht zwingend. Sie
+bestimmt AUSSERDEM (seit v2.2.22), welches Kamera-Protokoll verwendet
+wird:
+
+- **A1-Serie:** funktioniert ohne weitere Einstellung (rohes MJPEG,
+  Port 6000).
+- **X1/P1/P2/H2/X2-Serie:** braucht zusaetzlich zum Developer Mode am
+  Drucker-Display die SEPARATE Einstellung **"LAN Only Liveview"**
+  (teils auch "LAN Mode Liveview" genannt, je nach Firmware-
+  Uebersetzung an anderer Stelle im Menue als der Developer Mode) sowie
+  eine mitgelieferte/installierte **FFmpeg**-Programmdatei (siehe
+  Abschnitt 0/1) - ohne aktivierte Einstellung zeigt das Kamera-Fenster
+  einen Hinweis darauf, ohne FFmpeg einen Hinweis, dass FFmpeg fehlt,
+  statt eines kryptischen Fehlers.
 
 **Eigene Sensoren/Schalter** ueber einen zweiten, von den Druckern
 unabhaengigen MQTT-Broker (z. B. Home Assistant/Mosquitto) lassen sich
@@ -132,7 +171,13 @@ geschaetzter Druckzeit (siehe [Abschnitt 5](#5-temperaturfeuchtedruckzeit-anzeig
 im Verlauf - **Erneut drucken**, **In Warteschlange**, **Zuweisen** (an
 einen anderen Drucker gleichen Typs/Familie), **Loeschen**. Erneutes
 Senden an denselben Drucker aktualisiert nur den Zeitstempel (kein
-doppelter Eintrag). Automatisch auf die letzten 30 Auftraege begrenzt.
+doppelter Eintrag). Automatisch begrenzt auf die Anzahl aus
+`"history_max_jobs"` in `config.json` (Standardwert 30, je Drucker
+separat gezaehlt) - als Wert geht eine positive Zahl, oder `0`, `null`
+bzw. der Text `"unendlich"` fuer KEIN Limit (der Verlaufsordner waechst
+dann unbegrenzt, das im Auge zu behalten liegt dann beim Nutzer). Ein
+ungueltiger Wert faellt defensiv auf 30 zurueck (mit einer Warnung in
+der Server-Konsole beim Start).
 
 **Warteschlange** (Listen-Symbol, nur Bambu/Ultimaker): eine Datei wird
 automatisch eingereiht statt sofort gesendet, wenn der Drucker gerade
@@ -160,6 +205,18 @@ Export) auf die Karte ziehen - **Developer Mode muss aktiv sein**
 2. **Drucken starten:** Upload per FTPS (Port 990), danach MQTT-Kommando
    `project_file`. Schlaegt der Upload fehl, bleiben Datei/Zuordnung
    erhalten - einfach erneut klicken.
+
+**AMS HT (Stuetzmaterial-Einheit):** seit v2.2.21 vollstaendig
+unterstuetzt, automatische Zuordnung eingeschlossen. v2.2.20 hatte das
+noch bewusst ausgeschlossen, weil die interne Fach-Numerierung des
+Dashboards faelschlich von 4 Faechern pro AMS-Einheit ausging (eine
+AMS HT hat nur 1 Fach und meldet sich mit der Geraete-ID 128 statt
+0/1/2) - das hatte bei einem H2D Pro (AMS 2 Pro + AMS HT fuer PLA-
+Stuetzmaterial) einen Druckabbruch nach den ersten Schichten verursacht
+("Zuordnungstabelle des AMS konnte nicht abgerufen werden"). Der
+korrekte Wert wurde inzwischen durch einen vom Nutzer eingefangenen
+echten Bambu-Studio-Befehl verifiziert (kein Raten mehr) und ist jetzt
+fest hinterlegt. Details: `UEBERGABE.md`, v2.2.21.
 
 Technisch nutzt jede Druckerfamilie automatisch das passende FTPS-Profil
 und Druckstart-URL-Schema (`file:///sdcard/...` bei X1/A1/P1/X2,
@@ -199,6 +256,29 @@ Problemen: `UEBERGABE.md`.
   kein Cloud-Account).
 - `FtpsUploadHelper.exe` muss neben `DruckerDashboard.exe` liegen, sonst
   greift ein langsamerer Fallback (Selbstaufruf).
+- `ffmpeg(.exe)` muss ebenfalls neben `DruckerDashboard.exe` liegen (bei
+  Nutzung des per GitHub Actions gebauten Zips bereits enthalten, siehe
+  Abschnitt 0), sonst funktioniert nur die Kamera der X1/P1/P2/H2/X2-
+  Serie nicht (klare Fehlermeldung im Kamera-Fenster statt Absturz).
+  Bleibt das Kamera-Fenster trotz aktivierter "LAN Only Liveview" und
+  vorhandenem FFmpeg laenger als ~15 Sekunden ohne Bild oder
+  Fehlermeldung haengen: in der Server-Konsole nach Zeilen mit dem
+  Praefix `[MK6-FFMPEG]` suchen (seit v2.2.23/25 - u. a. "Starte
+  FFmpeg-Prozess...", "FFmpeg-Prozess gestartet (PID ...)" sowie
+  FFmpegs eigene Fehlerausgabe zur RTSPS-Verbindung). Erscheint nicht
+  einmal "FFmpeg-Prozess gestartet" (nur die Start-Zeile davor): dann
+  verzoegert/blockiert vermutlich eine Antivirus-Software/Windows
+  Defender den Start der frisch heruntergeladenen `ffmpeg.exe` - im
+  Windows-Sicherheitsverlauf (Viren- & Bedrohungsschutz -> Schutz-
+  verlauf) nachsehen, und `ffmpeg.exe` testweise manuell im selben
+  Ordner starten (z. B. `ffmpeg -version`).
+- (Seit v2.2.26 behoben, Hintergrund zur Erinnerung:) Bis v2.2.25 blieb
+  das Bild der X1/P1/P2/H2/X2-Kamera dauerhaft leer/schwarz, obwohl
+  FFmpeg fehlerfrei lief - Ursache war ein browserinkompatibles
+  Multipart-Format von FFmpegs eingebautem `mpjpeg`-Muxer (fehlender
+  `Content-Length`-Header, `\n` statt `\r\n`). Das Dashboard trennt die
+  JPEG-Bilder seitdem selbst aus dem FFmpeg-Rohstrom heraus und verpackt
+  sie im selben Format wie die A1-Kamera. Details: `UEBERGABE.md`, v2.2.26.
 - Waehrend eines Drag-&-Drop-Uploads pausiert Status/Kamera/AMS kurz
   (MQTT wird bewusst kurz getrennt und automatisch neu verbunden).
 - Formlabs braucht PreFormServer, Creality braucht Moonraker - beides

@@ -45,7 +45,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
 # Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
 # README Abschnitt 0a beschriebenen Automatik hergeleitet).
-APP_VERSION = "2.2.19"
+APP_VERSION = "2.2.28"
 
 import os
 import sys
@@ -71,6 +71,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime
+from typing import Optional
 
 from flask import Flask, jsonify, request, Response, render_template_string, redirect, send_file
 from werkzeug.utils import secure_filename
@@ -127,8 +128,40 @@ def _find_ftps_upload_helper():
     return candidate if os.path.isfile(candidate) else None
 
 
+def _find_ffmpeg_binary():
+    """Sucht eine FFmpeg-Programmdatei fuer den RTSPS-Kamera-Stream der
+    X1/P1/P2/H2/X2-Serie (siehe bambu_rtsp_mjpeg_generator(), v2.2.22).
+
+    FFmpeg ist bewusst KEIN Python-Paket (es gibt dafuer keins - ein
+    'pip install ffmpeg-python' o.ae. waere nur ein duenner Wrapper, der
+    im Hintergrund trotzdem dieses eigenstaendige, in C geschriebene
+    Programm braucht), sondern eine separate ausfuehrbare Datei. Analog
+    zu _find_ftps_upload_helper() oben wird sie zuerst NEBEN der
+    Haupt-exe gesucht - dorthin legt sie der GitHub-Actions-Workflow
+    (build-exe.yml, v2.2.22) beim Bauen automatisch mit hinein, siehe
+    dortiger Kommentar. Im Entwicklungsbetrieb (direkter Start per
+    "python3 app.py", keine gebaute exe) wird zusaetzlich auf eine
+    bereits separat installierte, ueber PATH erreichbare ffmpeg-
+    Installation zurueckgegriffen (z. B. per Paketmanager installiert) -
+    das ist reine Entwickler-Bequemlichkeit, am Ausgelieferten Verhalten
+    (gebuendeltes FFmpeg neben der exe) aendert das nichts.
+
+    Gibt None zurueck, wenn nichts gefunden wird - der Aufrufer zeigt
+    dann eine klare Fehlermeldung statt eines kryptischen Absturzes."""
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    candidate = os.path.join(base_dir(), name)
+    if os.path.isfile(candidate):
+        return candidate
+    return shutil.which("ffmpeg")
+
+
 CONFIG_PATH = os.path.join(base_dir(), "config.json")
 LOCK = threading.Lock()
+
+# v2.2.21: nach oben vorgezogen (war urspruenglich erst nach DEFAULT_CONFIG
+# definiert), damit DEFAULT_CONFIG unten direkt darauf verweisen kann statt
+# den Wert 30 ein zweites Mal hart zu codieren.
+PRINT_HISTORY_MAX_JOBS = 30  # Standardwert, ueber config.json ueberschreibbar (siehe _resolve_history_max_jobs())
 
 DEFAULT_CONFIG = {
     "server": {
@@ -136,6 +169,10 @@ DEFAULT_CONFIG = {
         "port": 8000
     },
     "preform_server": "http://localhost:44388",
+    # v2.2.21: ueber config.json einstellbar (siehe _resolve_history_max_jobs()
+    # und README Abschnitt 3) - Standardwert unveraendert wie zuvor fest
+    # codiert (PRINT_HISTORY_MAX_JOBS = 30).
+    "history_max_jobs": PRINT_HISTORY_MAX_JOBS,
     "extras_mqtt": {
         "enabled": False,
         "host": "",
@@ -172,8 +209,13 @@ KNOWN_TYPES = ("bambu",) + FORMLABS_TYPES + ("octoprint",) + CREALITY_TYPES + ("
 # bewusst bereits beim Anlegen/Start jedes Druckers erzeugt (nicht erst
 # beim ersten Druck), damit er zuverlaessig vorhanden ist, sobald der
 # Nutzer manuell hineinschauen moechte.
+#
+# v2.2.21: die maximale Anzahl aufbewahrter Eintraege pro Drucker ist
+# jetzt ueber "history_max_jobs" in config.json einstellbar (Zahl, oder
+# null/"unendlich" fuer unbegrenzt) - PRINT_HISTORY_MAX_JOBS (oben, vor
+# DEFAULT_CONFIG definiert) ist dabei nur noch der Standardwert, falls
+# das Feld in config.json fehlt. Siehe _resolve_history_max_jobs().
 # ----------------------------------------------------------------------
-PRINT_HISTORY_MAX_JOBS = 30  # aelteste Eintraege werden je Drucker automatisch entfernt
 
 # MK6 v1.2.0: Zustaende, in denen ein Drucker als "beschaeftigt" gilt (ein
 # Druckauftrag belegt gerade den Druckraum) - dieselbe Zustandsmenge wie
@@ -350,10 +392,12 @@ class PrintHistoryStore:
     plus EINEM gemeinsamen "index.json" je Drucker-Ordner (Liste aller
     Eintraege, neueste zuerst)."""
 
-    MAX_JOBS_PER_PRINTER = PRINT_HISTORY_MAX_JOBS
-
-    def __init__(self):
+    # v2.2.21: Instanz-Attribut statt fester Klassenkonstante - wird beim
+    # Anlegen aus config.json ("history_max_jobs") gespeist, siehe
+    # _resolve_history_max_jobs(). None bedeutet "kein Limit".
+    def __init__(self, max_jobs_per_printer: Optional[int] = PRINT_HISTORY_MAX_JOBS):
         self._lock = threading.Lock()
+        self.max_jobs_per_printer = max_jobs_per_printer
 
     def dir_for(self, printer_id: str) -> str:
         d = os.path.join(base_dir(), "print_history", printer_id)
@@ -438,8 +482,19 @@ class PrintHistoryStore:
             with self._lock:
                 entries = self._load_index(printer_id)
                 entries.insert(0, entry)
-                removed = entries[self.MAX_JOBS_PER_PRINTER:]
-                entries = entries[:self.MAX_JOBS_PER_PRINTER]
+                # v2.2.21: self.max_jobs_per_printer kann jetzt None sein
+                # ("unendlich", siehe _resolve_history_max_jobs()) - ACHTUNG,
+                # kein simples entries[self.max_jobs_per_printer:] mehr
+                # moeglich: Python wertet "liste[None:]" als "liste[:]" (die
+                # GESAMTE Liste), nicht als "nichts" - das haette bei
+                # "unendlich" versehentlich ALLE Eintraege als "removed"
+                # markiert und ihre Dateien geloescht, obwohl sie im Index
+                # behalten werden sollten. Deshalb der explizite Fall.
+                if self.max_jobs_per_printer is None:
+                    removed = []
+                else:
+                    removed = entries[self.max_jobs_per_printer:]
+                    entries = entries[:self.max_jobs_per_printer]
                 self._save_index(printer_id, entries)
             for old in removed:
                 self._delete_files(printer_id, old)
@@ -685,6 +740,7 @@ def load_config() -> dict:
         cfg = json.load(f)
     cfg.setdefault("server", DEFAULT_CONFIG["server"])
     cfg.setdefault("preform_server", DEFAULT_CONFIG["preform_server"])
+    cfg.setdefault("history_max_jobs", DEFAULT_CONFIG["history_max_jobs"])
     cfg.setdefault("extras_mqtt", json.loads(json.dumps(DEFAULT_CONFIG["extras_mqtt"])))
     cfg.setdefault("printers", [])
     for p in cfg["printers"]:
@@ -692,6 +748,48 @@ def load_config() -> dict:
         if p.get("type") == "bambu":
             p.setdefault("bambu_family", "x1")
     return cfg
+
+
+# v2.2.21: siehe README Abschnitt 3 und Kommentar bei PRINT_HISTORY_MAX_JOBS.
+# "history_max_jobs" in config.json darf sein:
+#   - eine positive ganze Zahl  -> genau dieses Limit je Drucker
+#   - 0, null ODER der String "unendlich" (Gross-/Kleinschreibung egal)
+#     -> KEIN Limit, der Verlauf waechst unbegrenzt (Nutzer ist dafuer
+#     selbst verantwortlich, den Ordner "print_history/" im Auge zu
+#     behalten - siehe README)
+# Jeder andere Wert (negative Zahl, Text, der nicht "unendlich" ist, ...)
+# gilt als ungueltig: faellt defensiv auf PRINT_HISTORY_MAX_JOBS zurueck,
+# statt entweder zu raten oder den Verlauf kaputtzumachen - wird EINMALIG
+# beim Start geloggt, damit ein Tippfehler in config.json auffaellt statt
+# still ignoriert zu werden.
+_history_max_jobs_warned = False
+
+
+def _resolve_history_max_jobs(raw_value) -> Optional[int]:
+    """Wandelt den rohen "history_max_jobs"-Wert aus config.json in ein
+    fuer PrintHistoryStore nutzbares Ergebnis um: None bedeutet "kein
+    Limit", eine positive Zahl das tatsaechliche Limit. Siehe
+    Kommentarblock oberhalb dieser Funktion fuer die akzeptierten
+    Werte."""
+    global _history_max_jobs_warned
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str) and raw_value.strip().lower() == "unendlich":
+        return None
+    if isinstance(raw_value, bool):
+        pass  # bool ist in Python eine int-Unterklasse - bewusst wie unten als ungueltig behandeln
+    elif isinstance(raw_value, int):
+        if raw_value == 0:
+            return None
+        if raw_value > 0:
+            return raw_value
+    if not _history_max_jobs_warned:
+        _history_max_jobs_warned = True
+        print(f"[MK6] Warnung: 'history_max_jobs' in config.json hat einen "
+              f"ungueltigen Wert ({raw_value!r}) - erwartet wird eine "
+              f"positive ganze Zahl, 0, null oder der Text 'unendlich'. "
+              f"Verwende stattdessen den Standardwert ({PRINT_HISTORY_MAX_JOBS}).")
+    return PRINT_HISTORY_MAX_JOBS
 
 
 def save_config(cfg: dict) -> None:
@@ -724,6 +822,13 @@ class PrinterConnection:
             "remaining_min": None,
             "ams": [],
             "ams_units": [],  # v2.2.1: Luftfeuchtigkeit je AMS-Einheit, siehe _apply_print_report()
+            # v2.2.22: letzter bekannter Wert von "ipcam.rtsp_url" aus dem
+            # MQTT-Report - None, solange noch kein Report mit diesem Feld
+            # empfangen wurde; der woertliche String "disable", solange am
+            # Drucker die Einstellung "LAN Only Liveview" nicht aktiviert
+            # ist; sonst die tatsaechliche RTSPS-Stream-URL. Siehe
+            # bambu_rtsp_mjpeg_generator() und /camera/<printer_id>.
+            "ipcam_rtsp_url": None,
         }
         self._client = None
         self._stop = False
@@ -813,6 +918,24 @@ class PrinterConnection:
             self.status["connected"] = True
             topic = f"device/{self.cfg['serial']}/report"
             client.subscribe(topic)
+            # v2.2.20: zusaetzlich das eigene "request"-Topic abonnieren -
+            # NICHT um eigene Befehle zu verarbeiten (siehe _on_message:
+            # Nachrichten auf diesem Topic werden dort explizit NICHT an
+            # _apply_print_report() weitergereicht), sondern rein zu
+            # Diagnosezwecken: der lokale MQTT-Broker eines Bambu-
+            # Druckers liefert laut MQTT-Spezifikation JEDEM auf ein
+            # Topic abonnierten Client ALLE darauf veroeffentlichten
+            # Nachrichten - unabhaengig davon, WER sie gesendet hat. Ist
+            # also gleichzeitig Bambu Studio mit demselben Drucker
+            # verbunden und sendet von dort aus einen Druck mit
+            # project_file, sieht auch dieses Dashboard diesen Befehl
+            # mit. Hintergrund: siehe _log_foreign_project_file_command()
+            # unten - damit laesst sich das tatsaechliche, nicht
+            # dokumentierte "ams_mapping"-Format fuer AMS-HT-Faecher OHNE
+            # Wireshark/Mitmproxy erfassen (Nutzer hat keine Moeglichkeit
+            # fuer eine solche Analyse, siehe UEBERGABE.md v2.2.20).
+            self._request_topic = f"device/{self.cfg['serial']}/request"
+            client.subscribe(self._request_topic)
             self._request_pushall(client)
         else:
             self.status["connected"] = False
@@ -834,11 +957,52 @@ class PrinterConnection:
             payload = json.loads(msg.payload.decode("utf-8", errors="ignore"))
         except Exception:
             return
+        # v2.2.20: Nachrichten auf dem (seit v2.2.20 zusaetzlich
+        # abonnierten) "request"-Topic sind Befehle (von diesem
+        # Dashboard selbst ODER von einem anderen Client wie Bambu
+        # Studio), KEINE Status-Reports - duerfen also nicht an
+        # _apply_print_report() gehen (andere Feldbedeutungen,
+        # wuerde den Status verfaelschen). Stattdessen rein diagnostisch
+        # behandelt, siehe _log_foreign_project_file_command().
+        if msg.topic == getattr(self, "_request_topic", None):
+            self._log_foreign_project_file_command(payload)
+            return
         p = payload.get("print")
         if p:
             self._apply_print_report(p)
         if time.time() - self._last_pushall > self.PUSHALL_INTERVAL_SEC:
             self._request_pushall(client)
+
+    def _log_foreign_project_file_command(self, payload: dict):
+        """v2.2.20, rein diagnostisch: protokolliert JEDES
+        project_file-Druckstart-Kommando, das auf dem lokalen MQTT-
+        Broker dieses Druckers beobachtet wird - ob von diesem
+        Dashboard selbst (send_print()) oder von einem ANDEREN im
+        selben Netz verbundenen Client (z. B. Bambu Studio, Bambu Handy
+        App) gesendet. Hintergrund (siehe UEBERGABE.md, v2.2.20):
+        unklar ist, welchen "ams_mapping"/"ams_mapping2"-Wert Bambu
+        Studio fuer Faecher einer AMS HT verwendet - ohne Wireshark/
+        Mitmproxy-Zugriff (beim Nutzer nicht moeglich) ist das Mitlesen
+        auf dem lokalen Broker der einzige Weg, echte Beweisdaten statt
+        einer Vermutung zu bekommen, da ein MQTT-Broker jedem
+        abonnierten Client alle Nachrichten eines Topics zustellt,
+        unabhaengig vom urspruenglichen Absender.
+
+        Filtert bewusst auf command=="project_file" (blendet den sehr
+        viel haeufigeren "pushall"-Verkehr aus). Das geloggte Kommando
+        ENTHAELT KEINE Zugangsdaten (der Access Code wird nur beim TLS-
+        Handshake verwendet, taucht in diesem Kommando nicht auf) und
+        kann daher gefahrlos aus der Server-Konsole kopiert und geteilt
+        werden."""
+        p = payload.get("print")
+        if not isinstance(p, dict) or p.get("command") != "project_file":
+            return
+        print(f"[MK6-DIAG] project_file-Kommando auf dem lokalen Broker von "
+              f"'{self.cfg.get('name', self.id)}' beobachtet (von diesem "
+              f"Dashboard ODER einem anderen Client wie Bambu Studio "
+              f"gesendet). Vollstaendiges Kommando (keine Zugangsdaten "
+              f"enthalten):\n"
+              f"{json.dumps(payload, indent=2, ensure_ascii=False)}")
 
     def _apply_print_report(self, p: dict):
         s = self.status
@@ -915,6 +1079,16 @@ class PrinterConnection:
             s["bed_temp"] = p["bed_temper"]
         if "mc_remaining_time" in p:
             s["remaining_min"] = p["mc_remaining_time"]
+        # v2.2.22: fuer den RTSPS-Kamera-Stream (siehe
+        # bambu_rtsp_mjpeg_generator()) - das "ipcam"-Unterobjekt steckt
+        # (wie "ams" auch) nicht in jedem einzelnen MQTT-Update, sondern
+        # typischerweise nur in vollen "pushall"-Antworten. Deshalb wie
+        # bei den uebrigen optionalen Feldern hier NUR bei Vorhandensein
+        # uebernehmen (sonst bliebe der zuletzt bekannte Wert erhalten,
+        # statt bei jedem Teil-Update faelschlich auf None zu fallen).
+        ipcam = p.get("ipcam")
+        if isinstance(ipcam, dict) and "rtsp_url" in ipcam:
+            s["ipcam_rtsp_url"] = ipcam["rtsp_url"]
 
         ams_root = p.get("ams", {}).get("ams")
         if isinstance(ams_root, list):
@@ -986,10 +1160,11 @@ class PrinterConnection:
     # Community-Quellen nicht zuverlaessig per MQTT starten.
     #
     # WICHTIGE VORAUSSETZUNG: Auf dem Drucker muss "Developer Mode" /
-    # LAN-Modus aktiviert sein (Bambu Handy App -> Drucker -> Einstellungen
-    # -> "Developer Mode" bzw. "LAN Only Mode"). Ohne das lehnt neuere
-    # Firmware den project_file-Befehl ab. Siehe README, Abschnitt "Bambu
-    # Lab: Druckauftrag per Drag & Drop senden".
+    # LAN-Modus aktiviert sein (v2.2.18-Korrektur: LOKAL am Drucker
+    # ueber dessen eigene Einstellungen, NICHT in der Bambu Handy App -
+    # im reinen LAN-Modus ist die Verbindung zur App gekappt). Ohne das
+    # lehnt neuere Firmware den project_file-Befehl ab. Siehe README,
+    # Abschnitt "Bambu Lab: Druckauftrag per Drag & Drop senden".
     #
     # AUTOMATISCHE AMS-ZUORDNUNG (siehe UEBERGABE.md Abschnitt 7 fuer
     # Quellenlage): Die .gcode.3mf-Datei enthaelt in
@@ -1023,7 +1198,19 @@ class PrinterConnection:
         der auf dieser Platte benoetigten Filamente. Wurde das kompakte
         Array (Position = Index in der gefilterten Liste) gesendet,
         quittierte der Drucker das bei Mehrfarb-Drucken mit "Failed to
-        get AMS mapping table" - siehe UEBERGABE.md fuer Details."""
+        get AMS mapping table" - siehe UEBERGABE.md fuer Details.
+
+        WICHTIG (v2.2.20: AMS HT zunaechst bewusst ausgeschlossen, v2.2.21:
+        Ausschluss wieder aufgehoben): v2.2.20 hatte Faecher einer AMS HT
+        hier bewusst von der automatischen Zuordnung ausgenommen, weil
+        _slot_to_flat_index() faelschlich einen sinnlosen Wert (128*4=512)
+        berechnete. Ein vom Nutzer per Diagnose-Log (siehe
+        _log_foreign_project_file_command()) eingefangener ECHTER
+        project_file-Befehl von Bambu Studio hat inzwischen den
+        tatsaechlich erwarteten Wert bestaetigt (siehe korrigierte
+        _slot_to_flat_index() sowie UEBERGABE.md, v2.2.21) - AMS-HT-
+        Faecher werden deshalb wieder ganz normal wie jedes andere Fach
+        behandelt."""
         filaments, total_filaments = _parse_3mf_filaments(local_path)
         ams_trays_raw = list(self.status.get("ams") or [])
         ams_trays = [{
@@ -1388,6 +1575,34 @@ class PrinterConnection:
         }
         if ams_summary.get("mapping") is not None:
             payload["print"]["ams_mapping"] = ams_summary["mapping"]
+            # v2.2.21: zusaetzliches "ams_mapping2"-Feld, NUR fuer die
+            # H2-Serie (H2S/H2D/H2D Pro/H2C). Hintergrund: ein vom Nutzer
+            # per Diagnose-Log eingefangener ECHTER project_file-Befehl
+            # von Bambu Studio fuer einen H2D Pro (siehe UEBERGABE.md,
+            # v2.2.20/v2.2.21) enthielt dieses Feld IMMER zusaetzlich zum
+            # klassischen "ams_mapping" - ein paralleles Array mit
+            # expliziten {"ams_id", "slot_id"}-Paaren statt eines flachen
+            # Index, Platzhalter {"ams_id": 255, "slot_id": 255} fuer
+            # nicht benoetigte Positionen. Vermutlich noetig, damit die
+            # Firmware bei Druckern mit MEHREREN physischen Duesen (H2D/
+            # H2D Pro) weiss, welcher Duese ein Filament zugeordnet ist -
+            # ob das Feld bei den (vermutlich einduesigen) H2S/H2C
+            # tatsaechlich gebraucht wird, ist nicht verifiziert, wird
+            # hier aber aus Konsistenz zum beobachteten Verhalten fuer
+            # die GESAMTE "h2"-Familie gesetzt. Bewusst NICHT fuer x1/a1/
+            # p1/p2/x2 gesetzt, um das dort seit MK5 bestaetigt
+            # funktionierende Verhalten nicht zu riskieren - fuer diese
+            # Familien lag ohnehin kein Beweis vor, dass sie dieses Feld
+            # ueberhaupt kennen oder brauchen.
+            if self.cfg.get("bambu_family", "x1") == "h2":
+                ams_mapping2 = []
+                for m in ams_summary["mapping"]:
+                    pair = _flat_index_to_ams_pair(m)
+                    if pair is None:
+                        ams_mapping2.append({"ams_id": 255, "slot_id": 255})
+                    else:
+                        ams_mapping2.append({"ams_id": pair[0], "slot_id": pair[1]})
+                payload["print"]["ams_mapping2"] = ams_mapping2
         # v2.2.7: Nutzer meldete bei einem H2S (mit frisch eingestecktem
         # USB-Stick) den Druckerfehler "Nicht unterstuetzter Pfad oder
         # Name der Druckdatei" nach einem erfolgreichen FTPS-Upload.
@@ -1522,12 +1737,77 @@ def _slot_to_flat_index(slot: str) -> int:
     _apply_print_report weiter oben erzeugt) in den flachen AMS-Index
     um, den "ams_mapping" erwartet (Community-Konvention: 4 Faecher pro
     AMS-Einheit, siehe UEBERGABE.md Abschnitt 7 - nicht offiziell von
-    Bambu dokumentiert)."""
+    Bambu dokumentiert).
+
+    WICHTIG (v2.2.21 - jetzt per echtem MQTT-Mitschnitt verifiziert,
+    siehe UEBERGABE.md): eine AMS HT (Einheit-ID >= 128, siehe
+    _is_ams_ht_slot()) hat nur 1 Fach und wird NICHT nach dem "*4"-Schema
+    behandelt - der vom Nutzer per Diagnose-Log (v2.2.20) eingefangene,
+    echte project_file-Befehl von Bambu Studio zeigt fuer ein HT-Fach
+    (Einheit-ID 128, Fach-ID 0) direkt den Wert 128 im "ams_mapping"-
+    Array - OHNE Multiplikation. Fuer reguläre Einheiten (ID < 128)
+    bleibt die bisherige, ebenfalls durch denselben Mitschnitt bestaetigte
+    Formel (Einheit 0, Fach 1 -> Wert 1) unveraendert."""
     try:
         unit_str, tray_str = slot.split("-", 1)
-        return int(unit_str) * 4 + int(tray_str)
+        unit = int(unit_str)
+        tray = int(tray_str)
+        if unit >= 128:
+            return unit + tray
+        return unit * 4 + tray
     except Exception:
         return -1
+
+
+def _flat_index_to_ams_pair(flat_index):
+    """Kehrt _slot_to_flat_index() um: liefert (ams_id, slot_id) fuer
+    einen gueltigen flachen Index, oder None fuer "kein Fach" (-1 oder
+    nicht auswertbar). Rein mechanische Umkehrung der oben verifizierten
+    Formel - KEINE neue Vermutung. Wird fuer das Zusatzfeld
+    "ams_mapping2" gebraucht (siehe _request_print(), v2.2.21): der vom
+    Nutzer eingefangene echte project_file-Befehl von Bambu Studio fuer
+    einen H2D Pro enthielt NEBEN dem flachen "ams_mapping"-Array
+    zusaetzlich ein paralleles "ams_mapping2"-Array mit expliziten
+    {"ams_id": ..., "slot_id": ...}-Paaren pro Filament (Platzhalter
+    {"ams_id": 255, "slot_id": 255} fuer nicht benoetigte Positionen -
+    ANDERE Konvention als das "-1" von "ams_mapping"!)."""
+    try:
+        flat = int(flat_index)
+    except (TypeError, ValueError):
+        return None
+    if flat < 0:
+        return None
+    if flat >= 128:
+        return (flat, 0)
+    return (flat // 4, flat % 4)
+
+
+# v2.2.20: Bestaetigt per Recherche (Bambu-Produktseite fuer die AMS HT
+# UND zwei unabhaengige, aktiv gepflegte Community-Projekte, die reale
+# MQTT-Rohdaten zeigen - bambulab/BambuStudio Issue #7931 sowie
+# TigerTag-Project/TigerSpool-RFID Issue #8): eine AMS HT hat GENAU 1
+# Fach (nicht 4 wie AMS/AMS Pro/AMS 2 Pro) und meldet sich im MQTT-
+# Status mit der AMS-Einheit-ID 128 (Tray-ID 0), NICHT mit einer
+# fortlaufenden kleinen Zahl wie reguläre Einheiten (0, 1, 2, ...).
+# Weitere AMS-HT-Einheiten in derselben Kette duerften ab 128 weiter
+# hochzaehlen - das ist aber NICHT verifiziert, daher wird hier bewusst
+# nur grob "Einheit-ID >= 128" als "ist eine AMS HT" gewertet (jede
+# normale AMS-Einheit hat eine kleine ID im niedrigen einstelligen
+# Bereich, 128 ist dafuer niemals plausibel).
+def _is_ams_ht_slot(slot) -> bool:
+    """Prueft anhand des Slot-Bezeichners "<ams_unit>-<tray>", ob das
+    Fach zu einer AMS HT gehoert (Einheit-ID >= 128, siehe Kommentar
+    oben). Liefert False bei nicht auswertbarem Slot-String (dann wird
+    das Fach wie eine normale AMS-Einheit behandelt - kein Falsch-
+    Positiv-Risiko, da eine echte AMS HT immer eine gueltige Zahl >= 128
+    liefert)."""
+    if not slot:
+        return False
+    try:
+        unit_str, _tray_str = str(slot).split("-", 1)
+        return int(unit_str) >= 128
+    except (ValueError, TypeError):
+        return False
 
 
 def _types_compatible(want_type: str, tray_type: str) -> bool:
@@ -1609,7 +1889,11 @@ def _find_matching_tray(filament: dict, ams_trays: list, used_slots: set):
     NICHT zu "ASA-CF" - siehe _types_compatible()). Bei mehreren
     passenden Faechern gewinnt das mit der GERINGSTEN Farbabweichung
     (bei einem exakten Treffer aendert sich dadurch nichts). Liefert
-    None statt zu raten, wenn nichts hinreichend gut passt."""
+    None statt zu raten, wenn nichts hinreichend gut passt.
+
+    Seit v2.2.21 OHNE Sonderbehandlung von AMS-HT-Faechern (v2.2.20 hatte
+    sie hier noch ausgeschlossen, siehe _slot_to_flat_index() fuer den
+    seitdem korrigierten/verifizierten Hintergrund)."""
     want_color = filament.get("color") or ""
     want_type = filament.get("type") or ""
     if not want_color:
@@ -1816,6 +2100,27 @@ BAMBU_FAMILY_TO_FTPS_PROFILE = {
     "x2": "x1",  # vorlaeufig, siehe Kommentar oben
 }
 
+# v2.2.22: Welche Bambu-Familien ihren Kamera-Stream ueber RTSPS (Port
+# 322, statt des rohen MJPEG-ueber-TLS-Protokolls auf Port 6000) liefern -
+# siehe bambu_rtsp_mjpeg_generator() und /camera/<printer_id> unten fuer
+# die vollstaendige Quellenlage. NUR "a1" bleibt aussen vor (nutzt
+# weiterhin bambu_mjpeg_generator() auf Port 6000, seit MK5 bestaetigt
+# funktionierend). Alle anderen bekannten Familien - X1/P1/P2 UND,
+# entgegen einer frueheren, ZU KURZ GEGRIFFENEN Einschaetzung in dieser
+# Codebasis, auch die H2-Serie (und vermutlich X2D) - verwenden laut
+# mehreren unabhaengigen Quellen (Bambu-Forum-Thread "H2C RTSP for
+# Camera?": ein Nutzer bestaetigt RTSPS-Verbindung auf einem H2C nach
+# Aktivieren der separaten Druckereinstellung "LAN Only Liveview"/"LAN
+# Mode Liveview"; ebenso Bambu-Forum "P2S: Lan Only Liveview while in
+# Cloud Mode?") DIESELBE RTSPS-Methode wie X1/P1. Die in einer frueheren
+# Recherche dieses Projekts vermutete eigene, undokumentierte
+# "BRTC"-Kameraprotokoll fuer die H2-Serie beruhte auf einer Verwechslung:
+# das beobachtete "brtc://emmc/..." aus dem project_file-Kommando (siehe
+# UEBERGABE.md v2.2.20/21) ist ein DATEISPEICHER-Schema fuer den
+# Druckstart, hat mit dem Kamera-Stream nichts zu tun - fuer Kamera
+# nutzt auch die H2-Serie denselben "ipcam"-Mechanismus.
+BAMBU_RTSPS_CAMERA_FAMILIES = {"x1", "p1", "p2", "h2", "x2"}
+
 
 def _build_ftps_context(profile: dict):
     ctx = ssl._create_unverified_context()
@@ -1922,6 +2227,295 @@ def _recv_exact(sock, n):
             return None
         buf += chunk
     return buf
+
+
+# ----------------------------------------------------------------------
+# Kamera-Stream der X1/P1/P2/H2/X2-Serie (RTSPS, Port 322) - v2.2.22
+#
+# Anders als die A1-Familie (rohes MJPEG-ueber-TLS, Port 6000, siehe
+# bambu_mjpeg_generator() oben) liefern alle anderen bekannten Bambu-
+# Familien ihren Live-Kamera-Feed stattdessen als RTSPS-Stream (RTSP
+# ueber TLS) auf Port 322 - siehe BAMBU_RTSPS_CAMERA_FAMILIES oben fuer
+# die Quellenlage. Belege (mehrere unabhaengige Quellen, keine geratenen
+# Werte):
+#   - URL-Format "rtsps://bblp:<access_code>@<ip>:322/streaming/live/1"
+#     (Benutzername "bblp" + Access Code als Passwort, wie beim
+#     bestehenden MJPEG-Port-6000-Protokoll und beim FTPS-Upload) -
+#     u. a. im Bambu-Forum-Thread "How to access camera on LAN ?
+#     (firmware 01.06+)" von einem Nutzer per ffplay bestaetigt, sowie
+#     identisch in der Referenzimplementierung "bambustudio_mcp"
+#     (camera/stream.py, "rtsps://bblp:{access_code}@{host}:{port}/
+#     streaming/live/1", Standardport 322).
+#   - Vor dem eigentlichen Stream-Zugriff muss am Drucker ZUSAETZLICH
+#     zum "Developer Mode" eine SEPARATE Einstellung aktiviert werden
+#     ("LAN Only Liveview" bzw. "LAN Mode Liveview" je nach Firmware-
+#     Uebersetzung, am Drucker-Display zu finden, NICHT identisch mit
+#     dem vollen LAN-Only-Modus) - ohne diese Einstellung liefert der
+#     MQTT-Report das Feld "ipcam.rtsp_url" als woertlichen String
+#     "disable" statt einer echten URL. Dieses Verhalten ist in der
+#     aktiv gepflegten Home-Assistant-Bambu-Lab-Integration
+#     (greghesp/ha-bambulab, pybambu/models.py) exakt so implementiert
+#     ("if self.rtsp_url == 'disable': ...") und wird hier genauso
+#     ausgewertet (siehe _apply_print_report() und /camera/<printer_id>)
+#     statt den rohen Verbindungsfehler von FFmpeg unkommentiert
+#     durchzureichen.
+#   - KORREKTUR einer frueheren, zu kurz gegriffenen Annahme dieses
+#     Projekts: die H2-Serie braucht KEIN eigenes, undokumentiertes
+#     Protokoll fuer die Kamera - sie nutzt denselben RTSPS-Mechanismus
+#     wie X1/P1/P2 (siehe Kommentar bei BAMBU_RTSPS_CAMERA_FAMILIES).
+#
+# Technisch wird dafuer (anders als beim handgestrickten Parsing bei
+# bambu_mjpeg_generator()) eine separate, extern mitgelieferte FFmpeg-
+# Programmdatei als Subprozess gestartet (siehe _find_ffmpeg_binary()):
+# FFmpeg uebernimmt Verbindungsaufbau, TLS-Handshake, RTSP-Signalisierung
+# und - unabhaengig davon, ob der Drucker intern H.264, H.265 oder
+# bereits MJPEG ueber RTSP sendet (nicht oeffentlich dokumentiert und
+# fuer diese Implementierung auch nicht relevant, da FFmpeg jeden
+# Eingabe-Codec automatisch erkennt/dekodiert) - die Neukodierung nach
+# MJPEG fuer die Ausgabe. Ausgabeformat ist FFmpegs eingebauter
+# "mpjpeg"-Muxer: er erzeugt direkt einen fertigen
+# "multipart/x-mixed-replace"-Bytestrom (fester, im FFmpeg-Quellcode
+# hart codierter Boundary-String "ffserver", siehe libavformat/mpjpeg.c)
+# - die rohen Ausgabe-Bytes von FFmpeg koennen deshalb 1:1 als Flask-
+# Response-Body durchgereicht werden, ganz ohne eigenes Frame-Parsing
+# wie bei bambu_mjpeg_generator().
+#
+# "-rtsp_transport tcp": erzwingt TCP statt des RTSP-Standards UDP fuer
+# die eigentliche Mediendaten-Uebertragung - in mehreren der oben
+# genannten Quellen (u. a. "H2C RTSP for Camera?"-Thread: "ffplay with
+# TCP transport successfully connected") ausdruecklich als notwendig
+# fuer eine zuverlaessige Verbindung zu Bambu-Druckern genannt (UDP
+# scheitert haeufig an lokalen Firewalls/NAT-internen Eigenheiten).
+def _drain_ffmpeg_stderr(proc, ip: str):
+    """Liest die Standardfehlerausgabe des FFmpeg-Subprozesses fortlaufend
+    in einem eigenen Thread mit und gibt jede Zeile ueber die Server-
+    Konsole aus (Praefix "[MK6-FFMPEG]").
+
+    ZWEI Gruende, warum das noetig ist (v2.2.23, nach einem Nutzerbericht
+    "Kamera-Fenster laedt dauerhaft, weder Bild noch Fehlermeldung" fuer
+    X1E/H2D Pro trotz aktivierter "LAN Only Liveview"):
+      1. Diagnose: FFmpeg schreibt Verbindungs-/Protokollfehler nach
+         stderr - ohne das mitzulesen, war bisher nicht erkennbar, WARUM
+         FFmpeg haengt oder scheitert (reine Vermutung waere hier gegen
+         die Projekt-Konvention).
+      2. Ein bekanntes, von der Ursache unabhaengiges Python-
+         subprocess-Problem: wird stderr=PIPE gesetzt, aber NIE gelesen
+         (wie bisher), kann der interne Betriebssystem-Puffer dieser
+         Pipe volllaufen (typischerweise bereits bei wenigen zehn KB) -
+         FFmpeg blockiert dann beim naechsten Schreibversuch nach stderr
+         UNBEGRENZT, komplett unabhaengig vom eigentlichen RTSPS-Problem.
+         Das allein kann bereits ein "haengt fuer immer, ohne Fehler"-
+         Bild erzeugen, wie vom Nutzer beschrieben."""
+    try:
+        for raw_line in iter(proc.stderr.readline, b""):
+            line = raw_line.decode("utf-8", errors="ignore").rstrip()
+            if line:
+                print(f"[MK6-FFMPEG] (Drucker-IP {ip}): {line}")
+    except Exception:
+        pass
+
+
+def bambu_rtsp_mjpeg_generator(ip: str, access_code: str, ffmpeg_path: str):
+    rtsp_url = f"rtsps://bblp:{access_code}@{ip}:322/streaming/live/1"
+    cmd = [
+        ffmpeg_path,
+        "-loglevel", "error",
+        "-rtsp_transport", "tcp",
+        # v2.2.23: Socket-I/O-Timeout (Verbindungsaufbau UND Lesen) in
+        # Mikrosekunden - OHNE dieses Limit kann FFmpeg bei einer nicht
+        # zustande kommenden RTSPS-Verbindung unbegrenzt haengen bleiben
+        # (vom Nutzer genau so beobachtet: "Kamera-Fenster laedt
+        # dauerhaft, weder Bild noch Fehlermeldung"). Der Optionsname
+        # "timeout" ist die seit FFmpeg 4.4 (2021) aktuelle Bezeichnung
+        # fuer den RTSP-Demuxer (siehe ffmpeg-protocols(1)); die aeltere
+        # Bezeichnung "stimeout" wurde seitdem entfernt, nicht nur
+        # umbenannt - ein FFmpeg-Build aus GyanD/codexffmpeg (siehe
+        # build-exe.yml) ist aktuell genug, um nur den neuen Namen zu
+        # kennen. 15 Sekunden als grosszuegiger, aber endlicher Wert.
+        "-timeout", "15000000",
+        # v2.2.24: Nutzer lieferte per [MK6-FFMPEG]-Mitschnitt (siehe
+        # _drain_ffmpeg_stderr(), v2.2.23) den tatsaechlichen Fehler auf
+        # echter X1E- UND H2D-Pro-Hardware: "[tls] Peer certificate
+        # failed verification" -> "Error opening input: I/O error". Das
+        # ist die eigentliche Ursache des in v2.2.22/23 beobachteten
+        # Haengenbleibens, nicht (nur) das in v2.2.23 behobene stderr-
+        # Deadlock-Risiko. Root Cause identifiziert (keine Vermutung,
+        # klar belegt): FFmpeg 9.0 (das ueber GyanD/codexffmpeg bezogene,
+        # zum Implementierungszeitpunkt aktuelle Release, siehe
+        # build-exe.yml) hat den Standardwert der TLS-Zertifikatspruefung
+        # ("tls_verify") von 0 (nicht pruefen) auf 1 (pruefen) umgestellt
+        # - fuer die allermeisten TLS-Verbindungen (echte, von einer
+        # oeffentlichen Zertifizierungsstelle signierte Zertifikate) eine
+        # sinnvolle Verschaerfung, bricht hier aber die Verbindung zum
+        # Drucker, der (wie bei der bestehenden FTPS-Datei-Uebertragung
+        # und dem MJPEG-Port-6000-Protokoll auch) ein SELBSTSIGNIERTES
+        # Zertifikat verwendet. Die aeltere FFmpeg-Generation, auf die
+        # sich mehrere Forum-Berichte zur erfolgreichen RTSPS-Verbindung
+        # noch stuetzten (siehe UEBERGABE.md v2.2.22), hatte diesen
+        # strengen Standardwert noch nicht - daher dort kein Problem.
+        # "-tls_verify 0" deaktiviert die Pruefung wieder explizit, genau
+        # wie es das bereits bestehende `ssl._create_unverified_context()`
+        # fuer den A1-MJPEG-Port-6000- und den FTPS-Upload-Pfad in diesem
+        # Projekt ebenfalls tut (gleiche Begruendung: Drucker im eigenen
+        # LAN, kein oeffentliches Zertifikat zu erwarten).
+        "-tls_verify", "0",
+        "-i", rtsp_url,
+        "-an",
+        "-c:v", "mjpeg",
+        "-q:v", "5",
+        "-r", "10",
+        # v2.2.26: siehe ausfuehrliche Begruendung weiter unten (direkt vor
+        # dem JPEG-Marker-Parsing) - "image2pipe" statt des zuvor
+        # verwendeten "mpjpeg"-Muxers, weil Letzterer kein browserkompat-
+        # ibles Multipart-Format erzeugt (recherchiert, nicht vermutet:
+        # siehe libavformat/mpjpeg.c).
+        "-f", "image2pipe",
+        "-",
+    ]
+    # v2.2.25: Nutzer meldete nach v2.2.24 weiterhin keine Anzeige - diesmal
+    # aber OHNE JEDE [MK6-FFMPEG]-Zeile in der Konsole (nur die normalen
+    # Zugriffsprotokoll-Zeilen von Flask/Werkzeug). Das ist diagnostisch
+    # wichtig: entweder haengt bereits der Start des FFmpeg-Subprozesses
+    # selbst (Popen() kehrt nie zurueck - denkbar z. B. durch Antivirus-/
+    # Windows-Defender-Pruefung einer frisch heruntergeladenen, unsignierten
+    # ffmpeg.exe beim allerersten Ausfuehren, siehe dieselbe Problematik
+    # bei FtpsUploadHelper.exe weiter oben in dieser Datei), oder FFmpeg
+    # laeuft, haengt aber in einer Phase, die weder "-loglevel error"
+    # noch die bisherige "-timeout"-Option abdecken. Ohne weitere, hier
+    # bewusst NICHT geratene Protokolldetails sind explizite Logzeilen VOR
+    # und NACH dem Start der einzige Weg, diese beiden Faelle sauber
+    # auseinanderzuhalten - gleichzeitig wird ein evtl. Fehler beim Start
+    # selbst (z. B. "nicht ausfuehrbar") jetzt abgefangen und sichtbar
+    # gemacht statt (wie zuvor) unbemerkt im Generator unterzugehen: ein
+    # Python-Generator fuehrt seinen Code erst bei der ERSTEN Iteration
+    # aus, die bei einer Flask-Streaming-Response ERST beim Senden des
+    # Response-Bodys erfolgt - zu diesem Zeitpunkt sind Status/Header
+    # (200) laengst verschickt, das umgebende try/except in
+    # /camera/<printer_id> kann einen hier auftretenden Fehler also gar
+    # nicht mehr abfangen (greift nur fuer Fehler VOR dem ersten Yield-
+    # Aufruf, siehe bereits bestehende, identische Einschraenkung bei
+    # bambu_mjpeg_generator()).
+    print(f"[MK6-FFMPEG] (Drucker-IP {ip}): Starte FFmpeg-Prozess fuer RTSPS-Kamera-Stream...")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        print(f"[MK6-FFMPEG] (Drucker-IP {ip}): FEHLER beim Start von FFmpeg: {e!r} "
+              f"(Pfad: {ffmpeg_path!r})")
+        return
+    print(f"[MK6-FFMPEG] (Drucker-IP {ip}): FFmpeg-Prozess gestartet (PID {proc.pid}).")
+    stderr_thread = threading.Thread(target=_drain_ffmpeg_stderr, args=(proc, ip), daemon=True)
+    stderr_thread.start()
+    # v2.2.26: Nutzer berichtete nach v2.2.25 (mit umfangreicher Diagnose-
+    # Protokollierung) folgenden, schrittweise eingegrenzten Befund: FFmpeg
+    # startet erfolgreich (PID bestaetigt), verbindet sich zum Drucker
+    # (TLS/RTSP erfolgreich, keine Fehler), decodiert und re-encodiert den
+    # H.264-Stream fehlerfrei zu MJPEG - ALLE folgenden, vom Nutzer auf
+    # unsere Bitte hin durchgefuehrten Tests ergaben einwandfreie Bilder:
+    #   1. Einzelbild per "-frames:v 1" direkt als JPG gespeichert: gut.
+    #   2. Fortlaufende Aufnahme als einzelne JPG-Dateien (kein mpjpeg-
+    #      Container): alle 104 Bilder gut.
+    #   3. Fortlaufende Aufnahme MIT "-f mpjpeg" in eine Datei geschrieben,
+    #      anschliessend mit FFmpeg selbst wieder in Einzelbilder zerlegt:
+    #      alle Bilder gut (Dateigroesse ca. 90 MB fuer 10-15s, unauffaellig).
+    #   4. Der tatsaechliche HTTP-Response des LAUFENDEN Flask-Servers
+    #      wurde per "curl" (am Browser vorbei) 10 Sekunden lang in eine
+    #      Datei aufgezeichnet (27,9 MB) und ebenfalls wieder in Einzel-
+    #      bilder zerlegt: ebenfalls alle gut.
+    #   Nur die Anzeige im Browser selbst (Chrome UND Firefox, sowohl ueber
+    #   das Dashboard als auch per direktem URL-Aufruf) blieb durchgehend
+    #   schwarz, ohne jede Fehlermeldung.
+    # Das grenzt die Ursache zweifelsfrei auf das Byte-Format des von
+    # FFmpeg per "-f mpjpeg" erzeugten Multipart-Streams selbst ein - nicht
+    # auf Verbindung, Decoding, Flask-Uebertragung oder Pufferung. Recherche
+    # im FFmpeg-Quellcode (libavformat/mpjpeg.c) bestaetigt den Grund: Der
+    # mpjpeg-Muxer schreibt pro Bild exakt
+    #     --ffserver\n Content-type: image/jpeg\n\n <JPEG-Daten> \n--ffserver\n
+    # - also OHNE "Content-Length"-Header und nur mit "\n" (LF) statt dem
+    # fuer HTTP-/MIME-Multipart (RFC 2046) eigentlich vorgeschriebenen
+    # "\r\n" (CRLF) als Zeilenende. FFmpeg selbst kann diese Daten beim
+    # erneuten Einlesen trotzdem korrekt interpretieren, weil sein eigener
+    # Demuxer die JPEG-Bilder anhand ihrer binaeren Start-/Endmarker (siehe
+    # unten) erkennt, unabhaengig von der Boundary-Textformatierung - genau
+    # deshalb waren alle vier oben genannten FFmpeg-eigenen Tests
+    # erfolgreich. Der strikte "multipart/x-mixed-replace"-Parser der
+    # Browser fuer <img>-Tags verlangt dagegen eine korrekt begrenzte
+    # Boundary/Header-Struktur und kann die Bildgrenzen in diesem Format
+    # offenbar nicht zuverlaessig erkennen, was zu einem dauerhaft leeren/
+    # schwarzen Bild ohne jede Fehlermeldung fuehrt - exakt das beobachtete
+    # Verhalten.
+    #
+    # Die bereits bestehende, nachweislich funktionierende A1-Kamera
+    # (bambu_mjpeg_generator() weiter oben) umgeht dieses Problem, indem
+    # sie das Multipart-Format selbst erzeugt: boundary "--frame", CRLF-
+    # Zeilenenden und ein expliziter "Content-Length"-Header pro Bild.
+    # Fuer den RTSPS-Pfad bauen wir jetzt denselben, bereits bewaehrten
+    # Mechanismus nach: FFmpeg liefert ueber den Standard-Muxer
+    # "image2pipe" (siehe Kommandozeile oben) nur noch die rohen JPEG-
+    # Bilddaten hintereinander, ohne jegliches Text-Wrapping. Wir trennen
+    # diese Bilder anhand der im JPEG-Format fest definierten (nicht
+    # geratenen) binaeren Marker auf: jedes JPEG beginnt mit dem SOI-Marker
+    # 0xFFD8 ("Start of Image") und endet mit dem EOI-Marker 0xFFD9 ("End
+    # of Image"). Mit diesen eindeutigen Grenzen verpacken wir jedes Bild
+    # exakt wie bei der A1-Kamera erneut in ein korrektes Multipart-Format.
+    SOI_MARKER = b"\xff\xd8"
+    EOI_MARKER = b"\xff\xd9"
+    MAX_FRAME_BUFFER_BYTES = 10_000_000  # Sicherheitsgrenze gegen unbegrenztes Wachstum bei kaputten/fehlenden Endmarkern
+    buf = bytearray()
+    try:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                exit_code = proc.poll()
+                print(f"[MK6-FFMPEG] (Drucker-IP {ip}): Stream beendet "
+                      f"(FFmpeg-Exitcode: {exit_code!r}).")
+                break
+            buf += chunk
+            while True:
+                start = buf.find(SOI_MARKER)
+                if start == -1:
+                    # Kein Bildanfang im Puffer - bis auf das letzte Byte
+                    # verwerfen (falls der Marker genau an der Grenze
+                    # zweier FFmpeg-Lesevorgaenge zerschnitten wurde).
+                    if len(buf) > 1:
+                        del buf[:-1]
+                    break
+                if start > 0:
+                    del buf[:start]
+                end = buf.find(EOI_MARKER, 2)
+                if end == -1:
+                    if len(buf) > MAX_FRAME_BUFFER_BYTES:
+                        print(f"[MK6-FFMPEG] (Drucker-IP {ip}): Puffer ohne "
+                              f"JPEG-Endmarker ueber {MAX_FRAME_BUFFER_BYTES} "
+                              f"Bytes gewachsen - verwerfe Puffer.")
+                        del buf[:]
+                    break
+                frame = bytes(buf[:end + 2])
+                del buf[:end + 2]
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+                       frame + b"\r\n")
+    except Exception as e:
+        print(f"[MK6-FFMPEG] (Drucker-IP {ip}): FEHLER waehrend des Streamens: {e!r}")
+    finally:
+        # Verhindert, dass bei einem Browser-Tab-Wechsel/Schliessen des
+        # Kamera-Fensters der FFmpeg-Subprozess (und damit die
+        # RTSPS-Verbindung zum Drucker) unbemerkt weiterlaeuft - Flask
+        # ruft den finally-Block eines Response-Generators zuverlaessig
+        # auf, sobald die Verbindung zum Browser endet (auch bei
+        # abgebrochener Uebertragung).
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -2834,7 +3428,9 @@ class DashboardApp:
     def __init__(self):
         self.cfg = load_config()
         self.connections = {}
-        self.history = PrintHistoryStore()
+        # v2.2.21: Limit aus config.json ("history_max_jobs") statt der
+        # bisher fest codierten Konstante - siehe _resolve_history_max_jobs().
+        self.history = PrintHistoryStore(_resolve_history_max_jobs(self.cfg.get("history_max_jobs")))
         self.queue = PrintQueueStore()  # MK6 v1.2.0: siehe PrintQueueStore-Kommentar
         self.extras = ExtrasMqttManager(self.cfg)
         self.extras.start()
@@ -4280,6 +4876,38 @@ def camera_stream(printer_id):
     ptype = pcfg.get("type", "bambu")
 
     if ptype == "bambu":
+        bambu_family = pcfg.get("bambu_family", "x1")
+        if bambu_family in BAMBU_RTSPS_CAMERA_FAMILIES:
+            # v2.2.22: X1/P1/P2/H2/X2 - RTSPS ueber FFmpeg, siehe
+            # bambu_rtsp_mjpeg_generator() fuer die vollstaendige
+            # Quellenlage/Begruendung der einzelnen Schritte unten.
+            conn = dash.connections.get(printer_id)
+            rtsp_status = conn.status.get("ipcam_rtsp_url") if conn else None
+            if rtsp_status == "disable":
+                return ("Kamera-Livestream ist am Drucker nicht aktiviert. Bitte "
+                        "zusaetzlich zum Developer Mode am Drucker-Display die "
+                        "separate Einstellung \"LAN Only Liveview\" (teils auch "
+                        "\"LAN Mode Liveview\" genannt) aktivieren - siehe README."), 409
+            if rtsp_status is None:
+                return ("Kamera-Status noch nicht bekannt (noch kein vollstaendiger "
+                        "MQTT-Report vom Drucker empfangen). Bitte kurz warten und "
+                        "erneut versuchen."), 503
+            ffmpeg_path = _find_ffmpeg_binary()
+            if not ffmpeg_path:
+                return ("FFmpeg wurde nicht gefunden (weder neben dem Programm noch "
+                        "ueber PATH). Der Kamera-Stream dieser Druckerfamilie "
+                        "braucht FFmpeg - siehe README."), 500
+            try:
+                gen = bambu_rtsp_mjpeg_generator(pcfg["ip"], pcfg["access_code"], ffmpeg_path)
+                # v2.2.26: boundary jetzt "frame" statt "ffserver" - der
+                # Generator verpackt die Bilder seit v2.2.26 selbst im
+                # selben Format wie bambu_mjpeg_generator() (A1-Kamera),
+                # nicht mehr im (browserinkompatiblen) Rohformat von
+                # FFmpegs "-f mpjpeg"-Muxer. Siehe ausfuehrliche Begruendung
+                # in bambu_rtsp_mjpeg_generator().
+                return Response(gen, mimetype="multipart/x-mixed-replace; boundary=frame")
+            except Exception as e:
+                return f"Kamera nicht erreichbar: {e}", 502
         try:
             gen = bambu_mjpeg_generator(pcfg["ip"], pcfg["access_code"], int(pcfg.get("camera_port", 6000)))
             return Response(gen, mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -4945,6 +5573,7 @@ INDEX_HTML = r"""
   <span class="cam-close" onclick="closeCam()">&times;</span>
   <div class="modal">
     <img id="camImg" src="">
+    <div id="camError" class="hint-text" style="display:none; padding:16px; max-width:480px;"></div>
   </div>
 </div>
 
@@ -5378,12 +6007,41 @@ async function deletePrinter(id){
 }
 
 function openCam(id){
-  document.getElementById('camImg').src = '/camera/' + id + '?_=' + Date.now();
+  const img = document.getElementById('camImg');
+  const errBox = document.getElementById('camError');
+  const url = '/camera/' + id + '?_=' + Date.now();
+  errBox.style.display = 'none';
+  errBox.textContent = '';
+  img.style.display = '';
+  // MK6 v2.2.22: bei Fehlern (z. B. "LAN Only Liveview" am Drucker nicht
+  // aktiviert, FFmpeg fehlt, ...) liefert /camera/<id> seit der RTSPS-
+  // Unterstuetzung fuer X1/P1/P2/H2/X2 einen kurzen Klartext-Fehler statt
+  // eines Bildes - der bricht das <img> mit "onerror" ab. Statt nur ein
+  // kaputtes Bild-Icon zu zeigen, wird derselbe Pfad dann noch einmal per
+  // fetch() als Text abgerufen (schnelle, kurze Fehlerantwort - kein
+  // zweiter Dauerstream) und die eigentliche, konkrete Fehlermeldung
+  // angezeigt.
+  img.onerror = function(){
+    img.style.display = 'none';
+    fetch(url).then(function(r){
+      return r.text().then(function(t){ return {status: r.status, text: t}; });
+    }).then(function(res){
+      errBox.textContent = res.text || ('Kamera-Stream konnte nicht geladen werden (HTTP ' + res.status + ').');
+      errBox.style.display = '';
+    }).catch(function(){
+      errBox.textContent = 'Kamera-Stream konnte nicht geladen werden.';
+      errBox.style.display = '';
+    });
+  };
+  img.src = url;
   document.getElementById('camModal').classList.add('show');
 }
 function closeCam(){
+  const img = document.getElementById('camImg');
   document.getElementById('camModal').classList.remove('show');
-  document.getElementById('camImg').src = '';
+  img.onerror = null;
+  img.src = '';
+  document.getElementById('camError').style.display = 'none';
 }
 
 // MK6: Druckauftrags-Verlauf (Untermenue je Drucker-Kachel) -----------
@@ -6351,6 +7009,10 @@ function amsRowHtml(filament, i, amsTrays){
   const filamentColorName = colorNameFor(filament.color);
   const filamentHexTitle = '#' + (filament.color || '').toUpperCase();
 
+  // v2.2.20 hatte hier AMS-HT-Faecher noch ausgeblendet (unverifizierter
+  // Mapping-Wert); seit v2.2.21 (verifizierter Wert, siehe
+  // _slot_to_flat_index()) werden sie wieder ganz normal wie jedes
+  // andere AMS-Fach behandelt - keine Sonderbehandlung mehr noetig.
   const suggestionLabel = hasSuggestion
     ? `AMS-Fach ${suggestedTray.flat_index} &middot; ${suggestedTray.type || '-'} &middot; <span title="${'#' + (suggestedTray.color || '').toUpperCase()}">${colorNameFor(suggestedTray.color)}</span>`
     : `Extern / manuell am Display (keine passende Farbe im AMS gefunden)`;

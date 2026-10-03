@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.5.1).
+> den aktuellen Stand (v2.5.5).
 
 ---
 
@@ -296,6 +296,36 @@ Problemen: `UEBERGABE.md`.
   sie im selben Format wie die A1-Kamera. Details: `UEBERGABE.md`, v2.2.26.
 - Waehrend eines Drag-&-Drop-Uploads pausiert Status/Kamera/AMS kurz
   (MQTT wird bewusst kurz getrennt und automatisch neu verbunden).
+- **Status-Punkt bleibt bei einem Bambu-Drucker dauerhaft rot:** der
+  Punkt zeigt AUSSCHLIESSLICH, ob die eigene MQTT-Verbindung des
+  Dashboards zu diesem Drucker gerade steht - unabhaengig davon, ob
+  Kamera (eigener, unabhaengiger Stream) oder Temperaturwerte angezeigt
+  werden. Letztere werden bei einer getrennten Verbindung bewusst NICHT
+  geloescht, sondern bleiben als "zuletzt bekannt" stehen (mit
+  entsprechendem Hinweis auf der Karte) - sie sehen also ggf. "live" aus,
+  obwohl sie veraltet sind. Zur Diagnose in der Server-Konsole nach
+  Zeilen mit dem Praefix `[MK6-MQTT]` suchen: "rc=0: Connection Accepted"
+  = Verbindung steht; ein anderer rc-Wert (z. B. "not authorised") deutet
+  auf falschen Access Code/Seriennummer in der Drucker-Konfiguration hin;
+  eine Zeile "Verbindungsfehler: ..." (z. B. Timeout/Connection refused)
+  deutet auf ein Netzwerk-/Firewall-Problem auf Port `8883` hin
+  (unabhaengig vom Kamera-Port `6000`, der separat erreichbar sein
+  kann); eine Zeile "unerwartet getrennt (rc=7)" bedeutet "Connection
+  Lost" (Client-Bibliothek, kein vom MQTT-Protokoll selbst definierter
+  Code) - ein unerwartet geschlossener Socket, keine regulaere Abmeldung
+  durch den Drucker, inkl. Standzeit seit dem letzten erfolgreichen
+  Connect. **Bekannter, seit v2.5.5 behobener Fall (A1/A1 mini):** die
+  Verbindung wurde reproduzierbar SOFORT (Standzeit "0.0s") nach dem
+  Connect wieder getrennt - Ursache war das zusaetzliche, rein
+  diagnostische Abo des eigenen "request"-Topics (siehe v2.2.20), das
+  bei dieser Druckerfamilie zum sofortigen Verbindungsabbruch fuehrte;
+  X1/H2 sind nicht betroffen. Seit v2.5.5 wird dieses Abo fuer
+  `bambu_family: "a1"` deshalb nicht mehr gesetzt - Status-Report und
+  "pushall"-Anfrage (und damit alle Status-/Temperaturwerte) sind davon
+  unberuehrt, lediglich die Mitprotokollierung fremder project_file-
+  Kommandos (nur fuer die AMS-HT-Mapping-Analyse relevant, siehe v2.2.20)
+  steht fuer A1-Drucker nicht zur Verfuegung. Details zur Diagnose siehe
+  `UEBERGABE.md`, v2.5.2-v2.5.5.
 - Formlabs braucht PreFormServer, Creality braucht Moonraker - beides
   Hersteller-Einschraenkungen, keine Design-Entscheidung dieses Programms.
 - Vorbereitete, aber nie bestaetigte Druckauftraege werden nach 20

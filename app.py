@@ -74,7 +74,49 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # im Einstellungen-Modus wurde vom bisherigen Einzel-Modal auf dieselbe
 # inline Darstellung wie "Drucker verwalten"/"Raeume"/"Externe RTSP-
 # Kameras" umgestellt - siehe UEBERGABE.md v2.5.1.
-APP_VERSION = "2.5.1"
+#
+# v2.5.2: PATCH - Diagnose/Fehlerbehebung fuer den gemeldeten Fall
+# "Status-Punkt bleibt bei einem Bambu-Drucker (A1 mini) dauerhaft rot,
+# obwohl Kamera und Sensorwerte angezeigt werden": (1) MQTT-Verbindungs-
+# versuche/-ergebnisse werden jetzt in der Konsole protokolliert
+# (Praefix "[MK6-MQTT]", analog zu "[MK6-FFMPEG]"), damit sich eine
+# abgelehnte Anmeldung von einem reinen Netzwerkproblem unterscheiden
+# laesst; (2) die Temperaturanzeige zeigt jetzt einen Hinweis, wenn die
+# Werte wegen fehlender Verbindung nicht mehr aktuell sind, statt
+# stillschweigend die letzten bekannten Werte wie Live-Daten aussehen zu
+# lassen - siehe UEBERGABE.md v2.5.2.
+#
+# v2.5.3: PATCH - Weiterfuehrende Diagnose fuer denselben A1-mini-Fall:
+# Nutzer-Rueckmeldung mit [MK6-MQTT]-Log (v2.5.2) zeigt "Verbindung
+# erfolgreich (rc=0)" gefolgt von "Verbindung unerwartet getrennt (rc=7)"
+# - rc=7 ist in der verwendeten MQTT-Client-Bibliothek MQTT_ERR_CONN_LOST
+# (ein unerwartet geschlossener Socket, KEINE vom Drucker gesendete
+# regulaere Abmeldung und KEIN vom MQTT-Protokoll selbst definierter
+# CONNACK-Code). Um ohne Spekulation einzugrenzen, OB der Abbruch sofort
+# nach einer bestimmten Aktion (Subscribe auf "report"/"request"-Topic,
+# Senden der "pushall"-Anfrage) oder erst nach Ablauf des Keepalive-
+# Intervalls (30s) auftritt, wird jetzt (1) jeder dieser Schritte
+# einzeln protokolliert und (2) beim Abbruch die Standzeit seit dem
+# erfolgreichen Connect mit ausgegeben - siehe UEBERGABE.md v2.5.3.
+#
+# v2.5.4: PATCH - Nutzer-Rueckmeldung mit v2.5.3 zeigt reproduzierbar
+# "Standzeit seit Connect: 0.0s" beim A1 mini - die Trennung (rc=7) folgt
+# also SOFORT, nicht erst nach Ablauf des Keepalive-Intervalls. Als
+# kontrollierter, einfach umkehrbarer Test wird das rein diagnostische
+# Abo des eigenen "request"-Topics (siehe _on_connect()) jetzt fuer
+# bambu_family=="a1" probeweise ausgesetzt, um einzugrenzen, ob genau
+# dieses Subscribe die sofortige Trennung ausloest - essenzielle
+# Funktionen (Status-Report-Abo, "pushall"-Anfrage) sind davon nicht
+# betroffen. Siehe UEBERGABE.md v2.5.4 fuer Details und offene Fragen.
+#
+# v2.5.5: PATCH - Nutzer-Rueckmeldung bestaetigt den v2.5.4-Test: mit
+# ausgesetztem Abo des "request"-Topics haelt die Verbindung zum A1 mini
+# dauerhaft (Test UND Produktivbetrieb); ein Vergleichstest mit v2.2.19
+# (vor Einfuehrung dieses Subscribes) bestaetigt zusaetzlich, dass die
+# Drucker-Firmware selbst in Ordnung ist. Keine Code-Aenderung noetig -
+# nur Kommentare/Log-Text/Dokumentation von "Experiment"/"probeweise" auf
+# bestaetigten, dauerhaften Fix aktualisiert. Siehe UEBERGABE.md v2.5.5.
+APP_VERSION = "2.5.5"
 
 import os
 import sys
@@ -901,6 +943,7 @@ class PrinterConnection:
         self._stop = False
         self._paused = False
         self._last_pushall = 0.0
+        self._connected_at = None  # v2.5.3, siehe _on_connect()/_on_disconnect()
 
     def start(self):
         self._stop = False
@@ -926,7 +969,23 @@ class PrinterConnection:
             try:
                 self._client.connect(self.cfg["ip"], int(self.cfg.get("mqtt_port", 8883)), keepalive=30)
                 self._client.loop_forever(retry_first_connection=True)
-            except Exception:
+            except Exception as e:
+                # v2.5.2: vorher wurde ein Verbindungsfehler (z. B. falsche
+                # IP/Port, Netzwerk nicht erreichbar, TLS-Handshake
+                # schlaegt fehl) komplett verschluckt - der Status-Punkt
+                # wurde zwar korrekt rot, aber es gab in der Konsole
+                # KEINERLEI Hinweis darauf, WARUM die Verbindung nicht
+                # zustande kommt (im Unterschied zu einer abgelehnten
+                # Anmeldung, die stattdessen ueber _on_connect() mit einem
+                # rc != 0 laeuft, siehe dort). Gemeldeter Fall: A1 mini
+                # zeigt dauerhaft rot, obwohl die Kamera - die OHNE MQTT
+                # und ohne Anmeldedaten auskommt, siehe
+                # bambu_rtsp_mjpeg_generator()/Port 6000 - ein bewegtes
+                # Bild liefert; das MQTT-Problem war damit von
+                # Netzwerkproblemen NICHT zu unterscheiden, ohne diese
+                # Ausgabe. Gleiches Praefix-Schema wie bei [MK6-FFMPEG].
+                print(f"[MK6-MQTT] ({self.cfg.get('name', '?')} / {self.cfg.get('ip', '?')}): "
+                      f"Verbindungsfehler: {e!r}")
                 self.status["connected"] = False
                 time.sleep(5)
             if self._stop:
@@ -981,10 +1040,36 @@ class PrinterConnection:
         return self.status.get("connected", False)
 
     def _on_connect(self, client, userdata, flags, rc):
+        # v2.5.2: Verbindungsergebnis (Erfolg UND Ablehnung) jetzt in der
+        # Konsole protokolliert - vorher wurde ein rc != 0 (z. B. falscher
+        # Access Code/Seriennummer -> vom Drucker abgelehnte Anmeldung)
+        # kommentarlos nur auf "connected": False gesetzt, ohne jeden
+        # Hinweis in der Konsole auf den Grund. `mqtt.connack_string(rc)`
+        # liefert dafuer die vom MQTT-Protokoll vorgegebene Klartext-
+        # Bedeutung (z. B. "Connection Refused: not authorised").
+        label = f"{self.cfg.get('name', '?')} / {self.cfg.get('ip', '?')}"
+        try:
+            reason = mqtt.connack_string(rc)
+        except Exception:
+            reason = str(rc)
+        print(f"[MK6-MQTT] ({label}): Verbindung {'erfolgreich' if rc == 0 else 'ABGELEHNT'} (rc={rc}: {reason})")
         if rc == 0:
+            # v2.5.3: Zeitpunkt der erfolgreichen Verbindung merken, um in
+            # _on_disconnect() die Standzeit bis zu einem (unerwarteten)
+            # Abbruch protokollieren zu koennen - gemeldeter Fall (A1 mini):
+            # Verbindung wird angenommen (rc=0), bricht aber kurz danach mit
+            # rc=7 (MQTT_ERR_CONN_LOST, Client-Bibliothek - keine vom
+            # Drucker gesendete Abmelde-Nachricht, sondern ein unerwartet
+            # geschlossener Socket) wieder ab. Ohne Zeitangabe laesst sich
+            # nicht unterscheiden, ob das SOFORT nach einer bestimmten
+            # Aktion (Subscribe/Publish, s. u.) oder erst nach Ablauf des
+            # Keepalive-Intervalls (30s) passiert - beides deutet auf eine
+            # andere Ursache hin. Siehe UEBERGABE.md v2.5.3.
+            self._connected_at = time.time()
             self.status["connected"] = True
             topic = f"device/{self.cfg['serial']}/report"
             client.subscribe(topic)
+            print(f"[MK6-MQTT] ({label}): Topic '{topic}' abonniert.")
             # v2.2.20: zusaetzlich das eigene "request"-Topic abonnieren -
             # NICHT um eigene Befehle zu verarbeiten (siehe _on_message:
             # Nachrichten auf diesem Topic werden dort explizit NICHT an
@@ -1001,9 +1086,35 @@ class PrinterConnection:
             # dokumentierte "ams_mapping"-Format fuer AMS-HT-Faecher OHNE
             # Wireshark/Mitmproxy erfassen (Nutzer hat keine Moeglichkeit
             # fuer eine solche Analyse, siehe UEBERGABE.md v2.2.20).
-            self._request_topic = f"device/{self.cfg['serial']}/request"
-            client.subscribe(self._request_topic)
+            #
+            # v2.5.4/v2.5.5: fuer bambu_family=="a1" bewusst ausgesetzt.
+            # Beim A1 mini fuehrte dieses Subscribe reproduzierbar (Standzeit
+            # 0,0s, siehe v2.5.3) zu einer sofortigen, unerwarteten Trennung
+            # (rc=7/CONN_LOST) - X1/H2 sind davon nicht betroffen. Der v2.5.4-
+            # Test (dieses eine Subscribe probeweise ausgesetzt, da als
+            # einziges der drei Schritte rein diagnostisch und ohne
+            # Funktionsverlust entbehrlich) wurde vom Nutzer bestaetigt: mit
+            # ausgesetztem Subscribe haelt die Verbindung zum A1 mini seitdem
+            # dauerhaft, sowohl im Test als auch im Produktivbetrieb; ein
+            # Vergleichstest mit v2.2.19 (vor Einfuehrung dieses Subscribes
+            # in v2.2.20) bestaetigte zusaetzlich, dass die Drucker-Firmware
+            # selbst in Ordnung ist. Das "report"-Topic-Abo und die
+            # "pushall"-Anfrage (fuer den Status) bleiben unveraendert
+            # bestehen. Fuer A1-Drucker bleibt dadurch lediglich die
+            # Mitprotokollierung fremder project_file-Kommandos (siehe
+            # _log_foreign_project_file_command(), nur fuer die AMS-HT-
+            # Mapping-Analyse relevant) ungenutzt - alle anderen Funktionen
+            # sind unberuehrt. Siehe UEBERGABE.md v2.5.4/v2.5.5.
+            if self.cfg.get("bambu_family", "x1") != "a1":
+                self._request_topic = f"device/{self.cfg['serial']}/request"
+                client.subscribe(self._request_topic)
+                print(f"[MK6-MQTT] ({label}): Topic '{self._request_topic}' abonniert.")
+            else:
+                print(f"[MK6-MQTT] ({label}): Abo des 'request'-Topics uebersprungen "
+                      f"(bambu_family=a1, behebt sofortigen Verbindungsabbruch - "
+                      f"siehe UEBERGABE.md v2.5.4/v2.5.5).")
             self._request_pushall(client)
+            print(f"[MK6-MQTT] ({label}): 'pushall'-Anfrage gesendet.")
         else:
             self.status["connected"] = False
 
@@ -1017,6 +1128,20 @@ class PrinterConnection:
             pass
 
     def _on_disconnect(self, client, userdata, rc):
+        # v2.5.2: siehe Kommentar in _on_connect() - dieselbe bisher
+        # fehlende Konsolen-Ausgabe, hier fuer den Fall einer (zunaechst
+        # erfolgreichen) Verbindung, die anschliessend wieder abbricht
+        # (rc != 0 = unerwarteter Abbruch, rc == 0 = regulaeres disconnect()).
+        if rc != 0:
+            # v2.5.3: Standzeit seit erfolgreichem Connect mitloggen (siehe
+            # Kommentar in _on_connect()), damit sich ein sofortiger Abbruch
+            # (z. B. ausgeloest durch Subscribe/Publish) von einem erst nach
+            # Ablauf des Keepalive-Intervalls auftretenden Abbruch
+            # unterscheiden laesst.
+            connected_at = getattr(self, "_connected_at", None)
+            standzeit = f"{time.time() - connected_at:.1f}s" if connected_at else "unbekannt"
+            print(f"[MK6-MQTT] ({self.cfg.get('name', '?')} / {self.cfg.get('ip', '?')}): "
+                  f"Verbindung unerwartet getrennt (rc={rc}), Standzeit seit Connect: {standzeit}.")
         self.status["connected"] = False
 
     def _on_message(self, client, userdata, msg):
@@ -7947,6 +8072,17 @@ async function refresh(){
   list.innerHTML = html;
 }
 
+// v2.5.2: Hinweis, wenn die MQTT-Verbindung zu diesem Bambu-Drucker
+// gerade nicht steht ("connected": false) - vorher blieben die zuletzt
+// empfangenen Duese-/Bett-/Kammer-Werte beim Verbindungsabbruch
+// UNVERAENDERT stehen (siehe PrinterConnection._on_disconnect() in
+// app.py - setzt bewusst nur "connected", nicht die einzelnen
+// Messwerte, zurueck), ohne das irgendwo kenntlich zu machen. Gemeldeter
+// Fall: Status-Punkt dauerhaft rot, Temperaturen wirkten trotzdem wie
+// "live", weil es sich um eingefrorene alte Werte handelte - die Kamera
+// (voellig unabhaengig von dieser MQTT-Verbindung, siehe
+// bambu_rtsp_mjpeg_generator()) zeigte parallel ein echtes Live-Bild,
+// was den Eindruck "der Drucker ist doch erreichbar" verstaerkte.
 function renderBambuCard(p){
   const online = p.connected;
   const pct = p.progress || 0;
@@ -7980,6 +8116,11 @@ function renderBambuCard(p){
           </div>
 
           <div class="field-label">Temperaturen</div>
+          ${online ? '' : `<div class="hint-text" style="margin-top:0;">
+            Nicht verbunden - die folgenden Werte sind die zuletzt bekannten
+            ${p.last_update ? '(Stand ' + p.last_update + ')' : ''}, KEINE
+            Live-Daten mehr.
+          </div>`}
           <div class="temps">
             ${p.bambu_family === 'a1' ? '' : tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp)}
             ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}

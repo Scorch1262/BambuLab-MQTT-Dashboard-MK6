@@ -45,7 +45,36 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Sprung 1.2.0 -> 2.0.1: auf ausdruecklichen Wunsch des Nutzers, als
 # Gesamtsumme mehrerer MK6-Aenderungen (nicht nach der ansonsten in
 # README Abschnitt 0a beschriebenen Automatik hergeleitet).
-APP_VERSION = "2.2.28"
+#
+# v2.3.0: auf ausdruecklichen Wunsch des Nutzers als MINOR (nicht PATCH)
+# erhoeht, da der Funktionsumfang umfangreich ist (Bedien-/Einstellungs-
+# Modus, Raeume/Gruppen, frei konfigurierbare externe RTSP-Kameras,
+# Drucker-/Raum-Reihenfolge) - siehe UEBERGABE.md v2.3.0 fuer Details.
+#
+# v2.4.0: erneut MINOR - externe RTSP-Kameras koennen jetzt eine eigene
+# Anmeldung (Benutzername/Passwort) sowie einen Raum haben, Kartenlayout
+# erlaubt zusaetzlich 4 Spalten, und die Kameras erscheinen direkt als
+# eigene Kacheln in der (Raum-)Ansicht statt hinter einem gemeinsamen
+# Knopf - siehe UEBERGABE.md v2.4.0.
+#
+# v2.5.0: MQTT-Sensoren/Schalter koennen jetzt auch OHNE Druckerzuordnung
+# angelegt werden ("eigenstaendige" Extras, siehe DashboardApp.
+# add_standalone_extra()); behebt den gemeldeten Fehler, dass das
+# Hinzufuegen-Formular ohne Drucker-Auswahl wortlos nichts tat.
+# Ausserdem: der "Speichern"-Knopf fuer die Druckverlauf-Einstellung
+# wurde aus dem "Druckverlauf"-Abschnitt in die Kopfzeile des
+# Einstellungen-Modus verschoben (neben "Zur Bedienung"), da seine
+# vorherige Position faelschlich wie ein Teil des Druckverlaufs wirkte -
+# siehe UEBERGABE.md v2.5.0.
+#
+# v2.5.1: PATCH, auf ausdruecklichen Nutzerwunsch (reine Fehlerbehebung/
+# Anpassung, daher nur die letzte Versionsstelle erhoeht): ALLE
+# MQTT-Sensoren zeigen jetzt ein Verlaufsdiagramm (vorher nur die mit
+# "display": "temperature"/"humidity"), und der komplette MQTT-Bereich
+# im Einstellungen-Modus wurde vom bisherigen Einzel-Modal auf dieselbe
+# inline Darstellung wie "Drucker verwalten"/"Raeume"/"Externe RTSP-
+# Kameras" umgestellt - siehe UEBERGABE.md v2.5.1.
+APP_VERSION = "2.5.1"
 
 import os
 import sys
@@ -181,6 +210,21 @@ DEFAULT_CONFIG = {
         "password": "",
         "tls": False
     },
+    # v2.3.0: Raeume/Gruppen (siehe DashboardApp.add_group() etc.) - jede
+    # Gruppe nur {"id","name","order"}, die Zuordnung eines Druckers zu
+    # einer Gruppe steht beim jeweiligen Drucker selbst ("group_id",
+    # siehe load_config()-Migration unten), nicht umgekehrt bei der
+    # Gruppe - vermeidet zwei Quellen der Wahrheit fuer dieselbe Relation.
+    "groups": [],
+    # v2.3.0: frei benennbare, vom Drucker UNABHAENGIGE RTSP(S)-Kameras
+    # (z. B. eine Raumuebersichtskamera) - siehe DashboardApp.
+    # add_rtsp_camera()/generic_rtsp_mjpeg_generator().
+    "rtsp_cameras": [],
+    # v2.5.0: MQTT-Sensoren/Schalter, die KEINEM Drucker zugeordnet sind
+    # (z. B. ein Raumthermometer) - vorher musste jeder Sensor/Schalter
+    # zwingend an einen bestehenden Drucker haengen ("extras" je Drucker),
+    # siehe DashboardApp.add_standalone_extra()/README Abschnitt 8.
+    "standalone_extras": [],
     "printers": []
 }
 
@@ -742,11 +786,34 @@ def load_config() -> dict:
     cfg.setdefault("preform_server", DEFAULT_CONFIG["preform_server"])
     cfg.setdefault("history_max_jobs", DEFAULT_CONFIG["history_max_jobs"])
     cfg.setdefault("extras_mqtt", json.loads(json.dumps(DEFAULT_CONFIG["extras_mqtt"])))
+    cfg.setdefault("groups", [])
+    cfg.setdefault("rtsp_cameras", [])
+    cfg.setdefault("standalone_extras", [])
     cfg.setdefault("printers", [])
-    for p in cfg["printers"]:
+    # v2.3.0: bestehende config.json-Dateien (vor Einfuehrung von Raeumen/
+    # Reihenfolge) haben weder "group_id" noch "order" je Drucker/Gruppe/
+    # Kamera - hier defensiv ergaenzt, damit aeltere Konfigurationen ohne
+    # manuellen Eingriff weiterlaufen (additiv, wie im ganzen Projekt
+    # ueblich). "order" wird anhand der bisherigen Listenreihenfolge in
+    # config.json vergeben, damit sich an der bisher gezeigten Reihenfolge
+    # durch das Update selbst nichts aendert.
+    for idx, p in enumerate(cfg["printers"]):
         p.setdefault("extras", [])
         if p.get("type") == "bambu":
             p.setdefault("bambu_family", "x1")
+        p.setdefault("group_id", None)
+        p.setdefault("order", idx)
+    for idx, g in enumerate(cfg["groups"]):
+        g.setdefault("order", idx)
+    for idx, c in enumerate(cfg["rtsp_cameras"]):
+        c.setdefault("order", idx)
+        # v2.4.0: Anmeldedaten und Raum-Zuordnung - siehe add_rtsp_camera().
+        c.setdefault("username", "")
+        c.setdefault("password", "")
+        c.setdefault("group_id", None)
+    for idx, e in enumerate(cfg["standalone_extras"]):
+        e.setdefault("order", idx)
+        e.setdefault("group_id", None)
     return cfg
 
 
@@ -2286,7 +2353,7 @@ def _recv_exact(sock, n):
 # TCP transport successfully connected") ausdruecklich als notwendig
 # fuer eine zuverlaessige Verbindung zu Bambu-Druckern genannt (UDP
 # scheitert haeufig an lokalen Firewalls/NAT-internen Eigenheiten).
-def _drain_ffmpeg_stderr(proc, ip: str):
+def _drain_ffmpeg_stderr(proc, log_label: str):
     """Liest die Standardfehlerausgabe des FFmpeg-Subprozesses fortlaufend
     in einem eigenen Thread mit und gibt jede Zeile ueber die Server-
     Konsole aus (Praefix "[MK6-FFMPEG]").
@@ -2310,7 +2377,7 @@ def _drain_ffmpeg_stderr(proc, ip: str):
         for raw_line in iter(proc.stderr.readline, b""):
             line = raw_line.decode("utf-8", errors="ignore").rstrip()
             if line:
-                print(f"[MK6-FFMPEG] (Drucker-IP {ip}): {line}")
+                print(f"[MK6-FFMPEG] ({log_label}): {line}")
     except Exception:
         pass
 
@@ -2403,7 +2470,7 @@ def bambu_rtsp_mjpeg_generator(ip: str, access_code: str, ffmpeg_path: str):
               f"(Pfad: {ffmpeg_path!r})")
         return
     print(f"[MK6-FFMPEG] (Drucker-IP {ip}): FFmpeg-Prozess gestartet (PID {proc.pid}).")
-    stderr_thread = threading.Thread(target=_drain_ffmpeg_stderr, args=(proc, ip), daemon=True)
+    stderr_thread = threading.Thread(target=_drain_ffmpeg_stderr, args=(proc, f"Drucker-IP {ip}"), daemon=True)
     stderr_thread.start()
     # v2.2.26: Nutzer berichtete nach v2.2.25 (mit umfangreicher Diagnose-
     # Protokollierung) folgenden, schrittweise eingegrenzten Befund: FFmpeg
@@ -2504,6 +2571,133 @@ def bambu_rtsp_mjpeg_generator(ip: str, access_code: str, ffmpeg_path: str):
         # ruft den finally-Block eines Response-Generators zuverlaessig
         # auf, sobald die Verbindung zum Browser endet (auch bei
         # abgebrochener Uebertragung).
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+
+
+# v2.4.0: baut Benutzername/Passwort (getrennt in config.json gespeichert,
+# siehe DashboardApp.add_rtsp_camera()) in die vom Nutzer hinterlegte
+# RTSP(S)-URL ein, statt den Nutzer zu zwingen, sie selbst als
+# "rtsp://user:pass@host:port/pfad" von Hand zusammenzusetzen - das
+# scheitert bei Sonderzeichen im Passwort (z. B. "@", ":" oder "/"), die
+# in dieser Position per RFC 3986 prozentkodiert werden muessten.
+# urllib.parse.quote() uebernimmt genau das. Ist weder Benutzername noch
+# Passwort gesetzt, bleibt die URL unveraendert (deckt weiterhin den
+# Fall ab, dass der Nutzer die Zugangsdaten - wie vor v2.4.0 einzig
+# moeglich - bereits selbst in die URL eingebaut hat). Sind sie gesetzt,
+# ersetzen sie etwaige bereits in der URL enthaltene Zugangsdaten
+# vollstaendig (eindeutiger Vorrang, keine Vermischung zweier Quellen).
+def build_rtsp_url_with_auth(url: str, username: str, password: str) -> str:
+    if not username and not password:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    user_enc = urllib.parse.quote(username or "", safe="")
+    pass_enc = urllib.parse.quote(password or "", safe="")
+    credentials = user_enc + (":" + pass_enc if pass_enc else "")
+    host = parsed.hostname or ""
+    # v2.4.0: IPv6-Hosts muessen in der Netloc wieder in eckige Klammern
+    # gefasst werden (urlsplit().hostname liefert sie OHNE Klammern
+    # zurueck) - siehe RFC 3986 Abschnitt 3.2.2. Bambu/IP-Kameras im LAN
+    # nutzen praktisch immer IPv4, das wird hier defensiv trotzdem korrekt
+    # behandelt statt nur fuer IPv4 anzunehmen.
+    if host and ":" in host:
+        host = f"[{host}]"
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    new_netloc = f"{credentials}@{netloc}" if credentials else netloc
+    return urllib.parse.urlunsplit((parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+# v2.3.0: frei konfigurierbare, vom Drucker UNABHAENGIGE RTSP(S)-Kamera
+# (z. B. eine Raumuebersichtskamera, siehe DashboardApp.add_rtsp_camera()).
+# Bewusst eine EIGENSTAENDIGE Funktion statt einer Umbau/Parametrisierung
+# von bambu_rtsp_mjpeg_generator() oben: Letztere ist auf echter X1E-/H2D-
+# Pro-Hardware ausfuehrlich diagnostiziert und bestaetigt funktionsfaehig
+# (siehe deren Kommentarblock) - additiv bleiben heisst hier, den bereits
+# bewiesenen Pfad nicht anzufassen, auch wenn das etwas Code verdoppelt.
+# Die FFmpeg-Kommandozeile und das JPEG-Marker-basierte Neuverpacken ins
+# bewaehrte "--frame"-Multipart-Format (siehe ausfuehrliche Begruendung
+# oben bei bambu_rtsp_mjpeg_generator()) sind identisch; einziger
+# fachlicher Unterschied: die URL kommt hier bereits vollstaendig vom
+# Nutzer (kein fest zusammengebautes "rtsps://bblp:<code>@<ip>:322/...")
+# und "-tls_verify 0" wird nur bei "rtsps://"-URLs gesetzt (die Option
+# existiert fuer reines "rtsp://" nicht/ist dort bedeutungslos, siehe
+# ffmpeg-protocols(1): "tls_verify" gehoert zum TLS-Transport).
+def generic_rtsp_mjpeg_generator(rtsp_url: str, ffmpeg_path: str, label: str):
+    cmd = [
+        ffmpeg_path,
+        "-loglevel", "error",
+        "-rtsp_transport", "tcp",
+        "-timeout", "15000000",
+    ]
+    if rtsp_url.strip().lower().startswith("rtsps://"):
+        cmd += ["-tls_verify", "0"]
+    cmd += [
+        "-i", rtsp_url,
+        "-an",
+        "-c:v", "mjpeg",
+        "-q:v", "5",
+        "-r", "10",
+        "-f", "image2pipe",
+        "-",
+    ]
+    print(f"[MK6-FFMPEG] (Kamera '{label}'): Starte FFmpeg-Prozess fuer RTSP-Kamera-Stream...")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        print(f"[MK6-FFMPEG] (Kamera '{label}'): FEHLER beim Start von FFmpeg: {e!r} "
+              f"(Pfad: {ffmpeg_path!r})")
+        return
+    print(f"[MK6-FFMPEG] (Kamera '{label}'): FFmpeg-Prozess gestartet (PID {proc.pid}).")
+    stderr_thread = threading.Thread(target=_drain_ffmpeg_stderr, args=(proc, f"Kamera '{label}'"), daemon=True)
+    stderr_thread.start()
+    SOI_MARKER = b"\xff\xd8"
+    EOI_MARKER = b"\xff\xd9"
+    MAX_FRAME_BUFFER_BYTES = 10_000_000
+    buf = bytearray()
+    try:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                exit_code = proc.poll()
+                print(f"[MK6-FFMPEG] (Kamera '{label}'): Stream beendet "
+                      f"(FFmpeg-Exitcode: {exit_code!r}).")
+                break
+            buf += chunk
+            while True:
+                start = buf.find(SOI_MARKER)
+                if start == -1:
+                    if len(buf) > 1:
+                        del buf[:-1]
+                    break
+                if start > 0:
+                    del buf[:start]
+                end = buf.find(EOI_MARKER, 2)
+                if end == -1:
+                    if len(buf) > MAX_FRAME_BUFFER_BYTES:
+                        print(f"[MK6-FFMPEG] (Kamera '{label}'): Puffer ohne "
+                              f"JPEG-Endmarker ueber {MAX_FRAME_BUFFER_BYTES} "
+                              f"Bytes gewachsen - verwerfe Puffer.")
+                        del buf[:]
+                    break
+                frame = bytes(buf[:end + 2])
+                del buf[:end + 2]
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+                       frame + b"\r\n")
+    except Exception as e:
+        print(f"[MK6-FFMPEG] (Kamera '{label}'): FEHLER waehrend des Streamens: {e!r}")
+    finally:
         try:
             proc.kill()
         except Exception:
@@ -3478,7 +3672,12 @@ class DashboardApp:
             "name": name,
             "type": ptype,
             "ip": ip,
-            "extras": []
+            "extras": [],
+            # v2.3.0: neue Drucker gehoeren zunaechst keinem Raum an und
+            # werden ans Ende der Anzeigereihenfolge gehaengt (siehe
+            # reorder_printers()/all_status() fuer die Verwendung).
+            "group_id": None,
+            "order": len(self.cfg["printers"]),
         }
         if ptype in FORMLABS_TYPES:
             pass
@@ -3531,6 +3730,171 @@ class DashboardApp:
             if p["id"] == printer_id:
                 return p
         return None
+
+    # ------------------------------------------------------------------
+    # v2.3.0: Raeume/Gruppen - rein organisatorisch (Anzeige gruppiert
+    # nach Raum im Bedien-Modus), ohne jede technische Wirkung auf die
+    # Drucker-Verbindungen selbst. Die Zuordnung eines Druckers zu einer
+    # Gruppe steht beim Drucker ("group_id", siehe assign_printer_group()),
+    # das Loeschen einer Gruppe setzt diese Zuordnung defensiv auf None
+    # zurueck statt die betroffenen Drucker versehentlich mitzuloeschen.
+    # ------------------------------------------------------------------
+    def get_groups(self):
+        return sorted(self.cfg.get("groups", []), key=lambda g: g.get("order", 0))
+
+    def add_group(self, name):
+        new_group = {
+            "id": uuid.uuid4().hex[:10],
+            "name": name,
+            "order": len(self.cfg.get("groups", [])),
+        }
+        self.cfg.setdefault("groups", []).append(new_group)
+        save_config(self.cfg)
+        return new_group
+
+    def rename_group(self, group_id, name):
+        for g in self.cfg.get("groups", []):
+            if g["id"] == group_id:
+                g["name"] = name
+                save_config(self.cfg)
+                return True
+        return False
+
+    def remove_group(self, group_id):
+        groups = self.cfg.get("groups", [])
+        if not any(g["id"] == group_id for g in groups):
+            return False
+        self.cfg["groups"] = [g for g in groups if g["id"] != group_id]
+        # Drucker UND externe Kameras (seit v2.4.0 ebenfalls raum-
+        # zuweisbar) dieser Gruppe werden NICHT geloescht, nur die
+        # Zuordnung entfernt (erscheinen danach im Bedien-Modus unter
+        # "Ohne Raum").
+        for p in self.cfg["printers"]:
+            if p.get("group_id") == group_id:
+                p["group_id"] = None
+        for c in self.cfg.get("rtsp_cameras", []):
+            if c.get("group_id") == group_id:
+                c["group_id"] = None
+        # v2.5.0: eigenstaendige (nicht an einen Drucker gebundene) MQTT-
+        # Sensoren/Schalter sind seitdem ebenfalls raum-zuweisbar (siehe
+        # add_standalone_extra()) - analog zu Druckern/Kameras oben wird
+        # beim Loeschen der Gruppe nur die Zuordnung entfernt.
+        for e in self.cfg.get("standalone_extras", []):
+            if e.get("group_id") == group_id:
+                e["group_id"] = None
+        save_config(self.cfg)
+        return True
+
+    def reorder_groups(self, ordered_ids):
+        groups = self.cfg.get("groups", [])
+        if sorted(ordered_ids) != sorted(g["id"] for g in groups):
+            return False
+        order_map = {gid: idx for idx, gid in enumerate(ordered_ids)}
+        for g in groups:
+            g["order"] = order_map[g["id"]]
+        save_config(self.cfg)
+        return True
+
+    def assign_printer_group(self, printer_id, group_id):
+        p = self.get_printer_cfg(printer_id)
+        if not p:
+            return False
+        if group_id is not None and not any(g["id"] == group_id for g in self.cfg.get("groups", [])):
+            return False
+        p["group_id"] = group_id
+        save_config(self.cfg)
+        return True
+
+    def reorder_printers(self, ordered_ids):
+        printers = self.cfg["printers"]
+        if sorted(ordered_ids) != sorted(p["id"] for p in printers):
+            return False
+        order_map = {pid: idx for idx, pid in enumerate(ordered_ids)}
+        for p in printers:
+            p["order"] = order_map[p["id"]]
+        save_config(self.cfg)
+        return True
+
+    # ------------------------------------------------------------------
+    # v2.3.0: frei konfigurierbare, vom Drucker unabhaengige RTSP(S)-
+    # Kameras (z. B. eine Raumuebersichtskamera) - Streaming laeuft ueber
+    # denselben FFmpeg-basierten Mechanismus wie die RTSPS-Kamera der
+    # X1/P1/P2/H2/X2-Serie (siehe generic_rtsp_mjpeg_generator()), hier
+    # nur die Verwaltung der Eintraege in config.json.
+    # ------------------------------------------------------------------
+    def get_rtsp_cameras(self):
+        return sorted(self.cfg.get("rtsp_cameras", []), key=lambda c: c.get("order", 0))
+
+    def get_rtsp_camera(self, camera_id):
+        for c in self.cfg.get("rtsp_cameras", []):
+            if c["id"] == camera_id:
+                return c
+        return None
+
+    def add_rtsp_camera(self, name, url, username="", password="", group_id=None):
+        new_cam = {
+            "id": uuid.uuid4().hex[:10],
+            "name": name,
+            "url": url,
+            # v2.4.0: Anmeldedaten bewusst GETRENNT von der URL gespeichert
+            # (nicht vom Nutzer selbst als "user:pass@" in die URL
+            # eingebaut) - siehe build_rtsp_url_with_auth() fuer den Grund
+            # (Sonderzeichen in Passwoertern wuerden eine manuell
+            # eingebaute URL sonst unbrauchbar machen) sowie group_id fuer
+            # die Raum-Zuordnung, analog zu Druckern.
+            "username": username or "",
+            "password": password or "",
+            "group_id": group_id,
+            "order": len(self.cfg.get("rtsp_cameras", [])),
+        }
+        self.cfg.setdefault("rtsp_cameras", []).append(new_cam)
+        save_config(self.cfg)
+        return new_cam
+
+    def update_rtsp_camera(self, camera_id, name, url, username="", password=""):
+        cam = self.get_rtsp_camera(camera_id)
+        if not cam:
+            return False
+        cam["name"] = name
+        cam["url"] = url
+        cam["username"] = username or ""
+        cam["password"] = password or ""
+        save_config(self.cfg)
+        return True
+
+    def remove_rtsp_camera(self, camera_id):
+        cams = self.cfg.get("rtsp_cameras", [])
+        if not any(c["id"] == camera_id for c in cams):
+            return False
+        self.cfg["rtsp_cameras"] = [c for c in cams if c["id"] != camera_id]
+        save_config(self.cfg)
+        return True
+
+    def assign_rtsp_camera_group(self, camera_id, group_id):
+        cam = self.get_rtsp_camera(camera_id)
+        if not cam:
+            return False
+        if group_id is not None and not any(g["id"] == group_id for g in self.cfg.get("groups", [])):
+            return False
+        cam["group_id"] = group_id
+        save_config(self.cfg)
+        return True
+
+    # ------------------------------------------------------------------
+    # v2.3.0: Einstellungen-Modus - bislang nur per Hand in config.json
+    # aenderbarer "history_max_jobs" (siehe _resolve_history_max_jobs())
+    # jetzt zusaetzlich ueber die Web-Oberflaeche aenderbar. Analog zu
+    # update_extras_mqtt_settings() wird der Effekt (Limit des bereits
+    # laufenden PrintHistoryStore) SOFORT uebernommen, kein Neustart noetig.
+    # ------------------------------------------------------------------
+    def get_settings(self):
+        return {"history_max_jobs": self.cfg.get("history_max_jobs")}
+
+    def update_history_max_jobs(self, raw_value):
+        self.cfg["history_max_jobs"] = raw_value
+        save_config(self.cfg)
+        self.history.max_jobs_per_printer = _resolve_history_max_jobs(raw_value)
+        return True
 
     def _resolve_extras(self, printer_cfg):
         out = []
@@ -3695,6 +4059,86 @@ class DashboardApp:
         save_config(self.cfg)
         return len(p["extras"]) != before
 
+    # ------------------------------------------------------------------
+    # v2.5.0: eigenstaendige (vom Drucker UNABHAENGIGE) MQTT-Sensoren und
+    # -Schalter - z. B. ein Raumthermometer, das an keinem bestimmten
+    # Drucker haengt. Vorher musste JEDER Sensor/Schalter zwingend einem
+    # bestehenden Drucker zugeordnet werden (siehe _get_extras_list()
+    # oben), wodurch sich ohne mindestens einen angelegten Drucker gar
+    # keine Sensoren/Schalter anlegen liessen - das Hinzufuegen-Formular
+    # im Frontend brach in diesem Fall wortlos ab (siehe submitMqttExtra()
+    # im <script>-Block). Diese Liste ist bewusst parallel zu, NICHT
+    # innerhalb von, "extras" je Drucker aufgebaut, um die bestehende
+    # Druckerzuordnung unveraendert zu lassen (additiv). Validierung
+    # (Pflichtfelder je nach "kind") nutzt dieselbe _validate_extra_fields()
+    # wie die druckergebundenen Extras. Analog zu Druckern/Kameras seit
+    # v2.3.0/v2.4.0 koennen auch eigenstaendige Sensoren/Schalter einem
+    # Raum zugewiesen werden (siehe assign_standalone_extra_group()),
+    # damit sie sich im Bedien-Modus sinnvoll einsortieren lassen.
+    # ------------------------------------------------------------------
+    def get_standalone_extras(self):
+        out = []
+        for ex in sorted(self.cfg.get("standalone_extras", []), key=lambda e: e.get("order", 0)):
+            item = dict(ex)
+            if ex.get("kind") == "sensor":
+                item["value"] = self.extras.get_value(ex.get("topic"))
+            out.append(item)
+        return out
+
+    def add_standalone_extra(self, data):
+        entry, err = self._validate_extra_fields(data)
+        if err:
+            return False, err, None
+        entry["id"] = uuid.uuid4().hex[:10]
+        entry["group_id"] = None
+        entry["order"] = len(self.cfg.get("standalone_extras", []))
+        self.cfg.setdefault("standalone_extras", []).append(entry)
+        save_config(self.cfg)
+        return True, None, entry
+
+    def update_standalone_extra(self, extra_id, data):
+        extras = self.cfg.get("standalone_extras", [])
+        existing = next((e for e in extras if e.get("id") == extra_id), None)
+        if not existing:
+            return False, "Eintrag nicht gefunden.", None
+        entry, err = self._validate_extra_fields(data, existing_kind=existing.get("kind"))
+        if err:
+            return False, err, None
+        entry["id"] = extra_id
+        entry["group_id"] = existing.get("group_id")
+        entry["order"] = existing.get("order", 0)
+        extras[extras.index(existing)] = entry
+        save_config(self.cfg)
+        return True, None, entry
+
+    def delete_standalone_extra(self, extra_id):
+        extras = self.cfg.get("standalone_extras", [])
+        before = len(extras)
+        self.cfg["standalone_extras"] = [e for e in extras if e.get("id") != extra_id]
+        save_config(self.cfg)
+        return len(self.cfg["standalone_extras"]) != before
+
+    def assign_standalone_extra_group(self, extra_id, group_id):
+        extra = next((e for e in self.cfg.get("standalone_extras", []) if e.get("id") == extra_id), None)
+        if not extra:
+            return False
+        if group_id is not None and not any(g["id"] == group_id for g in self.cfg.get("groups", [])):
+            return False
+        extra["group_id"] = group_id
+        save_config(self.cfg)
+        return True
+
+    def send_standalone_extra_command(self, extra_id, action):
+        extra = next((e for e in self.cfg.get("standalone_extras", []) if e.get("id") == extra_id), None)
+        if not extra or extra.get("kind") != "switch":
+            return False, "Schalter nicht gefunden."
+        topic = extra.get("command_topic")
+        payload = extra.get("payload_on") if action == "on" else extra.get("payload_off")
+        if not topic or payload is None:
+            return False, "Schalter ist in config.json nicht vollstaendig konfiguriert."
+        ok = self.extras.publish(topic, payload)
+        return ok, (None if ok else "MQTT-Verbindung fuer Sensoren/Schalter nicht verfuegbar.")
+
     def all_status(self):
         out = []
         for p in self.cfg["printers"]:
@@ -3704,6 +4148,11 @@ class DashboardApp:
                 "name": p["name"],
                 "ip": p["ip"],
                 "type": p.get("type", "bambu"),
+                # v2.3.0: Raum-Zuordnung und Anzeige-Reihenfolge - siehe
+                # assign_printer_group()/reorder_printers() sowie die
+                # gruppierte Darstellung in refresh() im <script>-Block.
+                "group_id": p.get("group_id"),
+                "order": p.get("order", 0),
             }
             item.update(conn.status if conn else {})
             item["extras"] = self._resolve_extras(p)
@@ -4468,6 +4917,193 @@ def api_delete_printer(printer_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/printers/reorder", methods=["POST"])
+def api_reorder_printers():
+    """Setzt eine vollstaendig neue Anzeige-Reihenfolge ueber ALLE Drucker
+    (unabhaengig von deren Raum-Zuordnung), Body {"order": [printer_id, ...]}
+    - siehe DashboardApp.reorder_printers() fuer die Validierung."""
+    data = request.get_json(force=True) or {}
+    order = data.get("order")
+    if not isinstance(order, list) or not order:
+        return jsonify({"error": "order (Liste von Drucker-IDs) fehlt."}), 400
+    if not dash.reorder_printers(order):
+        return jsonify({"error": "Reihenfolge passt nicht zu den aktuell angelegten Druckern."}), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/api/printers/<printer_id>/group", methods=["POST"])
+def api_assign_printer_group(printer_id):
+    """Weist einen Drucker einem Raum/einer Gruppe zu (oder entfernt die
+    Zuordnung), Body {"group_id": "<id>"} bzw. {"group_id": null}."""
+    data = request.get_json(force=True) or {}
+    group_id = data.get("group_id")
+    if group_id is not None and not isinstance(group_id, str):
+        return jsonify({"error": "group_id muss eine Zeichenkette oder null sein."}), 400
+    if not dash.assign_printer_group(printer_id, group_id):
+        return jsonify({"error": "Drucker oder Raum nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+# ----------------------------------------------------------------------
+# v2.3.0: Raeume/Gruppen - siehe DashboardApp-Methoden fuer Details.
+# ----------------------------------------------------------------------
+@app.route("/api/groups", methods=["GET"])
+def api_list_groups():
+    return jsonify(dash.get_groups())
+
+
+@app.route("/api/groups", methods=["POST"])
+def api_add_group():
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name ist ein Pflichtfeld."}), 400
+    return jsonify(dash.add_group(name)), 201
+
+
+@app.route("/api/groups/<group_id>", methods=["PUT"])
+def api_rename_group(group_id):
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name ist ein Pflichtfeld."}), 400
+    if not dash.rename_group(group_id, name):
+        return jsonify({"error": "Raum nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<group_id>", methods=["DELETE"])
+def api_delete_group(group_id):
+    if not dash.remove_group(group_id):
+        return jsonify({"error": "Raum nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/reorder", methods=["POST"])
+def api_reorder_groups():
+    data = request.get_json(force=True) or {}
+    order = data.get("order")
+    if not isinstance(order, list) or not order:
+        return jsonify({"error": "order (Liste von Raum-IDs) fehlt."}), 400
+    if not dash.reorder_groups(order):
+        return jsonify({"error": "Reihenfolge passt nicht zu den aktuell angelegten Raeumen."}), 409
+    return jsonify({"ok": True})
+
+
+# ----------------------------------------------------------------------
+# v2.3.0: frei konfigurierbare, vom Drucker unabhaengige RTSP(S)-Kameras -
+# siehe DashboardApp-Methoden sowie generic_rtsp_mjpeg_generator().
+# ----------------------------------------------------------------------
+@app.route("/api/rtsp-cameras", methods=["GET"])
+def api_list_rtsp_cameras():
+    return jsonify(dash.get_rtsp_cameras())
+
+
+@app.route("/api/rtsp-cameras", methods=["POST"])
+def api_add_rtsp_camera():
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    url = (data.get("url") or "").strip()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    group_id = data.get("group_id")
+    if not name or not url:
+        return jsonify({"error": "Name und RTSP(S)-URL sind Pflichtfelder."}), 400
+    if not (url.lower().startswith("rtsp://") or url.lower().startswith("rtsps://")):
+        return jsonify({"error": "Die URL muss mit rtsp:// oder rtsps:// beginnen."}), 400
+    if group_id is not None and not isinstance(group_id, str):
+        return jsonify({"error": "group_id muss eine Zeichenkette oder null sein."}), 400
+    if group_id is not None and not any(g["id"] == group_id for g in dash.cfg.get("groups", [])):
+        return jsonify({"error": "Raum nicht gefunden."}), 404
+    cam = dash.add_rtsp_camera(name, url, username=username, password=password, group_id=group_id)
+    return jsonify(cam), 201
+
+
+@app.route("/api/rtsp-cameras/<camera_id>", methods=["PUT"])
+def api_update_rtsp_camera(camera_id):
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    url = (data.get("url") or "").strip()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not name or not url:
+        return jsonify({"error": "Name und RTSP(S)-URL sind Pflichtfelder."}), 400
+    if not (url.lower().startswith("rtsp://") or url.lower().startswith("rtsps://")):
+        return jsonify({"error": "Die URL muss mit rtsp:// oder rtsps:// beginnen."}), 400
+    if not dash.update_rtsp_camera(camera_id, name, url, username=username, password=password):
+        return jsonify({"error": "Kamera nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rtsp-cameras/<camera_id>", methods=["DELETE"])
+def api_delete_rtsp_camera(camera_id):
+    if not dash.remove_rtsp_camera(camera_id):
+        return jsonify({"error": "Kamera nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rtsp-cameras/<camera_id>/group", methods=["POST"])
+def api_assign_rtsp_camera_group(camera_id):
+    """Weist eine externe RTSP-Kamera einem Raum zu (oder entfernt die
+    Zuordnung), Body {"group_id": "<id>"} bzw. {"group_id": null} - siehe
+    api_assign_printer_group() fuer dasselbe Muster bei Druckern."""
+    data = request.get_json(force=True) or {}
+    group_id = data.get("group_id")
+    if group_id is not None and not isinstance(group_id, str):
+        return jsonify({"error": "group_id muss eine Zeichenkette oder null sein."}), 400
+    if not dash.assign_rtsp_camera_group(camera_id, group_id):
+        return jsonify({"error": "Kamera oder Raum nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/camera/rtsp/<camera_id>")
+def rtsp_camera_stream(camera_id):
+    cam = dash.get_rtsp_camera(camera_id)
+    if not cam:
+        return "Kamera nicht gefunden", 404
+    ffmpeg_path = _find_ffmpeg_binary()
+    if not ffmpeg_path:
+        return ("FFmpeg wurde nicht gefunden (weder neben dem Programm noch "
+                "ueber PATH). Externe RTSP-Kameras brauchen FFmpeg - siehe README."), 500
+    try:
+        # v2.4.0: Benutzername/Passwort (getrennt gespeichert, siehe
+        # add_rtsp_camera()) erst hier, unmittelbar vor dem FFmpeg-Aufruf,
+        # in die URL eingebaut - build_rtsp_url_with_auth() dort fuer die
+        # Begruendung (Sonderzeichen im Passwort).
+        url = build_rtsp_url_with_auth(cam["url"], cam.get("username", ""), cam.get("password", ""))
+        gen = generic_rtsp_mjpeg_generator(url, ffmpeg_path, cam["name"])
+        return Response(gen, mimetype="multipart/x-mixed-replace; boundary=frame")
+    except Exception as e:
+        return f"Kamera nicht erreichbar: {e}", 502
+
+
+# ----------------------------------------------------------------------
+# v2.3.0: Einstellungen (aktuell: maximale Anzahl Verlaufseintraege) -
+# siehe DashboardApp.get_settings()/update_history_max_jobs().
+# ----------------------------------------------------------------------
+@app.route("/api/settings", methods=["GET"])
+def api_get_settings():
+    return jsonify(dash.get_settings())
+
+
+@app.route("/api/settings", methods=["PUT"])
+def api_update_settings():
+    data = request.get_json(force=True) or {}
+    if "history_max_jobs" in data:
+        raw_value = data["history_max_jobs"]
+        # Das Frontend sendet entweder eine ganze Zahl oder null
+        # ("unbegrenzt") - siehe saveHistorySettings() im <script>-Block.
+        # Strings (z. B. "unendlich") bleiben fuer die manuelle
+        # config.json-Bearbeitung weiterhin gueltig (siehe
+        # _resolve_history_max_jobs()).
+        if raw_value is not None and not isinstance(raw_value, (int, str)):
+            return jsonify({"error": "history_max_jobs muss eine Zahl, null oder 'unendlich' sein."}), 400
+        if isinstance(raw_value, bool):
+            return jsonify({"error": "history_max_jobs muss eine Zahl, null oder 'unendlich' sein."}), 400
+        dash.update_history_max_jobs(raw_value)
+    return jsonify(dash.get_settings())
+
+
 @app.route("/api/status", methods=["GET"])
 def api_status():
     return jsonify(dash.all_status())
@@ -4530,6 +5166,60 @@ def api_delete_extra(printer_id, extra_id):
     ok = dash.delete_extra(printer_id, extra_id)
     if not ok:
         return jsonify({"error": "Eintrag nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+# v2.5.0: eigenstaendige (vom Drucker unabhaengige) MQTT-Sensoren/Schalter -
+# siehe DashboardApp.add_standalone_extra() fuer den Hintergrund.
+@app.route("/api/standalone_extras", methods=["GET"])
+def api_get_standalone_extras():
+    return jsonify(dash.get_standalone_extras())
+
+
+@app.route("/api/standalone_extras", methods=["POST"])
+def api_add_standalone_extra():
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.add_standalone_extra(data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify(entry), 201
+
+
+@app.route("/api/standalone_extras/<extra_id>", methods=["PUT"])
+def api_update_standalone_extra(extra_id):
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.update_standalone_extra(extra_id, data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify(entry)
+
+
+@app.route("/api/standalone_extras/<extra_id>", methods=["DELETE"])
+def api_delete_standalone_extra(extra_id):
+    ok = dash.delete_standalone_extra(extra_id)
+    if not ok:
+        return jsonify({"error": "Eintrag nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/standalone_extras/<extra_id>/group", methods=["POST"])
+def api_assign_standalone_extra_group(extra_id):
+    data = request.get_json(force=True) or {}
+    group_id = data.get("group_id") or None
+    if not dash.assign_standalone_extra_group(extra_id, group_id):
+        return jsonify({"error": "Eintrag oder Raum nicht gefunden."}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/standalone_extras/<extra_id>/command", methods=["POST"])
+def api_standalone_extra_command(extra_id):
+    data = request.get_json(force=True) or {}
+    action = (data.get("action") or "").strip().lower()
+    if action not in ("on", "off"):
+        return jsonify({"error": "action muss 'on' oder 'off' sein."}), 400
+    ok, err = dash.send_standalone_extra_command(extra_id, action)
+    if not ok:
+        return jsonify({"error": err}), 400
     return jsonify({"ok": True})
 
 
@@ -5005,19 +5695,24 @@ INDEX_HTML = r"""
      falsch (Ausschalten ist keine destruktive Loesch-Aktion). */
   .btn-mini.btn-delete{ color:var(--danger); border-color:#c0392b66; }
   .btn-mini.btn-delete:hover{ border-color:var(--danger); filter:brightness(1.15); }
-  /* MK6: main = #printerList - Karten-Layout wahlweise 1/2/3-spaltig,
-     siehe .cols-2/.cols-3 (per JS umgeschaltet, Wahl lokal gespeichert). */
+  /* MK6: main = #printerList - Karten-Layout wahlweise 1/2/3/4-spaltig
+     (4 seit v2.4.0), siehe .cols-2/.cols-3/.cols-4 (per JS umgeschaltet,
+     Wahl lokal gespeichert). */
   main{
     padding:28px 32px; max-width:1100px; margin:0 auto;
     display:grid; grid-template-columns:1fr; gap:22px; align-items:start;
   }
   main.cols-2{ max-width:1600px; grid-template-columns:repeat(2, 1fr); }
   main.cols-3{ max-width:2000px; grid-template-columns:repeat(3, 1fr); }
+  main.cols-4{ max-width:2400px; grid-template-columns:repeat(4, 1fr); }
+  @media(max-width:1500px){
+    main.cols-4{ grid-template-columns:repeat(3, 1fr); max-width:2000px; }
+  }
   @media(max-width:1150px){
-    main.cols-3{ grid-template-columns:repeat(2, 1fr); max-width:1600px; }
+    main.cols-3, main.cols-4{ grid-template-columns:repeat(2, 1fr); max-width:1600px; }
   }
   @media(max-width:760px){
-    main.cols-2, main.cols-3{ grid-template-columns:1fr; max-width:1100px; }
+    main.cols-2, main.cols-3, main.cols-4{ grid-template-columns:1fr; max-width:1100px; }
   }
   .layout-switch{
     display:flex; border:1px solid var(--border); border-radius:6px; overflow:hidden;
@@ -5294,6 +5989,62 @@ INDEX_HTML = r"""
   .error-msg{ color:var(--danger); font-size:12px; margin-bottom:10px; display:none;}
   .hint-text{ font-size:11px; color:var(--text-dim); margin:-8px 0 14px 0; line-height:1.4;}
 
+  /* v2.3.0: Einstellungen-Modus - eigener Bereich statt main-Grid, siehe
+     enterSettingsMode()/exitSettingsMode() sowie Markup direkt nach
+     <main id="printerList">. */
+  #settingsPanel{ padding:28px 32px; max-width:900px; margin:0 auto; }
+  .settings-section{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:20px 24px; margin-bottom:22px;
+  }
+  .settings-section h2{
+    font-size:14px; margin:0 0 10px 0; text-transform:uppercase; letter-spacing:0.5px;
+  }
+  .settings-section label{
+    font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px;
+    display:block; margin-bottom:6px;
+  }
+  .settings-section input, .settings-section select{
+    background:#0d1014; border:1px solid var(--border); color:var(--text);
+    padding:9px 10px; border-radius:6px; font-family:var(--mono); font-size:13px;
+  }
+  .settings-section input:focus, .settings-section select:focus{ outline:none; border-color:var(--accent); }
+  .settings-inline-form{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .settings-inline-form input{ flex:1; min-width:180px; }
+  .manage-row{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:10px 0; border-bottom:1px solid var(--border);
+  }
+  .manage-row:last-child{ border-bottom:none; }
+  .manage-row .manage-info{ font-size:13px; flex:1; min-width:0; }
+  .manage-row .manage-info .manage-sub{
+    color:var(--text-dim); font-size:11px; font-family:var(--mono); margin-top:2px;
+    word-break:break-all;
+  }
+  .manage-row .manage-actions{ display:flex; align-items:center; gap:6px; flex-shrink:0; }
+  .manage-row select{ max-width:160px; }
+  /* v2.3.0: Raum-Ueberschrift innerhalb des #printerList-Grids - main ist
+     selbst ein CSS-Grid (siehe main{display:grid;...} oben), daher
+     "grid-column:1/-1" fuer die volle Breite UND "display:contents" auf
+     dem Wrapper der zugehoerigen Druckerkarten (.room-group), damit diese
+     Karten weiterhin direkt als Grid-Elemente von main behandelt werden
+     (nicht als ein einzelnes grosses Element). */
+  .room-header{
+    grid-column:1/-1; font-family:var(--mono); font-size:12px; letter-spacing:1px;
+    text-transform:uppercase; color:var(--text-dim); padding-bottom:8px;
+    border-bottom:1px solid var(--border); margin-top:6px;
+  }
+  main .room-header:first-child{ margin-top:0; }
+  .room-group{ display:contents; }
+  /* v2.4.0: Kachel fuer eine externe RTSP-Kamera - bewusst schlanker als
+     .printer-card (keine Druckfunktionen), reiht sich aber als normales
+     Grid-Element genauso in main/.room-group ein. */
+  .camera-card{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:14px;
+  }
+  .camera-card .name{ font-size:15px; font-weight:600; }
+
   .cam-modal .modal{ width:auto; padding:0; overflow:hidden; }
   .cam-modal img{ display:block; max-width:90vw; max-height:80vh; background:#000; }
   .cam-modal .cam-close{
@@ -5370,19 +6121,158 @@ INDEX_HTML = r"""
 
 <header>
   <h1>Drucker<span>Dashboard</span> <span class="ver-badge" id="verBadge"></span></h1>
-  <div style="display:flex; align-items:center; gap:14px;">
-    <!-- MK6: Layout-Umschalter 1/2/3-spaltig, siehe setLayoutCols()/getLayoutCols() -->
+  <!-- v2.3.0: Bedien-Modus (Standard) - Drucker-/Raum-Verwaltung, MQTT-
+       Geraete-Verwaltung und Kamera-Verwaltung sind nur noch im
+       Einstellungen-Modus erreichbar (siehe enterSettingsMode()/
+       exitSettingsMode()); Layoutwahl und alle bisherigen Bedien-
+       funktionen auf den Kacheln selbst bleiben hier. v2.4.0: KEIN
+       gemeinsamer "Kameras"-Knopf mehr - externe RTSP-Kameras erscheinen
+       stattdessen als eigene Kachel direkt in der (Raum-)Ansicht, siehe
+       cardForCamera()/refresh(). -->
+  <div style="display:flex; align-items:center; gap:14px;" id="operatorControls">
+    <!-- MK6: Layout-Umschalter 1/2/3/4-spaltig, siehe setLayoutCols()/getLayoutCols() -->
     <div class="layout-switch" title="Kartenlayout">
       <button type="button" class="layout-btn" data-cols="1" onclick="setLayoutCols(1)">1</button>
       <button type="button" class="layout-btn" data-cols="2" onclick="setLayoutCols(2)">2</button>
       <button type="button" class="layout-btn" data-cols="3" onclick="setLayoutCols(3)">3</button>
+      <button type="button" class="layout-btn" data-cols="4" onclick="setLayoutCols(4)">4</button>
     </div>
-    <button class="btn btn-ghost" onclick="openMqttModal()">MQTT-Sensoren</button>
-    <button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button>
+    <button class="btn" onclick="enterSettingsMode()">&#9881; Einstellungen</button>
+  </div>
+  <div style="display:none; align-items:center; gap:14px;" id="settingsModeControls">
+    <button class="btn" onclick="exitSettingsMode()">&larr; Zur Bedienung</button>
+    <!-- v2.5.0: hierher verschoben (vorher im "Druckverlauf"-Abschnitt
+         weiter unten) - dort sah es so aus, als gehoere "Speichern" zum
+         Druckverlauf, dabei speichert es dort ausschliesslich das Feld
+         "Maximal gespeicherte Druckauftraege je Drucker" (siehe
+         saveHistorySettings()). Funktional unveraendert. -->
+    <button class="btn" onclick="saveHistorySettings()">Speichern</button>
   </div>
 </header>
 
 <main id="printerList"></main>
+
+<!-- v2.3.0: Einstellungen-Modus - Drucker-/Raum-/Kamera-Verwaltung sowie
+     Verlaufs-Einstellung, siehe enterSettingsMode()/refreshSettingsPanel().
+     Bewusst EIGENER Bereich statt eines weiteren Modals: mehrere
+     unabhaengige Listen (Drucker, Raeume, Kameras) gleichzeitig sichtbar
+     zu haben erleichtert das Zuweisen von Druckern zu Raeumen. -->
+<div id="settingsPanel" style="display:none;">
+
+  <div class="settings-section">
+    <h2>Drucker verwalten</h2>
+    <div class="hint-text">
+      Hinzufuegen, entfernen, einem Raum zuweisen und die Anzeige-
+      Reihenfolge aendern. Die Kamera-Anzeige und alle Druckfunktionen
+      bleiben im Bedien-Modus.
+    </div>
+    <button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button>
+    <div id="printerManageList" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="settings-section">
+    <h2>Raeume / Gruppen</h2>
+    <div class="hint-text">
+      Drucker koennen im Bedien-Modus nach Raum gruppiert angezeigt
+      werden. Ein geloeschter Raum loescht KEINE Drucker - sie erscheinen
+      danach unter "Ohne Raum".
+    </div>
+    <div class="settings-inline-form">
+      <input id="newGroupName" placeholder="Name des neuen Raums (z. B. Werkstatt)">
+      <button class="btn" onclick="createGroup()">+ Raum anlegen</button>
+    </div>
+    <div id="groupsManageList" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="settings-section">
+    <h2>Externe RTSP-Kameras</h2>
+    <div class="hint-text">
+      Zusaetzlich zu den Drucker-eigenen Kameras koennen beliebige weitere
+      RTSP(S)-Kameras hinterlegt werden (z. B. eine Raumuebersicht) - sie
+      erscheinen danach als eigene Kachel im Bedien-Modus, im zugewiesenen
+      Raum (oder unter "Ohne Raum"). Bei Bedarf mit eigener Anmeldung
+      (Benutzername/Passwort). Benoetigt FFmpeg (siehe README/
+      LINUX-INSTALL.md), genau wie die RTSPS-Kamera der X1/P1/P2/H2/X2-Serie.
+    </div>
+    <button class="btn" onclick="openCameraModal()">+ Kamera hinzufuegen</button>
+    <div id="camerasManageList" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="settings-section">
+    <h2>MQTT-Geraete (Sensoren/Schalter)</h2>
+    <div class="hint-text">
+      Zweiter, von den Druckern unabhaengiger MQTT-Broker fuer frei
+      definierte Sensoren (Anzeige eines Werts, mit Verlaufsdiagramm) und
+      Schaltflaechen (senden fester An-/Aus-Nachrichten) - wahlweise je
+      Drucker oder eigenstaendig (siehe "Kein Drucker" beim Anlegen).
+    </div>
+
+    <div class="field-label" style="margin-top:10px;">Broker-Einstellungen</div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="mq_enabled">
+      <label style="margin:0;">Aktiviert</label>
+    </div>
+    <label>Broker-Adresse</label>
+    <input id="mq_host" placeholder="192.168.1.5">
+    <label>Port</label>
+    <input id="mq_port" placeholder="1883">
+    <label>Benutzername (optional)</label>
+    <input id="mq_user" placeholder="">
+    <label>Passwort (optional, leer lassen = unveraendert)</label>
+    <input id="mq_pass" type="password" placeholder="">
+    <div class="checkbox-row">
+      <input type="checkbox" id="mq_tls">
+      <label style="margin:0;">TLS verwenden</label>
+    </div>
+    <div class="settings-inline-form" style="margin-top:4px;">
+      <button class="btn" onclick="saveExtrasMqttSettings()">Broker-Einstellungen speichern</button>
+    </div>
+    <div class="hint-text" id="mqttStatusHint" style="margin-top:4px;"></div>
+
+    <div class="field-label" style="margin-top:14px;">Sensoren &amp; Schalter</div>
+    <button class="btn" onclick="openAddMqttExtraModal()">+ Sensor/Schalter hinzufuegen</button>
+    <div id="mqttExtrasList" style="margin-top:14px;" class="hint-text">Noch keine Sensoren/Schalter angelegt.</div>
+  </div>
+
+  <div class="settings-section">
+    <h2>Druckverlauf</h2>
+    <label>Maximal gespeicherte Druckauftraege je Drucker (leer lassen = unbegrenzt)</label>
+    <input id="historyMaxJobsInput" style="max-width:160px;" placeholder="z. B. 30">
+    <div class="hint-text">
+      Wird ueber den "Speichern"-Knopf oben neben "&larr; Zur Bedienung"
+      gesichert (siehe dort) - gilt nur fuer dieses Feld.
+    </div>
+  </div>
+
+</div>
+
+<!-- Modal: externe RTSP-Kamera anlegen/bearbeiten (Einstellungen-Modus) -->
+<div class="modal-backdrop" id="cameraModal">
+  <div class="modal">
+    <h2 id="cameraModalTitle">Kamera hinzufuegen</h2>
+    <div class="error-msg" id="cameraModalError"></div>
+
+    <label>Name</label>
+    <input id="cam_name" placeholder="z. B. Werkstatt-Uebersicht">
+    <label>RTSP(S)-URL</label>
+    <input id="cam_url" placeholder="rtsp(s)://IP:Port/Pfad">
+    <div class="hint-text">
+      Ohne Zugangsdaten in der URL selbst - die beiden Felder unten
+      werden automatisch (inkl. Sonderzeichen) eingebaut.
+    </div>
+    <label>Benutzername (optional)</label>
+    <input id="cam_username" placeholder="nur falls die Kamera eine Anmeldung verlangt">
+    <label>Passwort (optional)</label>
+    <input id="cam_password" type="password" placeholder="nur falls die Kamera eine Anmeldung verlangt">
+    <label>Raum (optional)</label>
+    <select id="cam_group"><option value="">Kein Raum</option></select>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeCameraModal()">Abbrechen</button>
+      <button class="btn" onclick="submitCameraModal()">Speichern</button>
+    </div>
+  </div>
+</div>
 
 <!-- Modal: Drucker hinzufuegen -->
 <div class="modal-backdrop" id="addModal">
@@ -5486,39 +6376,27 @@ INDEX_HTML = r"""
   </div>
 </div>
 
-<!-- Modal: MQTT-Sensoren & Schalter (v2.2.15) - Broker-Einstellungen und
-     Sensor-/Schalter-Verwaltung je Drucker ueber die Web-Oberflaeche,
-     siehe README Abschnitt 2 -->
-<div class="modal-backdrop" id="mqttModal">
+<!-- Modal: MQTT-Sensor/Schalter anlegen/bearbeiten (Einstellungen-Modus).
+     v2.5.1: NUR noch dieses eine Formular ist ein Modal - die Broker-
+     Einstellungen und die Liste vorhandener Eintraege sitzen seitdem
+     inline im "MQTT-Geraete"-Abschnitt des Einstellungen-Modus, genau wie
+     bei "Drucker verwalten"/"Raeume"/"Externe RTSP-Kameras" (vorher
+     steckte der GESAMTE MQTT-Bereich - Broker-Einstellungen, Formular UND
+     Liste - hinter einem einzelnen "MQTT-Geraete verwalten"-Knopf in
+     einem grossen Modal, als einziger Abschnitt mit diesem abweichenden
+     Bedienkonzept). Entspricht strukturell #cameraModal. -->
+<div class="modal-backdrop" id="mqttExtraModal">
   <div class="modal mqtt-modal">
-    <h2>MQTT-Sensoren &amp; Schalter</h2>
+    <h2 id="mqttExtraModalTitle">Sensor/Schalter hinzufuegen</h2>
     <div class="error-msg" id="mqttError"></div>
 
-    <div class="field-label">Zweiter MQTT-Broker (unabhaengig von den Druckern)</div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="mq_enabled">
-      <label style="margin:0;">Aktiviert</label>
-    </div>
-    <label>Broker-Adresse</label>
-    <input id="mq_host" placeholder="192.168.1.5">
-    <label>Port</label>
-    <input id="mq_port" placeholder="1883">
-    <label>Benutzername (optional)</label>
-    <input id="mq_user" placeholder="">
-    <label>Passwort (optional, leer lassen = unveraendert)</label>
-    <input id="mq_pass" type="password" placeholder="">
-    <div class="checkbox-row">
-      <input type="checkbox" id="mq_tls">
-      <label style="margin:0;">TLS verwenden</label>
-    </div>
-    <div class="modal-actions" style="justify-content:flex-start; margin-bottom:6px;">
-      <button class="btn" onclick="saveExtrasMqttSettings()">Broker-Einstellungen speichern</button>
-    </div>
-    <div class="hint-text" id="mqttStatusHint" style="margin-top:-2px;"></div>
-
-    <div class="field-label" style="margin-top:10px;" id="mqttFormTitle">Neuen Eintrag hinzufuegen</div>
     <label>Drucker</label>
     <select id="mq_printer"></select>
+    <div class="hint-text" style="margin-top:-4px;">
+      "Kein Drucker (eigenstaendig)" legt einen Sensor/Schalter an, der zu
+      keinem Drucker gehoert - er erscheint danach als eigene Kachel im
+      Bedien-Modus.
+    </div>
     <label>Art</label>
     <select id="mq_kind" onchange="toggleMqttKindFields()">
       <option value="sensor">Sensor (Anzeige)</option>
@@ -5535,9 +6413,13 @@ INDEX_HTML = r"""
       <label>Anzeigebereich</label>
       <select id="mq_display">
         <option value="generic">Generisch (eigener Bereich "Sensoren &amp; Schalter")</option>
-        <option value="temperature">Bei Temperaturen anzeigen (mit Verlaufsdiagramm, wie Duese/Bett/Kammer)</option>
-        <option value="humidity">Bei Luftfeuchtigkeit anzeigen (mit Verlaufsdiagramm, wie AMS-Feuchte)</option>
+        <option value="temperature">Bei Temperaturen anzeigen (wie Duese/Bett/Kammer)</option>
+        <option value="humidity">Bei Luftfeuchtigkeit anzeigen (wie AMS-Feuchte)</option>
       </select>
+      <div class="hint-text" style="margin-top:-4px;">
+        Zeigt seit v2.5.1 IMMER ein Verlaufsdiagramm - diese Auswahl
+        entscheidet nur noch, WO der Sensor angezeigt wird.
+      </div>
     </div>
     <div id="mqttSwitchFields" style="display:none;">
       <label>Befehls-Topic</label>
@@ -5547,13 +6429,6 @@ INDEX_HTML = r"""
       <label>Payload "Aus"</label>
       <input id="mq_payload_off" placeholder="OFF">
     </div>
-    <div class="modal-actions" style="justify-content:flex-start;">
-      <button class="btn" id="mqttSubmitBtn" onclick="submitMqttExtra()">Hinzufuegen</button>
-      <button class="btn btn-ghost" id="mqttCancelEditBtn" style="display:none;" onclick="cancelMqttExtraEdit()">Bearbeiten abbrechen</button>
-    </div>
-
-    <div class="field-label" style="margin-top:14px;">Vorhandene Eintraege</div>
-    <div id="mqttExtrasList" class="hint-text">Noch keine Sensoren/Schalter angelegt.</div>
 
     <div class="field-label" style="margin-top:14px;">
       Zuletzt vom Broker empfangene Topics (anklicken, um das Topic-Feld zu uebernehmen)
@@ -5563,7 +6438,8 @@ INDEX_HTML = r"""
     </div>
 
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeMqttModal()">Schliessen</button>
+      <button class="btn btn-ghost" onclick="closeMqttExtraModal()">Abbrechen</button>
+      <button class="btn" id="mqttSubmitBtn" onclick="submitMqttExtra()">Hinzufuegen</button>
     </div>
   </div>
 </div>
@@ -5767,7 +6643,12 @@ async function submitAdd(){
     return;
   }
   closeAddModal();
-  refresh();
+  // v2.3.0: die "+ Drucker hinzufuegen"-Schaltflaeche ist jetzt nur noch
+  // im Einstellungen-Modus erreichbar - dort muss die Verwaltungsliste
+  // selbst aktualisiert werden, refresh() allein wuerde nur die (dort
+  // ausgeblendete) Bedienansicht aktualisieren.
+  if(settingsMode) refreshSettingsPanel();
+  else refresh();
 }
 
 // ----------------------------------------------------------------------
@@ -5787,11 +6668,16 @@ function toggleMqttKindFields(){
 
 function populateMqttPrinterSelect(selectedId){
   const sel = document.getElementById('mq_printer');
-  sel.innerHTML = lastPrinterList.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
-  if(selectedId) sel.value = selectedId;
+  // v2.5.0: zusaetzliche Option fuer einen Sensor/Schalter OHNE
+  // Druckerzuordnung (leerer Wert) - behebt den Fehler, dass sich ohne
+  // mindestens einen bestehenden Drucker ueberhaupt kein Sensor/Schalter
+  // anlegen liess (siehe submitMqttExtra()).
+  sel.innerHTML = '<option value="">Kein Drucker (eigenstaendig)</option>' +
+    lastPrinterList.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+  sel.value = selectedId || '';
 }
 
-function renderMqttExtrasList(){
+async function renderMqttExtrasList(){
   const list = document.getElementById('mqttExtrasList');
   const rows = [];
   lastPrinterList.forEach(p => {
@@ -5811,6 +6697,39 @@ function renderMqttExtrasList(){
         </div>
       </div>`);
     });
+  });
+  // v2.5.0: eigenstaendige (druckerunabhaengige) Eintraege - frisch vom
+  // Server geladen (nicht aus lastStandaloneExtrasList, damit die Liste
+  // auch direkt nach dem Anlegen/Bearbeiten/Loeschen sofort aktuell ist,
+  // ohne auf den naechsten regulaeren refresh()-Zyklus zu warten).
+  try{
+    const res = await fetch('/api/standalone_extras');
+    lastStandaloneExtrasList = await res.json();
+  } catch(e){ /* Liste bleibt auf dem letzten bekannten Stand */ }
+  lastStandaloneExtrasList.forEach(e => {
+    const displayLabel = { generic: 'Sensoren-Bereich', temperature: 'Temperaturen-Bereich', humidity: 'Feuchte-Bereich' }[e.display] || 'Sensoren-Bereich';
+    const sub = (e.kind === 'switch')
+      ? `Schalter &middot; Befehls-Topic: ${e.command_topic}`
+      : `Sensor &middot; Topic: ${e.topic}${e.unit ? ' &middot; Einheit: ' + e.unit : ''} &middot; Anzeige: ${displayLabel}`;
+    // v2.5.0: eigenstaendige Eintraege koennen, analog zu Druckern und
+    // externen Kameras, einem Raum zugewiesen werden, damit sie sich im
+    // Bedien-Modus sinnvoll einsortieren - ueber ein Dropdown direkt in
+    // dieser Zeile (lastGroupList ist bereits ueber refreshSettingsPanel()
+    // befuellt, bevor dieser Dialog aus dem Einstellungen-Modus heraus
+    // geoeffnet werden kann).
+    const groupOptions = '<option value="">Ohne Raum</option>' + lastGroupList.map(g =>
+      `<option value="${g.id}" ${e.group_id === g.id ? 'selected' : ''}>${g.name}</option>`).join('');
+    rows.push(`<div class="mqtt-extra-row">
+      <div class="mqtt-extra-info">
+        <div><b>${e.label}</b> (kein Drucker)</div>
+        <div class="mqtt-extra-sub">${sub}</div>
+      </div>
+      <div>
+        <select onchange="assignStandaloneExtraGroup('${e.id}', this.value)">${groupOptions}</select>
+        <button class="btn-mini" onclick="startEditMqttExtra('','${e.id}')">Bearbeiten</button>
+        <button class="btn-mini btn-delete" onclick="deleteMqttExtra('','${e.id}')">Loeschen</button>
+      </div>
+    </div>`);
   });
   list.innerHTML = rows.length ? rows.join('') : 'Noch keine Sensoren/Schalter angelegt.';
 }
@@ -5843,13 +6762,15 @@ function useDiscoveredTopic(topic){
   document.getElementById('mq_topic').value = topic;
 }
 
-async function openMqttModal(){
-  document.getElementById('mqttError').style.display = 'none';
-  document.getElementById('mqttStatusHint').textContent = '';
-  cancelMqttExtraEdit();
-  populateMqttPrinterSelect();
+// v2.5.1: laedt die Broker-Einstellungen in die jetzt INLINE im
+// "MQTT-Geraete"-Abschnitt sitzenden Felder und baut die Eintragsliste
+// auf - wird von refreshSettingsPanel() aufgerufen (wie
+// refreshPrinterManageList()/refreshGroupsManageList()/
+// refreshCamerasManageList()), nicht mehr erst beim Oeffnen eines
+// eigenen Modals (das gab es vor v2.5.1 nur fuer den MQTT-Bereich, als
+// einzigen Abschnitt mit abweichendem Bedienkonzept).
+async function refreshMqttSettingsSection(){
   renderMqttExtrasList();
-  refreshMqttDiscovered();
   try{
     const res = await fetch('/api/extras_mqtt');
     const cfg = await res.json();
@@ -5863,11 +6784,6 @@ async function openMqttModal(){
     // Broker-Einstellungen konnten nicht geladen werden - Formular
     // bleibt leer, Sensor-/Schalter-Verwaltung funktioniert trotzdem.
   }
-  document.getElementById('mqttModal').classList.add('show');
-}
-
-function closeMqttModal(){
-  document.getElementById('mqttModal').classList.remove('show');
 }
 
 async function saveExtrasMqttSettings(){
@@ -5881,21 +6797,23 @@ async function saveExtrasMqttSettings(){
   const pass = document.getElementById('mq_pass').value;
   if(pass !== '') body.password = pass; // leer gelassen = Passwort unveraendert (siehe Backend)
 
-  const res = await fetch('/api/extras_mqtt', {
-    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
-  });
-  const data = await res.json();
-  const err = document.getElementById('mqttError');
-  if(!res.ok){
-    err.textContent = data.error || 'Fehler beim Speichern.';
-    err.style.display = 'block';
+  let data;
+  try{
+    const res = await fetch('/api/extras_mqtt', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Fehler beim Speichern der Broker-Einstellungen.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Speichern der Broker-Einstellungen.', 'err');
     return;
   }
-  err.style.display = 'none';
   document.getElementById('mq_pass').value = '';
   document.getElementById('mqttStatusHint').textContent =
-    'Gespeichert - Verbindung wird neu aufgebaut. Empfangene Topics erscheinen nach kurzer Zeit unten.';
-  setTimeout(refreshMqttDiscovered, 3000);
+    'Gespeichert - Verbindung wird neu aufgebaut. Empfangene Topics erscheinen nach kurzer Zeit im Anlegen-Dialog.';
 }
 
 function resetMqttExtraForm(){
@@ -5907,24 +6825,47 @@ function resetMqttExtraForm(){
   document.getElementById('mq_cmd_topic').value = '';
   document.getElementById('mq_payload_on').value = '';
   document.getElementById('mq_payload_off').value = '';
+  document.getElementById('mq_kind').disabled = false;
+  document.getElementById('mq_printer').disabled = false;
   toggleMqttKindFields();
 }
 
-function cancelMqttExtraEdit(){
+// v2.5.1: oeffnet das Modal fuer einen NEUEN Eintrag - Gegenstueck zu
+// startEditMqttExtra() weiter unten (Bearbeiten). Ersetzt das bisherige
+// openMqttModal(), das zusaetzlich noch die Broker-Einstellungen und die
+// komplette Liste geladen hat - beides sitzt seit v2.5.1 bereits inline
+// im Einstellungen-Modus (siehe refreshMqttSettingsSection()).
+function openAddMqttExtraModal(){
   mqttEditState = null;
-  document.getElementById('mqttFormTitle').textContent = 'Neuen Eintrag hinzufuegen';
+  document.getElementById('mqttError').style.display = 'none';
+  document.getElementById('mqttExtraModalTitle').textContent = 'Sensor/Schalter hinzufuegen';
   document.getElementById('mqttSubmitBtn').textContent = 'Hinzufuegen';
-  document.getElementById('mqttCancelEditBtn').style.display = 'none';
-  document.getElementById('mq_kind').disabled = false;
-  document.getElementById('mq_printer').disabled = false;
   resetMqttExtraForm();
+  populateMqttPrinterSelect();
+  refreshMqttDiscovered();
+  document.getElementById('mqttExtraModal').classList.add('show');
+}
+
+function closeMqttExtraModal(){
+  document.getElementById('mqttExtraModal').classList.remove('show');
+  mqttEditState = null;
 }
 
 function startEditMqttExtra(printerId, extraId){
-  const p = lastPrinterList.find(x => x.id === printerId);
-  const e = p && (p.extras || []).find(x => x.id === extraId);
+  // v2.5.0: printerId === '' bedeutet "eigenstaendiger Eintrag ohne
+  // Drucker" - dann wird in lastStandaloneExtrasList statt in einem
+  // bestimmten Drucker nachgeschlagen (siehe renderMqttExtrasList()).
+  let e;
+  if(printerId){
+    const p = lastPrinterList.find(x => x.id === printerId);
+    e = p && (p.extras || []).find(x => x.id === extraId);
+  } else {
+    e = lastStandaloneExtrasList.find(x => x.id === extraId);
+  }
   if(!e) return;
   mqttEditState = { printerId, extraId };
+  document.getElementById('mqttError').style.display = 'none';
+  resetMqttExtraForm();
   populateMqttPrinterSelect(printerId);
   document.getElementById('mq_printer').disabled = true; // Zuordnung zum Drucker aendert sich beim Bearbeiten nicht
   document.getElementById('mq_kind').value = e.kind;
@@ -5940,9 +6881,10 @@ function startEditMqttExtra(printerId, extraId){
     document.getElementById('mq_unit').value = e.unit || '';
     document.getElementById('mq_display').value = e.display || 'generic';
   }
-  document.getElementById('mqttFormTitle').textContent = 'Eintrag bearbeiten';
+  document.getElementById('mqttExtraModalTitle').textContent = 'Eintrag bearbeiten';
   document.getElementById('mqttSubmitBtn').textContent = 'Aktualisieren';
-  document.getElementById('mqttCancelEditBtn').style.display = 'inline-block';
+  refreshMqttDiscovered();
+  document.getElementById('mqttExtraModal').classList.add('show');
 }
 
 async function submitMqttExtra(){
@@ -5963,20 +6905,27 @@ async function submitMqttExtra(){
 
   const err = document.getElementById('mqttError');
   let res;
+  // v2.5.0: ein leerer printerId-Wert ("Kein Drucker (eigenstaendig)")
+  // fuehrt jetzt zum neuen, druckerunabhaengigen Endpunkt statt zu einer
+  // wortlosen Fehlermeldung - behebt den gemeldeten Fehler, dass sich
+  // ohne Drucker-Zuordnung gar kein Sensor/Schalter anlegen liess.
   if(mqttEditState){
-    res = await fetch('/api/printers/' + mqttEditState.printerId + '/extras/' + mqttEditState.extraId, {
-      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
-    });
+    res = mqttEditState.printerId
+      ? await fetch('/api/printers/' + mqttEditState.printerId + '/extras/' + mqttEditState.extraId, {
+          method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+        })
+      : await fetch('/api/standalone_extras/' + mqttEditState.extraId, {
+          method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
   } else {
     const printerId = document.getElementById('mq_printer').value;
-    if(!printerId){
-      err.textContent = 'Bitte zuerst einen Drucker anlegen.';
-      err.style.display = 'block';
-      return;
-    }
-    res = await fetch('/api/printers/' + printerId + '/extras', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
-    });
+    res = printerId
+      ? await fetch('/api/printers/' + printerId + '/extras', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+        })
+      : await fetch('/api/standalone_extras', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
   }
   const data = await res.json();
   if(!res.ok){
@@ -5985,17 +6934,32 @@ async function submitMqttExtra(){
     return;
   }
   err.style.display = 'none';
-  cancelMqttExtraEdit();
+  closeMqttExtraModal();
   await refresh();
   renderMqttExtrasList();
 }
 
 async function deleteMqttExtra(printerId, extraId){
   if(!confirm('Diesen Eintrag wirklich loeschen?')) return;
-  await fetch('/api/printers/' + printerId + '/extras/' + extraId, { method:'DELETE' });
-  if(mqttEditState && mqttEditState.printerId === printerId && mqttEditState.extraId === extraId){
-    cancelMqttExtraEdit();
+  if(printerId){
+    await fetch('/api/printers/' + printerId + '/extras/' + extraId, { method:'DELETE' });
+  } else {
+    await fetch('/api/standalone_extras/' + extraId, { method:'DELETE' });
   }
+  if(mqttEditState && mqttEditState.printerId === printerId && mqttEditState.extraId === extraId){
+    closeMqttExtraModal();
+  }
+  await refresh();
+  renderMqttExtrasList();
+}
+
+// v2.5.0: Raum-Zuweisung eines eigenstaendigen Sensors/Schalters - siehe
+// renderMqttExtrasList() fuer das Dropdown, das dies aufruft.
+async function assignStandaloneExtraGroup(extraId, groupId){
+  await fetch('/api/standalone_extras/' + extraId + '/group', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ group_id: groupId || null })
+  });
   await refresh();
   renderMqttExtrasList();
 }
@@ -6003,13 +6967,26 @@ async function deleteMqttExtra(printerId, extraId){
 async function deletePrinter(id){
   if(!confirm('Diesen Drucker wirklich entfernen?')) return;
   await fetch('/api/printers/' + id, { method:'DELETE' });
-  refresh();
+  // v2.3.0: wird jetzt nur noch aus dem Einstellungen-Modus heraus
+  // aufgerufen (siehe refreshPrinterManageList()) - dort muss die
+  // Verwaltungsliste selbst aktualisiert werden, refresh() allein wuerde
+  // nur die (dort ausgeblendete) Bedienansicht aktualisieren.
+  if(settingsMode) refreshSettingsPanel();
+  else refresh();
 }
 
 function openCam(id){
+  openCamUrl('/camera/' + id + '?_=' + Date.now());
+}
+
+// v2.3.0: aus openCam(id) herausgezogen, damit dasselbe Anzeige-Modal
+// (inkl. Klartext-Fehleranzeige, siehe Kommentar unten) auch fuer die neuen,
+// vom Drucker unabhaengigen externen RTSP-Kameras genutzt werden kann
+// (siehe openExternalCam()) - reiner Code-Reuse, Verhalten fuer openCam(id)
+// selbst unveraendert.
+function openCamUrl(url){
   const img = document.getElementById('camImg');
   const errBox = document.getElementById('camError');
-  const url = '/camera/' + id + '?_=' + Date.now();
   errBox.style.display = 'none';
   errBox.textContent = '';
   img.style.display = '';
@@ -6487,6 +7464,14 @@ async function extraCommand(printerId, extraId, action){
   });
 }
 
+// v2.5.0: wie extraCommand(), fuer einen eigenstaendigen (nicht an einen
+// Drucker gebundenen) Schalter - siehe cardForStandaloneExtra().
+async function standaloneExtraCommand(extraId, action){
+  await fetch(`/api/standalone_extras/${extraId}/command`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})
+  });
+}
+
 // v2.0.1: JS-Spiegel von PRINTER_BUSY_STATES (app.py) - fuer
 // updateQueueSendButtonState() (nicht-Bambu-Zweig). Bei Aenderung dort
 // auch hier nachziehen.
@@ -6785,8 +7770,18 @@ function renderExtras(printerId, extras){
             <button class="btn-mini off" onclick="extraCommand('${printerId}','${e.id}','off')">Aus</button>
           </div>`;
         }
-        const val = (e.value === undefined || e.value === null || e.value === '') ? '–' : e.value;
-        return `<div class="extra-sensor"><span>${e.label}</span><b>${val}${e.unit ? ' ' + e.unit : ''}</b></div>`;
+        // v2.5.1: zeigt jetzt IMMER ein Verlaufsdiagramm (Sparkline), nicht
+        // nur bei "display": "temperature"/"humidity" (siehe extraChip()
+        // oben, dieselbe tempHistory-Infrastruktur, eigener Feld-
+        // Namensraum "extra_<id>") - nur bei tatsaechlich numerischem Wert
+        // (ein Text-Sensorwert wird weiterhin ohne Diagramm angezeigt).
+        const raw = e.value;
+        const num = (raw === undefined || raw === null || raw === '') ? NaN : Number(raw);
+        const isNumeric = Number.isFinite(num);
+        if(isNumeric) recordTempHistory(printerId, 'extra_' + e.id, num);
+        const history = (tempHistory[printerId] && tempHistory[printerId]['extra_' + e.id]) || [];
+        const val = isNumeric ? formatTemp(num) : ((raw === undefined || raw === null || raw === '') ? '–' : raw);
+        return `<div class="extra-sensor"><span>${e.label}</span><b>${val}${e.unit ? ' ' + e.unit : ''}</b>${isNumeric ? sparklineSvg(history) : ''}</div>`;
       }).join('')}
     </div>
   </div>`;
@@ -6797,31 +7792,159 @@ function renderExtras(printerId, extras){
 // damit dort eine aktuelle Auswahl an Ziel-Druckern zur Verfuegung steht.
 let lastPrinterList = [];
 
+// v2.3.0: zuletzt vom Server geladene Raumliste - analog zu lastPrinterList
+// fuer Stellen, die ohne erneuten Request darauf zugreifen (z. B. das
+// Zuweisen-Dropdown in refreshPrinterManageList()).
+let lastGroupList = [];
+// v2.3.0: wie lastGroupList, fuer renameGroup()/editRtspCamera() - dort
+// wird NICHT der Name/die URL als eingebetteter JS-String-Literal-Wert
+// ins onclick-Attribut geschrieben (koennte bei Anfuehrungszeichen im
+// Namen das HTML-Attribut vorzeitig beenden), sondern nur die ID - der
+// aktuelle Name/die URL wird beim Aufruf aus dieser Liste nachgeschlagen.
+let lastCamsList = [];
+
+// v2.5.0: wie lastCamsList, fuer eigenstaendige (nicht an einen Drucker
+// gebundene) MQTT-Sensoren/Schalter - siehe cardForStandaloneExtra() und
+// die Verwaltung im "MQTT-Geraete"-Abschnitt des Einstellungen-Modus
+// (renderMqttExtrasList()).
+let lastStandaloneExtrasList = [];
+
+function cardForPrinter(p){
+  if(p.type === 'octoprint') return renderOctoPrintCard(p);
+  if(p.type === 'formlabs' || p.type === 'formlabs_wash' || p.type === 'formlabs_cure') return renderFormlabsCard(p);
+  if(CREALITY_TYPES.includes(p.type)) return renderCrealityCard(p);
+  if(p.type === 'ultimaker') return renderUltimakerCard(p);
+  return renderBambuCard(p);
+}
+
+// v2.4.0: Kachel fuer eine externe RTSP-Kamera - erscheint (seit v2.4.0,
+// anstelle des vorherigen gemeinsamen "Kameras"-Knopfs/-Modals) direkt als
+// eigenes Grid-Element neben den Drucker-Karten, im jeweils zugewiesenen
+// Raum. Zeigt bewusst nur Name + Kamera-Symbol (keine Druckfunktionen).
+function cardForCamera(c){
+  return `
+    <div class="camera-card">
+      <div>
+        <span class="name">${c.name}</span>
+        <span class="type-badge">Kamera</span>
+      </div>
+      <div class="cam-icon" title="Kamera anzeigen" onclick="openExternalCam('${c.id}')">${CAM_ICON}</div>
+    </div>`;
+}
+
+// v2.5.0: Kachel fuer einen eigenstaendigen (nicht an einen Drucker
+// gebundenen) MQTT-Sensor/Schalter - erscheint, analog zur Kamera-Kachel,
+// direkt als eigenes Grid-Element im jeweils zugewiesenen Raum. Ein
+// Schalter zeigt dieselben Ein/Aus-Knoepfe wie im druckergebundenen Fall
+// (siehe renderExtras()), nur ueber standaloneExtraCommand() statt
+// extraCommand() (anderer, druckerunabhaengiger Endpunkt).
+function cardForStandaloneExtra(e){
+  if(e.kind === 'switch'){
+    return `
+      <div class="camera-card">
+        <div>
+          <span class="name">${e.label}</span>
+          <span class="type-badge">Schalter</span>
+        </div>
+        <div>
+          <button class="btn-mini" onclick="standaloneExtraCommand('${e.id}','on')">Ein</button>
+          <button class="btn-mini off" onclick="standaloneExtraCommand('${e.id}','off')">Aus</button>
+        </div>
+      </div>`;
+  }
+  // v2.5.1: Verlaufsdiagramm (Sparkline) auch fuer eigenstaendige Sensoren
+  // - dieselbe tempHistory-Infrastruktur wie bei druckergebundenen Extras
+  // (renderExtras()), nur unter einem eigenen, druckerunabhaengigen
+  // "Pseudo-Drucker"-Schluessel "__standalone__" einsortiert, damit sich
+  // eigenstaendige und druckergebundene Sensor-IDs nicht ueberschneiden
+  // koennen.
+  const raw = e.value;
+  const num = (raw === undefined || raw === null || raw === '') ? NaN : Number(raw);
+  const isNumeric = Number.isFinite(num);
+  if(isNumeric) recordTempHistory('__standalone__', 'extra_' + e.id, num);
+  const history = (tempHistory['__standalone__'] && tempHistory['__standalone__']['extra_' + e.id]) || [];
+  const val = isNumeric ? formatTemp(num) : ((raw === undefined || raw === null || raw === '') ? '–' : raw);
+  return `
+    <div class="camera-card">
+      <div>
+        <span class="name">${e.label}</span>
+        <span class="type-badge">Sensor</span>
+      </div>
+      <div><b>${val}${e.unit ? ' ' + e.unit : ''}</b>${isNumeric ? sparklineSvg(history) : ''}</div>
+    </div>`;
+}
+
 async function refresh(){
-  const res = await fetch('/api/status');
-  const printers = await res.json();
+  const [printers, groups, cams, standaloneExtras] = await Promise.all([
+    fetch('/api/status').then(r => r.json()),
+    fetch('/api/groups').then(r => r.json()).catch(() => lastGroupList),
+    fetch('/api/rtsp-cameras').then(r => r.json()).catch(() => lastCamsList),
+    fetch('/api/standalone_extras').then(r => r.json()).catch(() => lastStandaloneExtrasList)
+  ]);
   lastPrinterList = printers;
+  lastGroupList = groups;
+  lastCamsList = cams;
+  lastStandaloneExtrasList = standaloneExtras;
   // v2.0.1: haelt den "Druckraum leer"-Knopf live aktuell, falls die
   // Warteschlange gerade offen ist (z. B. der Nutzer wartet darauf, dass
   // ein Bambu-Lab-Drucker fertig wird, ohne das Modal zu schliessen).
   if(queueModalPrinterId) updateQueueSendButtonState();
   const list = document.getElementById('printerList');
 
-  if(printers.length === 0){
+  if(printers.length === 0 && cams.length === 0 && standaloneExtras.length === 0){
     list.innerHTML = `<div class="empty-state">
       Noch keine Drucker hinterlegt.
-      <div><button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button></div>
+      <div><button class="btn" onclick="enterSettingsMode()">+ Drucker hinzufuegen</button></div>
     </div>`;
     return;
   }
 
-  list.innerHTML = printers.map(p => {
-    if(p.type === 'octoprint') return renderOctoPrintCard(p);
-    if(p.type === 'formlabs' || p.type === 'formlabs_wash' || p.type === 'formlabs_cure') return renderFormlabsCard(p);
-    if(CREALITY_TYPES.includes(p.type)) return renderCrealityCard(p);
-    if(p.type === 'ultimaker') return renderUltimakerCard(p);
-    return renderBambuCard(p);
-  }).join('');
+  // v2.3.0/v2.4.0/v2.5.0: ohne angelegte Raeume unveraendertes Verhalten
+  // (flache Liste, sortiert nach "order", Drucker vor Kameras vor
+  // eigenstaendigen Sensoren/Schaltern) - mit Raeumen wird nach Raum
+  // gruppiert angezeigt (Drucker, Kameras UND eigenstaendige Sensoren/
+  // Schalter koennen alle einem Raum zugewiesen werden), leere Raeume
+  // werden im Bedien-Modus nicht angezeigt (siehe Kommentar bei
+  // .room-header/.room-group).
+  const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
+  if(groups.length === 0){
+    list.innerHTML = printers.slice().sort(byOrder).map(cardForPrinter).join('') +
+                      cams.slice().sort(byOrder).map(cardForCamera).join('') +
+                      standaloneExtras.slice().sort(byOrder).map(cardForStandaloneExtra).join('');
+    return;
+  }
+  const printersByGroup = {};
+  printers.forEach(p => {
+    const gid = p.group_id || '__none__';
+    (printersByGroup[gid] = printersByGroup[gid] || []).push(p);
+  });
+  const camsByGroup = {};
+  cams.forEach(c => {
+    const gid = c.group_id || '__none__';
+    (camsByGroup[gid] = camsByGroup[gid] || []).push(c);
+  });
+  const standaloneByGroup = {};
+  standaloneExtras.forEach(e => {
+    const gid = e.group_id || '__none__';
+    (standaloneByGroup[gid] = standaloneByGroup[gid] || []).push(e);
+  });
+  let html = '';
+  groups.forEach(g => {
+    const pMembers = (printersByGroup[g.id] || []).slice().sort(byOrder);
+    const cMembers = (camsByGroup[g.id] || []).slice().sort(byOrder);
+    const eMembers = (standaloneByGroup[g.id] || []).slice().sort(byOrder);
+    if(pMembers.length === 0 && cMembers.length === 0 && eMembers.length === 0) return;
+    html += `<div class="room-header">${g.name}</div>`;
+    html += `<div class="room-group">${pMembers.map(cardForPrinter).join('')}${cMembers.map(cardForCamera).join('')}${eMembers.map(cardForStandaloneExtra).join('')}</div>`;
+  });
+  const pUngrouped = (printersByGroup['__none__'] || []).slice().sort(byOrder);
+  const cUngrouped = (camsByGroup['__none__'] || []).slice().sort(byOrder);
+  const eUngrouped = (standaloneByGroup['__none__'] || []).slice().sort(byOrder);
+  if(pUngrouped.length || cUngrouped.length || eUngrouped.length){
+    html += `<div class="room-header">Ohne Raum</div>`;
+    html += `<div class="room-group">${pUngrouped.map(cardForPrinter).join('')}${cUngrouped.map(cardForCamera).join('')}${eUngrouped.map(cardForStandaloneExtra).join('')}</div>`;
+  }
+  list.innerHTML = html;
 }
 
 function renderBambuCard(p){
@@ -6842,7 +7965,6 @@ function renderBambuCard(p){
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
           ${renderQueueIcon(p)}
-          <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
       <div class="card-body">
@@ -7219,7 +8341,6 @@ function renderOctoPrintCard(p){
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
-          <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
       <div class="card-body">
@@ -7269,7 +8390,6 @@ function renderCrealityCard(p){
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
-          <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
       <div class="card-body">
@@ -7320,7 +8440,6 @@ function renderUltimakerCard(p){
           <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
           ${renderQueueIcon(p)}
-          <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
       <div class="card-body">
@@ -7505,7 +8624,6 @@ function renderFormlabsCard(p){
         <div class="head-right">
           <span class="state-badge ${stateClass(p.device_status)}">${p.device_status || 'UNKNOWN'}</span>
           <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
-          <div class="del-icon" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</div>
         </div>
       </div>
       <div class="card-body single-col">
@@ -7545,24 +8663,403 @@ async function loadVersion(){
   } catch(e){ /* Version ist rein informativ - Fehler hier ignorieren */ }
 }
 
-// MK6: Kartenlayout 1/2/3-spaltig, Auswahl wird lokal im Browser gemerkt
-// (localStorage) - reine Anzeige-Praeferenz, kein Server-/config.json-Zustand,
-// da jeder Nutzer/Browser sein eigenes Layout haben kann.
+// MK6: Kartenlayout 1/2/3/4-spaltig (4 seit v2.4.0), Auswahl wird lokal im
+// Browser gemerkt (localStorage) - reine Anzeige-Praeferenz, kein Server-/
+// config.json-Zustand, da jeder Nutzer/Browser sein eigenes Layout haben kann.
 function getLayoutCols(){
   try{
     const v = parseInt(localStorage.getItem('dashboardLayoutCols'), 10);
-    return [1,2,3].includes(v) ? v : 1;
+    return [1,2,3,4].includes(v) ? v : 1;
   } catch(e){ return 1; }
 }
 function setLayoutCols(cols){
   const list = document.getElementById('printerList');
-  list.classList.remove('cols-2','cols-3');
+  list.classList.remove('cols-2','cols-3','cols-4');
   if(cols === 2) list.classList.add('cols-2');
   if(cols === 3) list.classList.add('cols-3');
+  if(cols === 4) list.classList.add('cols-4');
   document.querySelectorAll('.layout-btn').forEach(b=>{
     b.classList.toggle('active', parseInt(b.dataset.cols,10) === cols);
   });
   try{ localStorage.setItem('dashboardLayoutCols', String(cols)); } catch(e){ /* z.B. privater Modus - Auswahl bleibt dann nur fuer diese Sitzung aktiv */ }
+}
+
+// v2.4.0: kein gemeinsames Kameras-Modal mehr - externe RTSP-Kameras
+// erscheinen als eigene Kachel (siehe cardForCamera()); die Anzeige selbst
+// laeuft weiterhin ueber dasselbe Kamera-Modal wie die Drucker-Kamera
+// (openCamUrl()).
+function openExternalCam(camId){
+  openCamUrl('/camera/rtsp/' + camId + '?_=' + Date.now());
+}
+
+// ----------------------------------------------------------------------
+// v2.3.0: Einstellungen-Modus - Drucker-/Raum-/Kamera-Verwaltung sowie
+// Verlaufs-Einstellung. Siehe #settingsPanel-Markup sowie die Backend-
+// Routen /api/groups, /api/rtsp-cameras, /api/printers/reorder,
+// /api/printers/<id>/group, /api/settings.
+// ----------------------------------------------------------------------
+let settingsMode = false;
+
+function enterSettingsMode(){
+  settingsMode = true;
+  document.getElementById('operatorControls').style.display = 'none';
+  document.getElementById('settingsModeControls').style.display = 'flex';
+  document.getElementById('printerList').style.display = 'none';
+  document.getElementById('settingsPanel').style.display = 'block';
+  refreshSettingsPanel();
+}
+function exitSettingsMode(){
+  settingsMode = false;
+  document.getElementById('operatorControls').style.display = 'flex';
+  document.getElementById('settingsModeControls').style.display = 'none';
+  document.getElementById('printerList').style.display = '';
+  document.getElementById('settingsPanel').style.display = 'none';
+  refresh();
+}
+
+async function refreshSettingsPanel(){
+  let printers, groups, cams, settings;
+  try{
+    [printers, groups, cams, settings] = await Promise.all([
+      fetch('/api/status').then(r => r.json()),
+      fetch('/api/groups').then(r => r.json()),
+      fetch('/api/rtsp-cameras').then(r => r.json()),
+      fetch('/api/settings').then(r => r.json()),
+    ]);
+  } catch(e){
+    showToast('Einstellungen konnten nicht geladen werden.', 'err');
+    return;
+  }
+  lastPrinterList = printers;
+  lastGroupList = groups;
+  refreshPrinterManageList(printers, groups);
+  refreshGroupsManageList(groups);
+  refreshCamerasManageList(cams, groups);
+  // v2.5.1: MQTT-Bereich jetzt inline statt in einem eigenen Modal - wird
+  // hier wie die anderen Verwaltungslisten mit aktualisiert (lastGroupList
+  // ist zu diesem Zeitpunkt bereits befuellt, siehe renderMqttExtrasList()
+  // fuer die dortige Raum-Zuweisung eigenstaendiger Eintraege).
+  refreshMqttSettingsSection();
+  const histInput = document.getElementById('historyMaxJobsInput');
+  histInput.value = (settings.history_max_jobs === null || settings.history_max_jobs === undefined)
+    ? '' : settings.history_max_jobs;
+}
+
+function refreshPrinterManageList(printers, groups){
+  const el = document.getElementById('printerManageList');
+  if(!printers.length){
+    el.innerHTML = '<div class="hint-text">Noch keine Drucker hinterlegt.</div>';
+    return;
+  }
+  const sorted = printers.slice().sort((a,b) => (a.order||0) - (b.order||0));
+  const groupOptions = currentGroupId => groups.map(gr =>
+    `<option value="${gr.id}" ${currentGroupId === gr.id ? 'selected' : ''}>${gr.name}</option>`).join('');
+  el.innerHTML = sorted.map((p, i) => `
+    <div class="manage-row">
+      <div class="queue-order-btns">
+        <button class="btn-mini" ${i === 0 ? 'disabled' : ''} title="Nach oben" onclick="movePrinterOrder('${p.id}',-1)">&uarr;</button>
+        <button class="btn-mini" ${i === sorted.length - 1 ? 'disabled' : ''} title="Nach unten" onclick="movePrinterOrder('${p.id}',1)">&darr;</button>
+      </div>
+      <div class="manage-info">
+        ${p.name}
+        <div class="manage-sub">${p.ip} &middot; ${p.type}</div>
+      </div>
+      <div class="manage-actions">
+        <select onchange="assignPrinterGroup('${p.id}', this.value)">
+          <option value="">Kein Raum</option>
+          ${groupOptions(p.group_id)}
+        </select>
+        <button class="btn-mini btn-delete" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</button>
+      </div>
+    </div>`).join('');
+}
+
+async function movePrinterOrder(printerId, direction){
+  const ids = lastPrinterList.slice().sort((a,b) => (a.order||0) - (b.order||0)).map(p => p.id);
+  const idx = ids.indexOf(printerId);
+  const newIdx = idx + direction;
+  if(idx < 0 || newIdx < 0 || newIdx >= ids.length) return;
+  [ids[idx], ids[newIdx]] = [ids[newIdx], ids[idx]];
+  try{
+    const res = await fetch('/api/printers/reorder', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({order: ids})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Reihenfolge konnte nicht geaendert werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  refreshSettingsPanel();
+}
+
+async function assignPrinterGroup(printerId, groupId){
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/group', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({group_id: groupId || null})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Raum konnte nicht zugewiesen werden.', 'err');
+    }
+  } catch(e){
+    showToast('Netzwerkfehler bei der Raum-Zuweisung.', 'err');
+  }
+  refreshSettingsPanel();
+}
+
+function refreshGroupsManageList(groups){
+  const el = document.getElementById('groupsManageList');
+  if(!groups.length){
+    el.innerHTML = '<div class="hint-text">Noch keine Raeume angelegt.</div>';
+    return;
+  }
+  const sorted = groups.slice().sort((a,b) => (a.order||0) - (b.order||0));
+  el.innerHTML = sorted.map((g, i) => `
+    <div class="manage-row">
+      <div class="queue-order-btns">
+        <button class="btn-mini" ${i === 0 ? 'disabled' : ''} title="Nach oben" onclick="moveGroupOrder('${g.id}',-1)">&uarr;</button>
+        <button class="btn-mini" ${i === sorted.length - 1 ? 'disabled' : ''} title="Nach unten" onclick="moveGroupOrder('${g.id}',1)">&darr;</button>
+      </div>
+      <div class="manage-info">${g.name}</div>
+      <div class="manage-actions">
+        <button class="btn-mini" title="Umbenennen" onclick="renameGroup('${g.id}')">Umbenennen</button>
+        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteGroup('${g.id}')">&times;</button>
+      </div>
+    </div>`).join('');
+}
+
+async function createGroup(){
+  const input = document.getElementById('newGroupName');
+  const name = input.value.trim();
+  if(!name){ showToast('Bitte einen Namen fuer den Raum eingeben.', 'err'); return; }
+  try{
+    const res = await fetch('/api/groups', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Raum konnte nicht angelegt werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Anlegen des Raums.', 'err');
+    return;
+  }
+  input.value = '';
+  refreshSettingsPanel();
+}
+
+async function renameGroup(groupId){
+  const current = lastGroupList.find(g => g.id === groupId);
+  const name = window.prompt('Neuer Name fuer den Raum:', current ? current.name : '');
+  if(name === null) return;
+  const trimmed = name.trim();
+  if(!trimmed) return;
+  try{
+    const res = await fetch('/api/groups/' + groupId, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: trimmed})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Raum konnte nicht umbenannt werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Umbenennen.', 'err');
+    return;
+  }
+  refreshSettingsPanel();
+}
+
+async function deleteGroup(groupId){
+  if(!window.confirm('Diesen Raum wirklich entfernen? Zugewiesene Drucker werden NICHT geloescht, ' +
+                      'nur die Raum-Zuordnung wird entfernt (erscheinen danach unter "Ohne Raum").')) return;
+  try{
+    await fetch('/api/groups/' + groupId, { method:'DELETE' });
+  } catch(e){
+    showToast('Netzwerkfehler beim Entfernen des Raums.', 'err');
+  }
+  refreshSettingsPanel();
+}
+
+async function moveGroupOrder(groupId, direction){
+  const ids = lastGroupList.slice().sort((a,b) => (a.order||0) - (b.order||0)).map(g => g.id);
+  const idx = ids.indexOf(groupId);
+  const newIdx = idx + direction;
+  if(idx < 0 || newIdx < 0 || newIdx >= ids.length) return;
+  [ids[idx], ids[newIdx]] = [ids[newIdx], ids[idx]];
+  try{
+    const res = await fetch('/api/groups/reorder', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({order: ids})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Reihenfolge konnte nicht geaendert werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  refreshSettingsPanel();
+}
+
+function refreshCamerasManageList(cams, groups){
+  lastCamsList = cams;
+  const el = document.getElementById('camerasManageList');
+  if(!cams.length){
+    el.innerHTML = '<div class="hint-text">Noch keine externen Kameras hinterlegt.</div>';
+    return;
+  }
+  const groupOptions = currentGroupId => groups.map(gr =>
+    `<option value="${gr.id}" ${currentGroupId === gr.id ? 'selected' : ''}>${gr.name}</option>`).join('');
+  el.innerHTML = cams.slice().sort((a,b) => (a.order||0) - (b.order||0)).map(c => `
+    <div class="manage-row">
+      <div class="manage-info">
+        ${c.name}
+        <div class="manage-sub">${c.url}${c.username ? ' &middot; Anmeldung hinterlegt' : ''}</div>
+      </div>
+      <div class="manage-actions">
+        <select onchange="assignCameraGroup('${c.id}', this.value)">
+          <option value="">Kein Raum</option>
+          ${groupOptions(c.group_id)}
+        </select>
+        <button class="btn-mini" title="Anzeigen" onclick="openExternalCam('${c.id}')">Anzeigen</button>
+        <button class="btn-mini" title="Bearbeiten" onclick="openCameraModal('${c.id}')">Bearbeiten</button>
+        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteRtspCamera('${c.id}')">&times;</button>
+      </div>
+    </div>`).join('');
+}
+
+async function assignCameraGroup(camId, groupId){
+  try{
+    const res = await fetch('/api/rtsp-cameras/' + camId + '/group', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({group_id: groupId || null})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Raum konnte nicht zugewiesen werden.', 'err');
+    }
+  } catch(e){
+    showToast('Netzwerkfehler bei der Raum-Zuweisung.', 'err');
+  }
+  refreshSettingsPanel();
+}
+
+// v2.4.0: EIN Modal fuer Anlegen UND Bearbeiten einer externen RTSP-
+// Kamera (statt der vorherigen window.prompt()-Kette) - noetig, weil seit
+// v2.4.0 zusaetzlich Benutzername/Passwort UND eine Raum-Auswahl erfasst
+// werden sollen, was per prompt() nicht mehr vernuenftig bedienbar waere.
+// camId gesetzt = Bearbeiten (Felder vorausgefuellt aus lastCamsList),
+// sonst Anlegen.
+let cameraModalEditId = null;
+
+function openCameraModal(camId){
+  cameraModalEditId = camId || null;
+  const cam = camId ? lastCamsList.find(c => c.id === camId) : null;
+  document.getElementById('cameraModalTitle').textContent = cam ? 'Kamera bearbeiten' : 'Kamera hinzufuegen';
+  document.getElementById('cameraModalError').style.display = 'none';
+  document.getElementById('cam_name').value = cam ? cam.name : '';
+  document.getElementById('cam_url').value = cam ? cam.url : '';
+  document.getElementById('cam_username').value = cam ? (cam.username || '') : '';
+  document.getElementById('cam_password').value = cam ? (cam.password || '') : '';
+  const groupSelect = document.getElementById('cam_group');
+  groupSelect.innerHTML = '<option value="">Kein Raum</option>' +
+    lastGroupList.map(g => `<option value="${g.id}" ${cam && cam.group_id === g.id ? 'selected' : ''}>${g.name}</option>`).join('');
+  document.getElementById('cameraModal').classList.add('show');
+}
+function closeCameraModal(){
+  document.getElementById('cameraModal').classList.remove('show');
+  cameraModalEditId = null;
+}
+
+async function submitCameraModal(){
+  const name = document.getElementById('cam_name').value.trim();
+  const url = document.getElementById('cam_url').value.trim();
+  const username = document.getElementById('cam_username').value.trim();
+  const password = document.getElementById('cam_password').value;
+  const groupId = document.getElementById('cam_group').value;
+  const errBox = document.getElementById('cameraModalError');
+  errBox.style.display = 'none';
+  if(!name || !url){
+    errBox.textContent = 'Name und RTSP(S)-URL sind Pflichtfelder.';
+    errBox.style.display = 'block';
+    return;
+  }
+  const isEdit = !!cameraModalEditId;
+  // v2.4.0: beim Anlegen nimmt POST /api/rtsp-cameras group_id direkt
+  // entgegen (ein Request genuegt); PUT (Bearbeiten) aendert die Raum-
+  // Zuordnung bewusst NICHT mit, um ein versehentliches Leeren beim
+  // Weglassen des Felds auszuschliessen - dafuer dort die eigene Route
+  // (wie bei Druckern/assignPrinterGroup), daher der zweite Aufruf unten.
+  const body = isEdit ? { name, url, username, password } : { name, url, username, password, group_id: groupId || null };
+  const endpoint = isEdit ? '/api/rtsp-cameras/' + cameraModalEditId : '/api/rtsp-cameras';
+  let res, data;
+  try{
+    res = await fetch(endpoint, {
+      method: isEdit ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    data = await res.json().catch(() => ({}));
+  } catch(e){
+    errBox.textContent = 'Netzwerkfehler beim Speichern der Kamera.';
+    errBox.style.display = 'block';
+    return;
+  }
+  if(!res.ok){
+    errBox.textContent = data.error || 'Kamera konnte nicht gespeichert werden.';
+    errBox.style.display = 'block';
+    return;
+  }
+  if(isEdit){
+    await fetch('/api/rtsp-cameras/' + cameraModalEditId + '/group', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({group_id: groupId || null})
+    });
+  }
+  closeCameraModal();
+  refreshSettingsPanel();
+}
+
+async function deleteRtspCamera(camId){
+  if(!window.confirm('Diese Kamera wirklich entfernen?')) return;
+  try{
+    await fetch('/api/rtsp-cameras/' + camId, { method:'DELETE' });
+  } catch(e){
+    showToast('Netzwerkfehler beim Entfernen der Kamera.', 'err');
+  }
+  refreshSettingsPanel();
+}
+
+async function saveHistorySettings(){
+  const raw = document.getElementById('historyMaxJobsInput').value.trim();
+  let value = null;
+  if(raw !== ''){
+    const n = parseInt(raw, 10);
+    if(isNaN(n) || n < 0){
+      showToast("Bitte eine positive ganze Zahl oder leer lassen (unbegrenzt).", 'err');
+      return;
+    }
+    value = n;
+  }
+  try{
+    const res = await fetch('/api/settings', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({history_max_jobs: value})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Einstellung konnte nicht gespeichert werden.', 'err');
+      return;
+    }
+    showToast('Einstellung gespeichert.', 'ok');
+  } catch(e){
+    showToast('Netzwerkfehler beim Speichern.', 'err');
+  }
 }
 
 setLayoutCols(getLayoutCols());

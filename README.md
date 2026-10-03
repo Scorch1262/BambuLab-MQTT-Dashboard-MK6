@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.2.28).
+> den aktuellen Stand (v2.5.1).
 
 ---
 
@@ -33,6 +33,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [4. Bambu Lab: Drag & Drop drucken](#4-bambu-lab-drag--drop-drucken)
 - [5. Temperatur/Feuchte/Druckzeit-Anzeigen](#5-temperaturfeuchtedruckzeit-anzeigen)
 - [6. Grenzen & Hinweise](#6-grenzen--hinweise)
+- [7. Bedien-/Einstellungsmodus, Raeume & externe Kameras (seit v2.3.0)](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)
 
 ---
 
@@ -139,25 +140,34 @@ wird:
 
 **Eigene Sensoren/Schalter** ueber einen zweiten, von den Druckern
 unabhaengigen MQTT-Broker (z. B. Home Assistant/Mosquitto) lassen sich
-komplett ueber den Button **"MQTT-Sensoren"** oben im Kopfbereich
-einrichten - kein manuelles Bearbeiten der `config.json` mehr noetig:
+komplett im Abschnitt **"MQTT-Geraete (Sensoren/Schalter)"** des
+Einstellungen-Modus (seit v2.3.0, seit v2.5.1 inline statt hinter einem
+eigenen Knopf - siehe
+[Abschnitt 7](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230);
+vor v2.3.0 direkt im Kopfbereich als "MQTT-Sensoren") einrichten - kein
+manuelles Bearbeiten der `config.json` mehr noetig:
 
 1. Broker-Adresse/Port/Zugangsdaten eintragen und speichern - die
    Verbindung wird sofort (ohne Neustart) aufgebaut.
-2. Unten im selben Dialog erscheinen die **zuletzt tatsaechlich vom
-   Broker empfangenen Topics** zur Kontrolle/zum Uebernehmen per Klick -
-   der haeufigste Stolperstein (ein falsch abgetipptes Topic) faellt
-   damit weg.
-3. Drucker, Art (**Sensor** = reine Anzeige, **Schalter** = Ein/Aus-
-   Buttons) und die zugehoerigen Felder (Topic + Einheit bzw.
-   Befehls-Topic + Payloads) auswaehlen/eintragen und hinzufuegen -
-   Bearbeiten/Loeschen bestehender Eintraege direkt in derselben Liste.
-4. Bei einem Sensor zusaetzlich den **Anzeigebereich** waehlen:
+2. Ueber **"+ Sensor/Schalter hinzufuegen"** einen Eintrag anlegen:
+   Drucker (oder **"Kein Drucker (eigenstaendig)"**, seit v2.5.0 - siehe
+   [Abschnitt 7](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)),
+   Art (**Sensor** = reine Anzeige, **Schalter** = Ein/Aus-Buttons) und
+   die zugehoerigen Felder (Topic + Einheit bzw. Befehls-Topic +
+   Payloads) auswaehlen/eintragen. Im selben Dialog erscheinen die
+   **zuletzt tatsaechlich vom Broker empfangenen Topics** zur
+   Kontrolle/zum Uebernehmen per Klick - der haeufigste Stolperstein (ein
+   falsch abgetipptes Topic) faellt damit weg. Bearbeiten/Loeschen
+   bestehender Eintraege direkt in der Liste im Einstellungen-Bereich.
+3. Bei einem Sensor zusaetzlich den **Anzeigebereich** waehlen:
    "Generisch" zeigt ihn wie bisher unten im Bereich "Sensoren &
    Schalter"; **"Temperatur"** oder **"Luftfeuchtigkeit"** platziert ihn
    stattdessen direkt in der Temperaturen-Zeile der Karte, GENAUSO wie
    die vom Drucker selbst gelieferten Werte (Duese/Bett/Kammer bzw.
-   AMS-Feuchte) - inklusive derselben kleinen Verlaufsdiagramm-Sparkline.
+   AMS-Feuchte). Seit v2.5.1 zeigt **jeder** Sensor, unabhaengig vom
+   gewaehlten Anzeigebereich, ein kleines Verlaufsdiagramm
+   (Sparkline) - die Auswahl entscheidet seitdem nur noch, WO er
+   angezeigt wird.
 
 Alternativ weiterhin per Hand in `config.json` moeglich (Beispiel in
 `config.example.json`, Felder `extras_mqtt` global + `extras`-Liste je
@@ -173,11 +183,13 @@ einen anderen Drucker gleichen Typs/Familie), **Loeschen**. Erneutes
 Senden an denselben Drucker aktualisiert nur den Zeitstempel (kein
 doppelter Eintrag). Automatisch begrenzt auf die Anzahl aus
 `"history_max_jobs"` in `config.json` (Standardwert 30, je Drucker
-separat gezaehlt) - als Wert geht eine positive Zahl, oder `0`, `null`
-bzw. der Text `"unendlich"` fuer KEIN Limit (der Verlaufsordner waechst
-dann unbegrenzt, das im Auge zu behalten liegt dann beim Nutzer). Ein
-ungueltiger Wert faellt defensiv auf 30 zurueck (mit einer Warnung in
-der Server-Konsole beim Start).
+separat gezaehlt) - als Wert geht eine positive Zahl, oder leer/`0`/
+`null` bzw. der Text `"unendlich"` fuer KEIN Limit (der Verlaufsordner
+waechst dann unbegrenzt, das im Auge zu behalten liegt dann beim
+Nutzer). Ein ungueltiger Wert faellt defensiv auf 30 zurueck (mit einer
+Warnung in der Server-Konsole beim Start). Seit v2.3.0 auch direkt im
+Einstellungen-Modus aenderbar, ohne `config.json` von Hand zu bearbeiten
+(siehe [Abschnitt 7](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)).
 
 **Warteschlange** (Listen-Symbol, nur Bambu/Ultimaker): eine Datei wird
 automatisch eingereiht statt sofort gesendet, wenn der Drucker gerade
@@ -187,9 +199,9 @@ beschaeftigt ist. Aeltester Auftrag steht oben; **▲/▼** sortiert um,
 sobald der Drucker wirklich fertig ist (bei Bambu: Status `FINISH`/
 `IDLE`/`FAILED`).
 
-**Kartenlayout:** Schaltflaechen **1/2/3** oben rechts wechseln zwischen
-einer, zwei oder drei Spalten (je Browser in `localStorage` gemerkt, bei
-schmalem Fenster automatisch reduziert).
+**Kartenlayout:** Schaltflaechen **1/2/3/4** (4-spaltig seit v2.4.0) oben
+rechts wechseln zwischen ein bis vier Spalten (je Browser in
+`localStorage` gemerkt, bei schmalem Fenster automatisch reduziert).
 
 ## 4. Bambu Lab: Drag & Drop drucken
 
@@ -227,7 +239,10 @@ Problemen: `UEBERGABE.md`.
 
 - **Temperatur-Sparklines:** jeder Duesen-/Bett-/Kammer-Chip zeigt eine
   kleine rote Verlaufskurve der letzten Werte (nur im Browser, geht
-  beim Neuladen verloren - es wird keine Zeitreihe gespeichert).
+  beim Neuladen verloren - es wird keine Zeitreihe gespeichert). Seit
+  v2.5.1 gilt das fuer **jeden** MQTT-Sensor (siehe
+  [Abschnitt 2](#2-drucker-hinzufuegen)), nicht nur fuer die mit
+  Anzeigebereich "Temperatur"/"Luftfeuchtigkeit".
 - **AMS-Feuchte** (Bambu, je AMS-Einheit): zeigt bei AMS 2 Pro einen
   echten Prozentwert (`humidity_raw`, z. B. "44%" - unabhaengig vom
   Druckermodell, das AMS 2 Pro ist ein eigenstaendiges Zubehoerteil; laut
@@ -287,6 +302,96 @@ Problemen: `UEBERGABE.md`.
   Minuten automatisch aufgeraeumt.
 - Fuer Zugriff aus dem gesamten LAN ggf. Port `8000` in der Firewall
   freigeben.
+- Die seit v2.3.0 frei konfigurierbaren externen RTSP-Kameras (siehe
+  [Abschnitt 7](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230))
+  brauchen genau wie die RTSPS-Kamera der X1/P1/P2/H2/X2-Serie FFmpeg -
+  dieselben Hinweise/Fehlerbilder oben in diesem Abschnitt gelten dafuer
+  entsprechend.
+
+## 7. Bedien-/Einstellungsmodus, Raeume & externe Kameras (seit v2.3.0)
+
+Seit v2.3.0 gibt es zwei Modi, umschaltbar ueber die Schaltflaeche
+**"⚙ Einstellungen"** oben rechts (bzw. **"← Zur Bedienung"** zurueck):
+
+- **Bedien-Modus** (Standard, das ist die bisherige Oberflaeche): alle
+  Drucker samt Kamera, Verlauf, Warteschlange und allen Druckfunktionen
+  ansehen/bedienen, Kartenlayout waehlen (seit v2.4.0 auch 4-spaltig).
+  Externe RTSP-Kameras (siehe unten) erscheinen seit v2.4.0 als eigene,
+  schlanke Kachel direkt zwischen den Druckern (**kein gemeinsamer
+  "Kameras"-Knopf mehr** - mit v2.3.0 eingefuehrt, mit v2.4.0 wieder
+  entfernt, weil Kameras seitdem genauso wie Drucker einem Raum
+  zugewiesen und dort passend einsortiert werden). **Hinzufuegen/
+  Entfernen von Druckern und Kameras ist hier bewusst NICHT moeglich**
+  (siehe unten).
+- **Einstellungen-Modus:** Drucker hinzufuegen/entfernen/einem Raum
+  zuweisen/in der Reihenfolge verschieben, Raeume anlegen/umbenennen/
+  entfernen/verschieben, externe RTSP-Kameras anlegen/bearbeiten/
+  entfernen/einem Raum zuweisen, MQTT-Geraete verwalten (bisheriger
+  "MQTT-Sensoren"-Dialog, jetzt nur noch von hier aus erreichbar, seit
+  v2.5.0 auch ohne Druckerzuordnung moeglich, seit v2.5.1 inline wie die
+  anderen Bereiche statt hinter einem eigenen Knopf - siehe unten) sowie
+  die maximale Anzahl gespeicherter Verlaufseintraege
+  (`history_max_jobs`, siehe
+  [Abschnitt 3](#3-verlauf-warteschlange--kartenlayout)) direkt ueber die
+  Oberflaeche statt per Hand in `config.json`. Der **"Speichern"-Knopf
+  dafuer sitzt seit v2.5.0 in der Kopfzeile neben "← Zur Bedienung"**
+  (vorher im Abschnitt "Druckverlauf" weiter unten, wo er faelschlich wie
+  ein Teil davon aussah).
+
+**Raeume/Gruppen:** rein organisatorisch, ohne technische Wirkung auf
+die Drucker-/Kamera-Verbindung selbst. Im Bedien-Modus werden Drucker
+UND externe Kameras (sobald mindestens ein Raum angelegt wurde) nach
+Raum gruppiert angezeigt, mit Raumname als Zwischenueberschrift; nicht
+zugewiesene Drucker/Kameras erscheinen unter "Ohne Raum". Ein
+geloeschter Raum loescht WEDER Drucker noch Kameras - beide wandern
+automatisch zurueck unter "Ohne Raum". Ohne angelegte Raeume sieht die
+Ansicht unveraendert aus wie vor v2.3.0 (flache Liste).
+
+**Externe RTSP-Kameras:** zusaetzlich zu den drucker-eigenen Kameras
+lassen sich beliebige weitere, frei benennbare RTSP(S)-Kameras
+hinterlegen (z. B. eine Raumuebersichtskamera) - Name, vollstaendige
+`rtsp://`- bzw. `rtsps://`-URL, optional ein Raum sowie (seit v2.4.0)
+optional **Benutzername/Passwort als eigene Felder** genuegen. Verlangt
+die Kamera eine Anmeldung, muessen die Zugangsdaten NICHT mehr von Hand
+in die URL eingebaut werden (`rtsp://user:pass@...`) - das Dashboard
+baut sie selbst korrekt (inkl. automatischer Kodierung von
+Sonderzeichen wie `@`, `:` oder `/` im Passwort) in die URL ein. Das
+Streaming laeuft technisch genauso wie bei der RTSPS-Kamera der
+X1/P1/P2/H2/X2-Serie (siehe [Abschnitt 2](#2-drucker-hinzufuegen) und
+`UEBERGABE.md` v2.2.22/v2.2.26) - **FFmpeg wird also ebenfalls
+benoetigt** (siehe Abschnitt 0/1 bzw. `LINUX-INSTALL.md`).
+
+**Reihenfolge aendern:** sowohl Drucker als auch Raeume lassen sich im
+Einstellungen-Modus per ▲/▼-Schaltflaechen (gleiches Bedienkonzept wie
+die bestehende Warteschlangen-Umsortierung, siehe
+[Abschnitt 3](#3-verlauf-warteschlange--kartenlayout)) in eine beliebige
+Reihenfolge bringen - wirkt sich auf die Anzeigereihenfolge im Bedien-
+Modus aus.
+
+**Kartenlayout:** seit v2.4.0 zusaetzlich zu 1/2/3 auch **4-spaltig**
+waehlbar (siehe [Abschnitt 3](#3-verlauf-warteschlange--kartenlayout)).
+
+**Eigenstaendige MQTT-Sensoren/Schalter (seit v2.5.0):** im
+"MQTT-Geraete"-Bereich des Einstellungen-Modus steht beim Anlegen eines
+neuen Eintrags in der Drucker-Auswahl zusaetzlich **"Kein Drucker
+(eigenstaendig)"** zur Verfuegung. Damit lassen sich Sensoren (z. B. ein
+Raumthermometer) oder Schalter anlegen, die zu keinem bestimmten
+Drucker gehoeren - vorher war dafuer zwingend ein bereits angelegter
+Drucker noetig, ohne einen liess sich ueberhaupt kein Eintrag
+speichern. Eigenstaendige Eintraege erscheinen im Bedien-Modus als
+eigene, schlanke Kachel (wie eine externe Kamera) und koennen genauso
+wie Drucker/Kameras einem Raum zugewiesen werden (Dropdown direkt in
+der Eintragsliste im Einstellungen-Bereich).
+
+**MQTT-Geraete-Bereich jetzt inline (seit v2.5.1):** Broker-
+Einstellungen, das Anlegen-Formular (eigenes kleines Fenster, analog
+zum Kamera-Anlegen-Dialog) und die Liste bestehender Sensoren/Schalter
+sitzen jetzt direkt im "MQTT-Geraete"-Abschnitt des
+Einstellungen-Modus - genau wie bei "Drucker verwalten"/"Raeume"/
+"Externe RTSP-Kameras". Vorher steckte der komplette Bereich hinter
+einem einzelnen "MQTT-Geraete verwalten"-Knopf in einem grossen,
+eigenen Dialogfenster, als einziger Abschnitt mit abweichendem
+Bedienkonzept.
 
 ---
 

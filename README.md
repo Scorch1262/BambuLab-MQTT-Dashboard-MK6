@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.5.6).
+> den aktuellen Stand (v2.7.0).
 
 ---
 
@@ -34,6 +34,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [5. Temperatur/Feuchte/Druckzeit-Anzeigen](#5-temperaturfeuchtedruckzeit-anzeigen)
 - [6. Grenzen & Hinweise](#6-grenzen--hinweise)
 - [7. Bedien-/Einstellungsmodus, Raeume & externe Kameras (seit v2.3.0)](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)
+- [8. FarmBot: automatische Warteschlange ueber mehrere Drucker (seit v2.6.0)](#8-farmbot-automatische-warteschlange-ueber-mehrere-drucker-seit-v260)
 
 ---
 
@@ -429,6 +430,78 @@ anzeigen" zeigt sein Verlaufsdiagramm jetzt genau wie ein gleichartiger,
 druckergebundener Sensor in Blau - unabhaengig davon, ob er einem
 Drucker zugeordnet ist oder nicht (vorher war die eigenstaendige Kachel
 immer in der Default-Farbe Rot).
+
+---
+
+## 8. FarmBot: automatische Warteschlange ueber mehrere Drucker (seit v2.6.0)
+
+**FarmBot** ist eine eigenstaendige, von den Warteschlangen einzelner
+Drucker unabhaengige Funktion: statt eine Datei einem bestimmten
+Drucker zuzuweisen, legt man sie in die Warteschlange eines FarmBot,
+und FarmBot sucht sich bei Bedarf selbst einen gerade freien, passenden
+Drucker. Mehrere unabhaengige FarmBots koennen gleichzeitig aktiviert
+sein (z. B. einer je Druckerfamilie oder Werkstattbereich).
+
+**Einrichten (Einstellungen-Modus &rarr; Abschnitt "FarmBot"):**
+- **Namenszusatz** (optional) - unterscheidet mehrere FarmBots
+  voneinander (z. B. "FarmBot Werkstatt").
+- **Hersteller + Druckerfamilie**: aktuell **nur Bambu Lab oder
+  Ultimaker** (nur fuer diese beiden existiert bereits ein
+  automatisierter Upload+Druckstart ohne Eingriff am Drucker selbst -
+  OctoPrint/Creality bleiben weiterhin rein manuell).
+- **Arbeitstag** (von/bis): das Zeitfenster, in dem neue Druckauftraege
+  gestartet werden sollen (siehe "Automatische Reihenfolge" unten) -
+  **begrenzt nur das Starten neuer Auftraege**, nicht deren
+  Fertigstellung: ein bereits laufender Druck darf unbeaufsichtigt
+  ueber das Fensterende hinaus weiterdrucken.
+- **Maximale Wartezeit in der Warteschlange (Tage)**: Auftraege, die
+  diese Wartezeit erreichen, werden bei der naechsten Neuberechnung der
+  Reihenfolge unabhaengig von ihrer Druckdauer vorrangig abgearbeitet.
+
+**Bedienung:** ist mindestens ein FarmBot aktiviert, erscheint oberhalb
+der Drucker-Kacheln ein eigenes Feld je FarmBot. Eine fertig gesclicte
+Datei (`.gcode.3mf` fuer Bambu, `.gcode` fuer Ultimaker) wird per
+Drag & Drop dort hinein gezogen; ueber "Warteschlange" laesst sich die
+aktuelle Reihenfolge einsehen (sowie einzelne Auftraege entfernen).
+
+**Automatische Reihenfolge:** nach jedem Hinzufuegen eines Auftrags
+wird die Warteschlange automatisch neu sortiert - keine manuelle
+Umsortierung wie bei der Warteschlange eines einzelnen Druckers.
+Ueberfaellige Auftraege (siehe maximale Wartezeit) stehen zuerst,
+danach die uebrigen Auftraege nach **kuerzester geschaetzter Druckzeit
+zuerst** (maximiert die Anzahl der im Arbeitstag-Fenster noch
+**startbaren** Drucke - der jeweils letzte darf dabei unbeaufsichtigt
+ueber den Feierabend hinaus weiterlaufen, siehe Hinweis zum
+Arbeitstag-Fenster oben). Die Druckzeit wird, genau wie im Verlauf/in der
+Drucker-Warteschlange, automatisch aus der Datei ausgelesen, wenn
+moeglich - gelingt das nicht, wird der Auftrag ans Ende gestellt statt
+eine Dauer zu schaetzen.
+
+**Haendische Umsortierung (seit v2.7.0):** im Warteschlangen-Modal lassen
+sich Auftraege zusaetzlich per ▲/▼ frei verschieben, genau wie bei der
+Warteschlange eines einzelnen Druckers. Diese haendische Reihenfolge
+bleibt bestehen, bis der naechste Auftrag hinzugefuegt wird - danach
+wird automatisch wieder wie oben beschrieben neu sortiert.
+
+**"Naechsten Druck starten":** sucht einen passenden, gerade freien
+Drucker der gewaehlten Hersteller-/Familienauswahl (mit Lastverteilung
+zwischen mehreren passenden Druckern). Hat dieser Drucker zuvor bereits
+etwas fertig gedruckt, zeigt das Dashboard zunaechst dessen Kamerabild
+mit den Schaltflaechen **"Druckraum frei"** (startet den Druck) und
+**"Anderer Drucker"** (sucht erneut, diesmal ohne diesen Drucker) - bei
+einem frischen/noch nie benutzten Drucker entfaellt diese Abfrage. Der
+Knopf funktioniert jederzeit, auch ausserhalb des eingestellten
+Arbeitstag-Fensters (nur die automatische Umsortierung orientiert sich
+am Fenster). Bei Bambu-Lab-Druckern erscheint danach wie gewohnt der
+AMS-Zuordnungsdialog; die Zuordnung erfolgt also erst NACH Auswahl des
+Druckers und Bestaetigung der Verfuegbarkeit. Ein ueber FarmBot
+gestarteter Druck erscheint automatisch auch im Verlauf des jeweiligen
+Druckers.
+
+**Unabhaengigkeit:** der Betrieb eines FarmBot ist vollstaendig
+unabhaengig von der direkten, manuellen Zuweisung von Druckauftraegen
+an einzelne Drucker ueber das Dashboard - beide Wege koennen
+gleichzeitig genutzt werden, ohne sich gegenseitig zu beeinflussen.
 
 ---
 

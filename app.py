@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.5.6"
+APP_VERSION = "2.7.0"
 
 import os
 import sys
@@ -275,7 +275,11 @@ DEFAULT_CONFIG = {
     # zwingend an einen bestehenden Drucker haengen ("extras" je Drucker),
     # siehe DashboardApp.add_standalone_extra()/README Abschnitt 8.
     "standalone_extras": [],
-    "printers": []
+    "printers": [],
+    # v2.6.0: eigenstaendige Druckauftrags-Warteschlangen mit automatischer
+    # Terminierung und Drucker-Zuweisung - siehe DashboardApp.add_farmbot()
+    # und den Abschnitt "FarmBot" weiter unten.
+    "farmbots": []
 }
 
 FORMLABS_TYPES = ("formlabs", "formlabs_wash", "formlabs_cure")
@@ -285,6 +289,16 @@ FORMLABS_TYPES = ("formlabs", "formlabs_wash", "formlabs_cure")
 # technischen Anbindung.
 CREALITY_TYPES = ("creality_k1", "creality_k1c", "creality_k1max", "creality_k1se", "creality_other")
 KNOWN_TYPES = ("bambu",) + FORMLABS_TYPES + ("octoprint",) + CREALITY_TYPES + ("ultimaker",)
+
+# v2.6.0: FarmBot unterstuetzt bewusst nur Druckertypen, fuer die bereits
+# ein automatisierter Upload+Druckstart ohne Nutzer-Interaktion am
+# Drucker selbst existiert (siehe prepare_print_job()/send_ultimaker_
+# print_now()) - OctoPrint und Creality/Klipper haben aktuell KEINEN
+# solchen Pfad (nur manuelle Bedienung), waeren also fuer eine
+# automatische Warteschlange nicht sinnvoll nutzbar. Siehe UEBERGABE.md
+# v2.6.0 fuer die bewusste Entscheidung, das vorerst NICHT zusaetzlich
+# nachzuruesten.
+FARMBOT_MANUFACTURERS = ("bambu", "ultimaker")
 
 
 # ----------------------------------------------------------------------
@@ -682,13 +696,23 @@ class PrintQueueStore:
     Senden wertet DashboardApp._record_history_after_send() dieses Feld
     aus, damit derselbe Auftrag nicht doppelt im Verlauf auftaucht.
 
-    Ablage: "<Ordner der exe/des Skripts>/print_queue/<drucker_id>/"."""
+    Ablage: "<Ordner der exe/des Skripts>/print_queue/<drucker_id>/".
 
-    def __init__(self):
+    v2.6.0: `root` waehlt den obersten Ablageordner (Default weiterhin
+    "print_queue", unveraendertes Verhalten fuer alle bestehenden
+    Aufrufer) - FarmBot (siehe DashboardApp.farmbot_queue) nutzt eine
+    ZWEITE, unabhaengige Instanz mit `root="farmbot_queue"` und FarmBot-
+    IDs statt Drucker-IDs als Schluessel, um dieselbe bereits getestete
+    Ablage-/Index-/Dauer-Schaetzungs-Logik (inkl. _extract_print_
+    duration_seconds()) ohne Code-Duplizierung wiederzuverwenden, ohne
+    mit echten Drucker-Warteschlangen im selben Ordner zu kollidieren."""
+
+    def __init__(self, root: str = "print_queue"):
         self._lock = threading.Lock()
+        self._root = root
 
     def dir_for(self, printer_id: str) -> str:
-        d = os.path.join(base_dir(), "print_queue", printer_id)
+        d = os.path.join(base_dir(), self._root, printer_id)
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -840,6 +864,7 @@ def load_config() -> dict:
     cfg.setdefault("rtsp_cameras", [])
     cfg.setdefault("standalone_extras", [])
     cfg.setdefault("printers", [])
+    cfg.setdefault("farmbots", [])  # v2.6.0, siehe DashboardApp-Abschnitt "FarmBot"
     # v2.3.0: bestehende config.json-Dateien (vor Einfuehrung von Raeumen/
     # Reihenfolge) haben weder "group_id" noch "order" je Drucker/Gruppe/
     # Kamera - hier defensiv ergaenzt, damit aeltere Konfigurationen ohne
@@ -864,6 +889,17 @@ def load_config() -> dict:
     for idx, e in enumerate(cfg["standalone_extras"]):
         e.setdefault("order", idx)
         e.setdefault("group_id", None)
+    # v2.6.0: siehe add_farmbot() fuer die Bedeutung der einzelnen Felder.
+    for idx, fb in enumerate(cfg["farmbots"]):
+        fb.setdefault("order", idx)
+        fb.setdefault("enabled", True)
+        fb.setdefault("name_suffix", "")
+        fb.setdefault("manufacturer", "bambu")
+        if fb["manufacturer"] == "bambu":
+            fb.setdefault("bambu_family", "x1")
+        fb.setdefault("work_start", "08:00")
+        fb.setdefault("work_end", "18:00")
+        fb.setdefault("max_queue_days", 3)
     return cfg
 
 
@@ -3773,6 +3809,31 @@ class DashboardApp:
         # WAEHREND einer laufenden Kopplung befuellt, danach entfernt
         # (erfolgreich: id/key wandern dauerhaft in config.json).
         self._ultimaker_pending_auth = {}
+        # ------------------------------------------------------------------
+        # v2.6.0: FarmBot - siehe Klassenkommentar beim Abschnitt "FarmBot"
+        # weiter unten (nahe pick_farmbot_job()) fuer die vollstaendige
+        # Beschreibung. Eigene PrintQueueStore-Instanz (siehe dortiger
+        # Kommentar: gleiche Ablage-/Dauer-Schaetzungs-Logik, eigener
+        # Ordner "farmbot_queue/<farmbot_id>/", damit FarmBot-Warteschlangen
+        # niemals mit den Warteschlangen einzelner Drucker (self.queue)
+        # verwechselt/vermischt werden koennen - siehe UEBERGABE.md v2.6.0,
+        # Abschnitt "Unabhaengigkeit von der druckereigenen Warteschlange").
+        self.farmbot_queue = PrintQueueStore(root="farmbot_queue")
+        for fb in self.cfg.get("farmbots", []):
+            self.farmbot_queue.ensure_dir(fb["id"])
+        # printer_id -> bool: letzter bekannter Beschaeftigt-Zustand, siehe
+        # _update_bed_confirm_flags().
+        self._printer_was_busy = {}
+        # printer_id -> True, solange FarmBot vor dem naechsten Druck auf
+        # DIESEM Drucker eine Bestaetigung "Druckraum frei" braucht (siehe
+        # _update_bed_confirm_flags()/pick_farmbot_job()/assign_farmbot_job()).
+        self._farmbot_bed_confirm_pending = {}
+        # printer_id -> Anzahl bisher ueber FarmBot auf diesem Drucker
+        # gestarteter Druckauftraege - rein in-memory (setzt sich nach
+        # einem Neustart des Dashboards zurueck), nur fuer die
+        # Lastverteilung zwischen mehreren Druckern derselben Familie
+        # gedacht, siehe pick_farmbot_job().
+        self._farmbot_print_counts = {}
 
     def _start_printer(self, printer_cfg: dict):
         # MK6: Verlaufsordner fuer JEDEN Drucker anlegen, unabhaengig vom
@@ -4272,7 +4333,434 @@ class DashboardApp:
         ok = self.extras.publish(topic, payload)
         return ok, (None if ok else "MQTT-Verbindung fuer Sensoren/Schalter nicht verfuegbar.")
 
+    # ------------------------------------------------------------------
+    # v2.6.0: FarmBot - eigenstaendige, vom Drucker UNABHAENGIGE Warte-
+    # schlange je FarmBot-Instanz, die automatisch einem freien Drucker
+    # einer gewaehlten Hersteller-/Familien-Kombination zugewiesen wird.
+    # Auf ausdruecklichen Nutzerwunsch, siehe UEBERGABE.md v2.6.0 fuer die
+    # vollstaendige Beschreibung (Entstehung, Entscheidungen, bewusste
+    # Vereinfachungen). Kurzueberblick:
+    #   - Mehrere unabhaengige FarmBot-Instanzen moeglich (eigener Name-
+    #     Zusatz, eigene Warteschlange, eigene Einstellungen) - siehe
+    #     add_farmbot()/update_farmbot()/delete_farmbot().
+    #   - Dateien werden per Drag&Drop in die FarmBot-eigene Warteschlange
+    #     gelegt (self.farmbot_queue, siehe add_farmbot_job()); die
+    #     Reihenfolge wird danach IMMER automatisch neu berechnet, siehe
+    #     _reorder_farmbot_queue().
+    #   - "Naechsten Druck starten" laeuft zweistufig: pick_farmbot_job()
+    #     ermittelt (OHNE Seiteneffekt) den naechsten Auftrag + einen
+    #     freien Zieldrucker (inkl. Lastverteilung) und meldet, ob eine
+    #     Kamera-Bestaetigung ("Druckraum frei"/"anderer Drucker") noetig
+    #     ist; erst assign_farmbot_job() verschiebt die Datei tatsaechlich
+    #     und startet den Druck (AMS-Dialog bei Bambu, sofortiger Start
+    #     bei Ultimaker - identischer Ablauf wie ein manueller Drag&Drop-
+    #     Upload auf die Drucker-Kachel selbst).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_farmbot_work_window(work_start: str, work_end: str):
+        try:
+            sh, sm = map(int, work_start.split(":"))
+            eh, em = map(int, work_end.split(":"))
+            if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+                raise ValueError
+        except Exception:
+            return False, "Arbeitstag-Fenster muss im Format HH:MM angegeben werden."
+        if (eh, em) <= (sh, sm):
+            return False, ("Arbeitstag-Ende muss nach dem Arbeitstag-Beginn liegen (ueber Mitternacht "
+                            "hinausgehende Arbeitstage werden aktuell nicht unterstuetzt).")
+        return True, None
+
+    def get_farmbots(self):
+        return sorted(self.cfg.get("farmbots", []), key=lambda f: f.get("order", 0))
+
+    def get_farmbot_cfg(self, farmbot_id):
+        return next((f for f in self.cfg.get("farmbots", []) if f.get("id") == farmbot_id), None)
+
+    def _apply_farmbot_fields(self, entry: dict, data: dict):
+        """Gemeinsame Validierung/Uebernahme fuer add_farmbot()/
+        update_farmbot() - mutiert `entry` nur, wenn ALLE Felder gueltig
+        sind, und gibt sonst (False, Fehlermeldung) zurueck, OHNE `entry`
+        schon teilweise zu veraendern."""
+        manufacturer = (data.get("manufacturer") or "bambu").strip().lower()
+        if manufacturer not in FARMBOT_MANUFACTURERS:
+            return False, "Hersteller muss 'Bambu Lab' oder 'Ultimaker' sein."
+        work_start = (data.get("work_start") or "08:00").strip()
+        work_end = (data.get("work_end") or "18:00").strip()
+        ok, err = self._validate_farmbot_work_window(work_start, work_end)
+        if not ok:
+            return False, err
+        try:
+            max_days = int(data.get("max_queue_days", 3))
+            if max_days < 1:
+                raise ValueError
+        except Exception:
+            return False, "Maximale Wartezeit in der Warteschlange muss eine positive ganze Zahl (Tage) sein."
+        bambu_family = None
+        if manufacturer == "bambu":
+            bambu_family = (data.get("bambu_family") or "x1").strip().lower()
+            if bambu_family not in BAMBU_FAMILY_TO_FTPS_PROFILE:
+                bambu_family = "x1"
+
+        entry["name_suffix"] = (data.get("name_suffix") or "").strip()
+        entry["enabled"] = bool(data.get("enabled", True))
+        entry["manufacturer"] = manufacturer
+        entry["work_start"] = work_start
+        entry["work_end"] = work_end
+        entry["max_queue_days"] = max_days
+        if manufacturer == "bambu":
+            entry["bambu_family"] = bambu_family
+        else:
+            entry.pop("bambu_family", None)
+        return True, None
+
+    def add_farmbot(self, data: dict):
+        entry = {"id": uuid.uuid4().hex[:10], "order": len(self.cfg.get("farmbots", []))}
+        ok, err = self._apply_farmbot_fields(entry, data)
+        if not ok:
+            return False, err, None
+        self.cfg.setdefault("farmbots", []).append(entry)
+        save_config(self.cfg)
+        self.farmbot_queue.ensure_dir(entry["id"])
+        return True, None, entry
+
+    def update_farmbot(self, farmbot_id, data: dict):
+        entry = self.get_farmbot_cfg(farmbot_id)
+        if not entry:
+            return False, "FarmBot nicht gefunden.", None
+        candidate = dict(entry)
+        ok, err = self._apply_farmbot_fields(candidate, data)
+        if not ok:
+            return False, err, None
+        entry.clear()
+        entry.update(candidate)
+        save_config(self.cfg)
+        return True, None, entry
+
+    def delete_farmbot(self, farmbot_id):
+        before = len(self.cfg.get("farmbots", []))
+        self.cfg["farmbots"] = [f for f in self.cfg.get("farmbots", []) if f.get("id") != farmbot_id]
+        changed = len(self.cfg["farmbots"]) != before
+        if changed:
+            save_config(self.cfg)
+            # Warteschlangen-Dateien dieses FarmBot bewusst NICHT geloescht
+            # (analog zu Druckern: auch deren print_queue/print_history-
+            # Ordner bleiben beim Entfernen unangetastet) - vermeidet
+            # versehentlichen Datenverlust bei einem Tippfehler/Testlauf.
+            self._farmbot_bed_confirm_pending = {
+                pid: v for pid, v in self._farmbot_bed_confirm_pending.items()
+            }
+        return changed
+
+    @staticmethod
+    def _farmbot_display_name(fb: dict) -> str:
+        suffix = (fb.get("name_suffix") or "").strip()
+        return f"FarmBot {suffix}" if suffix else "FarmBot"
+
+    def _work_window_budget_minutes(self, fb: dict) -> int:
+        """Minuten bis zum Ende des Arbeitstag-Fensters - AUSSERHALB des
+        Fensters (vor Beginn oder nach Ende) wird vereinfachend die volle
+        Fensterlaenge angenommen (siehe UEBERGABE.md v2.6.0: kein echter
+        Mehrtage-Terminplaner, nur eine Orientierungsgroesse fuer die
+        Anzeige "passt heute noch X mal" und fuer die Sortierung - die
+        Sortierung selbst (kuerzeste Druckzeit zuerst) ist unabhaengig
+        von der konkreten Budget-Zahl immer optimal fuer "moeglichst viele
+        Auftraege heute noch STARTEN", siehe _reorder_farmbot_queue()/
+        _farmbot_status_extra() - v2.6.1: der Arbeitstag begrenzt nur das
+        Starten neuer Auftraege, nicht deren Fertigstellung; ein bereits
+        gestarteter Druck darf unbeaufsichtigt ueber das Fensterende hinaus
+        weiterlaufen)."""
+        try:
+            sh, sm = map(int, fb["work_start"].split(":"))
+            eh, em = map(int, fb["work_end"].split(":"))
+        except Exception:
+            return 0
+        now = datetime.now()
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_dt <= start_dt:
+            return 0
+        if start_dt <= now <= end_dt:
+            return max(0, int((end_dt - now).total_seconds() // 60))
+        return int((end_dt - start_dt).total_seconds() // 60)
+
+    def _farmbot_status_extra(self, fb: dict) -> dict:
+        """v2.6.1 - BUGFIX/Klarstellung auf ausdruecklichen Nutzerwunsch:
+        "Der Arbeitstag soll auch nur für den Start des letzten Druckes
+        relevant sein, da der Drucker auch außerhalb des Arbeitstages ohne
+        menschlichen Bediener weiterarbeiten kann aber halt keine neuen
+        Drucke starten kann." Der Arbeitstag begrenzt also NUR, wie viele
+        Auftraege heute noch GESTARTET werden koennen - nicht, wie viele
+        davon noch VOR Feierabend FERTIG werden. Ein Auftrag zaehlt daher
+        schon als "passt noch rein", wenn vor seinem Start noch Restzeit
+        im Fenster uebrig ist (`remaining > 0`); seine eigene Druckdauer
+        darf diese Restzeit ueberschreiten (der Drucker laeuft dann
+        unbeaufsichtigt ueber Feierabend hinaus weiter) - danach ist die
+        Restzeit fuer den naechsten Auftrag dann aber verbraucht, da der
+        Drucker erst nach Feierabend wieder frei wird. Vorherige Version
+        brach bereits ab, wenn die Druckdauer DIESES Auftrags allein schon
+        die Restzeit ueberschritt - das zaehlte faelschlich auch den
+        letzten, gerade noch rechtzeitig gestarteten Auftrag nicht mit."""
+        entries = self.farmbot_queue.list_entries(fb["id"])
+        remaining = self._work_window_budget_minutes(fb) * 60
+        fits = 0
+        for e in entries:
+            if remaining <= 0:
+                break
+            dur = e.get("duration_sec")
+            if dur is None:
+                break  # ab hier unbekannte Dauer - Abschaetzung endet hier bewusst (siehe Kommentar unten)
+            fits += 1
+            remaining -= dur
+        return {
+            "display_name": self._farmbot_display_name(fb),
+            "queue_count": len(entries),
+            "fits_in_workday": fits,
+        }
+
+    def get_farmbots_status(self):
+        return [dict(fb, **self._farmbot_status_extra(fb)) for fb in self.get_farmbots()]
+
+    def get_farmbot_jobs(self, farmbot_id):
+        return self.farmbot_queue.list_entries(farmbot_id)
+
+    def get_farmbot_job_thumbnail_path(self, farmbot_id, job_id):
+        return self.farmbot_queue.get_thumbnail_path(farmbot_id, job_id)
+
+    def _reorder_farmbot_queue(self, farmbot_id):
+        """Wird nach JEDEM Hinzufuegen eines neuen Auftrags automatisch
+        aufgerufen (siehe add_farmbot_job(), auf ausdruecklichen
+        Nutzerwunsch). Zwei Kriterien, in dieser Prioritaet:
+          1. Auftraege, die die eingestellte maximale Wartezeit
+             ("max_queue_days") bereits erreicht/ueberschritten haben,
+             werden ganz nach vorne gestellt (laengste Wartezeit zuerst) -
+             sie muessen unabhaengig von ihrer Druckdauer vorrangig
+             abgearbeitet werden.
+          2. Alle uebrigen Auftraege: aufsteigend nach geschaetzter
+             Druckdauer ("duration_sec") sortiert - das ist die klassische
+             "Shortest Job First"-Heuristik, die (unabhaengig vom exakten
+             Restzeit-Budget) nachweislich die ANZAHL der innerhalb eines
+             Zeitbudgets noch STARTBAREN Auftraege maximiert (v2.6.1: der
+             Arbeitstag begrenzt nur das Starten, nicht die Fertigstellung
+             - ein gestarteter Druck darf unbeaufsichtigt ueber Feierabend
+             hinaus weiterlaufen, siehe _farmbot_status_extra()).
+             Auftraege OHNE bekannte Dauer (Datei ohne auslesbare
+             Zeitschaetzung, siehe _extract_print_duration_seconds())
+             werden bewusst ans Ende gestellt, statt eine Dauer zu raten -
+             auf ausdruecklichen Nutzerwunsch ("nur automatisch, kein
+             Eingriff")."""
+        fb = self.get_farmbot_cfg(farmbot_id)
+        if not fb:
+            return
+        entries = self.farmbot_queue.list_entries(farmbot_id)
+        if len(entries) < 2:
+            return
+        max_days = fb.get("max_queue_days") or 3
+        now = datetime.now()
+
+        def age_days(e):
+            try:
+                added = datetime.strptime(e["added_at"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return 0.0
+            return (now - added).total_seconds() / 86400.0
+
+        urgent = sorted((e for e in entries if age_days(e) >= max_days), key=age_days, reverse=True)
+        rest = sorted((e for e in entries if age_days(e) < max_days),
+                       key=lambda e: (e.get("duration_sec") is None, e.get("duration_sec") or 0))
+        self.farmbot_queue.reorder(farmbot_id, [e["job_id"] for e in urgent + rest])
+
+    def add_farmbot_job(self, farmbot_id, local_path, filename):
+        fb = self.get_farmbot_cfg(farmbot_id)
+        if not fb:
+            return False, "FarmBot nicht gefunden.", None
+        entry = self.farmbot_queue.add_entry(farmbot_id, local_path, filename)
+        self._cleanup_job_file({"local_path": local_path})
+        if not entry:
+            return False, "Datei konnte nicht zur Warteschlange hinzugefuegt werden.", None
+        self._reorder_farmbot_queue(farmbot_id)
+        return True, None, entry
+
+    def delete_farmbot_job(self, farmbot_id, job_id):
+        return self.farmbot_queue.delete_entry(farmbot_id, job_id)
+
+    def reorder_farmbot_queue(self, farmbot_id, ordered_job_ids):
+        """v2.7.0 - auf ausdruecklichen Nutzerwunsch: die automatisch
+        berechnete Reihenfolge (siehe _reorder_farmbot_queue()) soll sich
+        haendisch uebersteuern lassen, genau wie bei der Warteschlange
+        eines einzelnen Druckers (siehe reorder_print_queue()). Diese
+        manuelle Reihenfolge bleibt bestehen, bis der naechste Auftrag
+        hinzugefuegt wird - add_farmbot_job() ruft danach weiterhin
+        IMMER automatisch _reorder_farmbot_queue() auf, das uebersteuert
+        eine manuelle Umsortierung also bewusst wieder (identisches
+        Verhalten zu vorher, nur dass es jetzt explizit eine manuelle
+        Zwischenstufe gibt)."""
+        return self.farmbot_queue.reorder(farmbot_id, ordered_job_ids)
+
+    def _update_bed_confirm_flags(self):
+        """Erkennt je Drucker den Uebergang "beschaeftigt" -> "nicht mehr
+        beschaeftigt" (unabhaengig vom genauen Status-Wert, siehe
+        PRINTER_BUSY_STATES - funktioniert damit druckertyp-uebergreifend
+        fuer Bambu UND Ultimaker, ohne druckerspezifische Status-Werte zu
+        erraten) und merkt sich das als "Druckraum vermutlich noch belegt
+        von einem vorherigen Druck", bis entweder FarmBot per Kamera-
+        Bestaetigung ("Druckraum frei") fortfaehrt oder irgendein neuer
+        Druck auf diesem Drucker erfolgreich gestartet wurde (dann ist die
+        Frage ohnehin hinfaellig). Guenstig genug, um bei jedem
+        /api/status-Abruf mitzulaufen - kein eigener Hintergrund-Thread
+        noetig, siehe all_status()."""
+        for pid, conn in self.connections.items():
+            state = str(conn.status.get("gcode_state") or "").upper()
+            busy = state in PRINTER_BUSY_STATES
+            was_busy = self._printer_was_busy.get(pid, False)
+            if was_busy and not busy:
+                self._farmbot_bed_confirm_pending[pid] = True
+            self._printer_was_busy[pid] = busy
+
+    def _farmbot_matching_printers(self, fb: dict):
+        """Alle Drucker im Dashboard, die zur Hersteller-/Familienauswahl
+        dieses FarmBot passen UND fuer einen automatisierten Druckstart
+        grundsaetzlich nutzbar sind (bei Ultimaker: bereits gekoppelt,
+        siehe start_ultimaker_pairing())."""
+        out = []
+        for p in self.cfg.get("printers", []):
+            if p.get("type", "bambu") != fb["manufacturer"]:
+                continue
+            if fb["manufacturer"] == "bambu" and p.get("bambu_family", "x1") != fb.get("bambu_family", "x1"):
+                continue
+            if fb["manufacturer"] == "ultimaker" and not (p.get("ultimaker_auth_id") and p.get("ultimaker_auth_key")):
+                continue
+            out.append(p)
+        return out
+
+    def pick_farmbot_job(self, farmbot_id, exclude_printer_ids=None):
+        """Ermittelt OHNE Seiteneffekt (keine Datei wird verschoben, kein
+        Druck gestartet) den naechsten Auftrag dieses FarmBot sowie einen
+        passenden, gerade freien Zieldrucker - fuer den "Naechsten Druck
+        starten"-Knopf, VOR der eigentlichen Kamera-Bestaetigung/Zuweisung
+        (siehe assign_farmbot_job()). `exclude_printer_ids` wird genutzt,
+        wenn der Nutzer im Kamera-Dialog "anderer Drucker" waehlt - dann
+        wird derselbe Auftrag erneut, aber ohne die bereits abgelehnten
+        Drucker, zugeordnet.
+
+        Lastverteilung: unter den aktuell freien, passenden Druckern wird
+        der mit den WENIGSTEN bisher ueber FarmBot gestarteten Auftraegen
+        gewaehlt (self._farmbot_print_counts, rein in-memory seit dem
+        letzten Programmstart) - bei Gleichstand entscheidet die Anzeige-
+        Reihenfolge/ID (deterministisch, kein Zufall)."""
+        fb = self.get_farmbot_cfg(farmbot_id)
+        if not fb:
+            return False, "FarmBot nicht gefunden.", None
+        if not fb.get("enabled", True):
+            return False, "Dieser FarmBot ist deaktiviert.", None
+        entries = self.farmbot_queue.list_entries(farmbot_id)
+        if not entries:
+            return False, "Die Warteschlange ist leer.", None
+        next_job = entries[0]
+
+        exclude = set(exclude_printer_ids or [])
+        candidates = [p for p in self._farmbot_matching_printers(fb)
+                      if p["id"] not in exclude and self.is_ready_for_next_print(p["id"])]
+        if not candidates:
+            return False, ("Kein freier Drucker der gewaehlten Hersteller-/Familienauswahl "
+                            "verfuegbar."), None
+        candidates.sort(key=lambda p: (self._farmbot_print_counts.get(p["id"], 0), p.get("order", 0), p["id"]))
+        target = candidates[0]
+        needs_confirm = bool(self._farmbot_bed_confirm_pending.get(target["id"], False))
+        return True, None, {
+            "job_id": next_job["job_id"],
+            "filename": next_job["filename"],
+            "printer_id": target["id"],
+            "printer_name": target["name"],
+            "needs_bed_confirm": needs_confirm,
+        }
+
+    def assign_farmbot_job(self, farmbot_id, job_id, printer_id):
+        """Fuehrt das Ergebnis von pick_farmbot_job() tatsaechlich aus -
+        erst HIER wird die Datei in einen temporaeren Job-Ordner kopiert
+        und der eigentliche Druckvorgang angestossen (fruehestens, nachdem
+        der Nutzer eine ggf. noetige Kamera-Bestaetigung gegeben hat,
+        siehe pick_farmbot_job()).
+
+        WICHTIG (Unabhaengigkeit von der druckereigenen Warteschlange,
+        auf ausdruecklichen Nutzerwunsch): dies laeuft NICHT ueber
+        enqueue_upload()/self.queue/start_next_queued_print() (das koennte
+        mit dort bereits manuell liegenden Auftraegen desselben Druckers
+        kollidieren bzw. deren Reihenfolge durcheinanderbringen), sondern
+        direkt wie ein frischer manueller Drag&Drop-Upload auf die
+        Drucker-Kachel selbst, ueber dieselben Basisfunktionen
+        (prepare_print_job() fuer Bambu, send_ultimaker_print_now() fuer
+        Ultimaker) - der Drucker merkt also keinen Unterschied, ob der
+        Auftrag manuell oder ueber FarmBot kam, und eine bereits laufende
+        eigene Warteschlange dieses Druckers bleibt unberuehrt.
+
+        Bei Bambu ist dies bewusst NUR der erste (Vorschau-)Schritt, genau
+        wie bei einem manuellen Upload: der Rueckgabewert enthaelt die
+        AMS-Zuordnungsvorschau; das Frontend oeffnet darauf denselben
+        bestehenden AMS-Dialog und bestaetigt ueber den bestehenden
+        Endpunkt /api/printers/<id>/print/confirm (start_confirm_print_job())
+        - dort erfolgt dann auch die vom Nutzer gewuenschte AMS-Zuordnung
+        "direkt beim Start, nach Auswahl des Druckers und Bestaetigung der
+        Verfuegbarkeit". Sowohl der Bambu- als auch der Ultimaker-Pfad
+        laufen anschliessend asynchron in einem Hintergrund-Thread (Upload
+        kann dauern) - der eigentliche Erfolg (und damit das Entfernen aus
+        der FarmBot-Warteschlange, die Lastverteilungs-Zaehlung und das
+        Zuruecksetzen des "Druckraum frei"-Flags) wird deshalb NICHT hier,
+        sondern zentral in _record_history_after_send() behandelt, siehe
+        dort ("farmbot_ref") - identisch zum bestehenden Muster fuer
+        history_ref/queue_ref."""
+        fb = self.get_farmbot_cfg(farmbot_id)
+        if not fb:
+            return False, "FarmBot nicht gefunden.", None
+        target_cfg = self.get_printer_cfg(printer_id)
+        if not target_cfg:
+            return False, "Ziel-Drucker nicht gefunden.", None
+        if target_cfg.get("type", "bambu") != fb["manufacturer"] or (
+            fb["manufacturer"] == "bambu"
+            and target_cfg.get("bambu_family", "x1") != fb.get("bambu_family", "x1")
+        ):
+            return False, "Ziel-Drucker passt nicht zur Hersteller-/Familienauswahl dieses FarmBot.", None
+        if not self.is_ready_for_next_print(printer_id):
+            return False, "Ziel-Drucker ist inzwischen nicht mehr frei - bitte erneut versuchen.", None
+
+        stored_path, filename = self.farmbot_queue.get_job_file_path(farmbot_id, job_id)
+        if not stored_path:
+            return False, "Dieser Auftrag ist nicht mehr vorhanden.", None
+        try:
+            tmp_path = self._copy_to_temp_job_dir(stored_path, filename)
+        except Exception as e:
+            return False, f"Datei konnte nicht kopiert werden: {e}", None
+
+        farmbot_ref = {"farmbot_id": farmbot_id, "job_id": job_id}
+        if target_cfg.get("type") == "ultimaker":
+            ok, err, new_job_id = self.send_ultimaker_print_now(printer_id, tmp_path, filename, farmbot_ref=farmbot_ref)
+            if not ok:
+                self._cleanup_job_file({"local_path": tmp_path})
+                return False, err, None
+            result = {"mode": "ultimaker", "job_id": new_job_id}
+        else:
+            ok, err, new_job_id, preview = self.prepare_print_job(printer_id, tmp_path, filename, farmbot_ref=farmbot_ref)
+            if not ok:
+                self._cleanup_job_file({"local_path": tmp_path})
+                return False, err, None
+            result = {
+                "mode": "bambu",
+                "job_id": new_job_id,
+                "filename": filename,
+                "filaments": preview["filaments"],
+                "ams_trays": preview["ams_trays"],
+                "total_filaments": preview.get("total_filaments", len(preview["filaments"])),
+            }
+
+        return True, None, result
+
     def all_status(self):
+        # v2.6.0: bei jedem Status-Abruf mitlaufen lassen (siehe
+        # _update_bed_confirm_flags()) - guenstig genug, kein eigener
+        # Hintergrund-Thread noetig, und so garantiert immer aktuell, wenn
+        # das FarmBot-Feld im Dashboard als naechstes "Druckraum frei?"
+        # abfragen muesste.
+        self._update_bed_confirm_flags()
         out = []
         for p in self.cfg["printers"]:
             conn = self.connections.get(p["id"])
@@ -4368,7 +4856,7 @@ class DashboardApp:
             with self._print_progress_lock:
                 self._print_progress.pop(jid, None)
 
-    def prepare_print_job(self, printer_id, local_path, remote_name, history_ref=None, queue_ref=None):
+    def prepare_print_job(self, printer_id, local_path, remote_name, history_ref=None, queue_ref=None, farmbot_ref=None):
         p = self.get_printer_cfg(printer_id)
         if not p:
             return False, "Drucker nicht gefunden.", None, None
@@ -4394,6 +4882,12 @@ class DashboardApp:
                 # Warteschlangen-Eintrag erst NACH bestaetigtem Erfolg.
                 "history_ref": history_ref,
                 "queue_ref": queue_ref,
+                # v2.6.0: siehe _record_history_after_send() - raeumt den
+                # FarmBot-Warteschlangen-Eintrag ebenfalls erst NACH
+                # bestaetigtem Erfolg auf (AMS-Zuordnung erfolgt bei Bambu
+                # erst NACH diesem Aufruf, ueber den normalen Bestaetigungs-
+                # Dialog/-Endpunkt - siehe assign_farmbot_job()).
+                "farmbot_ref": farmbot_ref,
             }
         return True, None, job_id, preview
 
@@ -4506,6 +5000,18 @@ class DashboardApp:
         queue_ref = job.get("queue_ref")
         if queue_ref:
             self.queue.delete_entry(queue_ref["printer_id"], queue_ref["job_id"])
+        # v2.6.0: analoges Aufraeumen fuer einen FarmBot-Auftrag - siehe
+        # assign_farmbot_job()/prepare_print_job()/send_ultimaker_print_now().
+        # Erst HIER (nach bestaetigtem Senden) wird der Warteschlangen-
+        # Eintrag entfernt und die Lastverteilungs-Zaehlung sowie ein noch
+        # offenes "Druckraum frei"-Flag fuer den Zieldrucker aktualisiert -
+        # ein fehlgeschlagener Versuch darf den Auftrag nicht aus der
+        # FarmBot-Warteschlange verlieren.
+        farmbot_ref = job.get("farmbot_ref")
+        if farmbot_ref:
+            self.farmbot_queue.delete_entry(farmbot_ref["farmbot_id"], farmbot_ref["job_id"])
+            self._farmbot_print_counts[printer_id] = self._farmbot_print_counts.get(printer_id, 0) + 1
+            self._farmbot_bed_confirm_pending.pop(printer_id, None)
 
     def is_printer_busy(self, printer_id) -> bool:
         """MK6 v1.2.0: True, wenn der Druckraum dieses Druckers gerade
@@ -4621,7 +5127,7 @@ class DashboardApp:
             return True, None, "unauthorized"
         return True, None, "pending"
 
-    def send_ultimaker_print_now(self, printer_id, local_path, filename, history_ref=None, queue_ref=None):
+    def send_ultimaker_print_now(self, printer_id, local_path, filename, history_ref=None, queue_ref=None, farmbot_ref=None):
         """Anders als bei Bambu (siehe prepare_print_job()/
         start_confirm_print_job()) gibt es bei Ultimaker keine AMS-
         Zuordnung zu bestaetigen - der Druck wird deshalb SOFORT nach
@@ -4657,6 +5163,7 @@ class DashboardApp:
                 "created": time.time(),
                 "history_ref": history_ref,   # MK6 v1.2.0: siehe _record_history_after_send()
                 "queue_ref": queue_ref,
+                "farmbot_ref": farmbot_ref,   # v2.6.0: siehe _record_history_after_send()
             }
 
         self._set_progress(job_id, phase="uploading", sent=0, total=total_size, percent=0, error=None)
@@ -4672,6 +5179,7 @@ class DashboardApp:
                 self._record_history_after_send({
                     "printer_id": printer_id, "local_path": local_path,
                     "remote_name": filename, "history_ref": history_ref, "queue_ref": queue_ref,
+                    "farmbot_ref": farmbot_ref,
                 })
                 with self._print_jobs_lock:
                     job = self._print_jobs.pop(job_id, None)
@@ -5686,6 +6194,162 @@ def api_print_queue_assign(printer_id, job_id):
     return jsonify({"ok": True, "queue_entry": entry})
 
 
+# ----------------------------------------------------------------------
+# v2.6.0 NEUES FEATURE: FarmBot - eigenstaendige, drucker-unabhaengige
+# Warteschlange mit automatischer Terminierung und Zuweisung an einen
+# freien Drucker der gewaehlten Hersteller-/Familienauswahl. Siehe
+# DashboardApp-Abschnitt "FarmBot" (nahe pick_farmbot_job()) fuer die
+# vollstaendige Beschreibung des Ablaufs.
+# ----------------------------------------------------------------------
+@app.route("/api/farmbots", methods=["GET"])
+def api_list_farmbots():
+    return jsonify(dash.get_farmbots_status())
+
+
+@app.route("/api/farmbots", methods=["POST"])
+def api_add_farmbot():
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.add_farmbot(data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "farmbot": entry})
+
+
+@app.route("/api/farmbots/<farmbot_id>", methods=["PUT"])
+def api_update_farmbot(farmbot_id):
+    data = request.get_json(force=True) or {}
+    ok, err, entry = dash.update_farmbot(farmbot_id, data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "farmbot": entry})
+
+
+@app.route("/api/farmbots/<farmbot_id>", methods=["DELETE"])
+def api_delete_farmbot(farmbot_id):
+    ok = dash.delete_farmbot(farmbot_id)
+    if not ok:
+        return jsonify({"error": "FarmBot nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/farmbots/<farmbot_id>/jobs", methods=["GET"])
+def api_farmbot_jobs(farmbot_id):
+    """Liste der wartenden Druckauftraege dieses FarmBot, AELTESTER
+    (=naechster) zuerst - fuer die Warteschlangen-Ansicht im FarmBot-
+    Feld des Dashboards."""
+    return jsonify(dash.get_farmbot_jobs(farmbot_id))
+
+
+@app.route("/api/farmbots/<farmbot_id>/jobs", methods=["POST"])
+def api_farmbot_jobs_add(farmbot_id):
+    """Nimmt eine per Drag & Drop in das FarmBot-Feld gelegte Datei
+    entgegen - welche Dateiendung erlaubt ist, richtet sich nach der
+    Hersteller-Auswahl dieses FarmBot (Bambu: .gcode.3mf, Ultimaker:
+    .gcode), genau wie bei der Warteschlange eines einzelnen Druckers
+    (siehe api_print_queue_add()). Die Reihenfolge wird danach
+    automatisch neu berechnet (siehe DashboardApp._reorder_farmbot_queue())."""
+    fb = dash.get_farmbot_cfg(farmbot_id)
+    if not fb:
+        return jsonify({"error": "FarmBot nicht gefunden."}), 404
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "Keine Datei erhalten."}), 400
+
+    filename = secure_filename(f.filename)
+    if fb["manufacturer"] == "ultimaker":
+        if not filename.lower().endswith(".gcode"):
+            return jsonify({"error": "Nur fertig gesclicte .gcode-Dateien werden unterstuetzt (Export aus Cura)."}), 400
+    else:
+        if not filename.lower().endswith(".gcode.3mf"):
+            return jsonify({
+                "error": "Nur fertig gesclicte .gcode.3mf-Dateien werden unterstuetzt "
+                         "(Export aus Bambu Studio/OrcaSlicer)."
+            }), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix="dashboard-print-")
+    tmp_path = os.path.join(tmp_dir, filename)
+    f.save(tmp_path)
+
+    ok, err, entry = dash.add_farmbot_job(farmbot_id, tmp_path, filename)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "queue_entry": entry})
+
+
+@app.route("/api/farmbots/<farmbot_id>/jobs/<job_id>/thumbnail", methods=["GET"])
+def api_farmbot_job_thumbnail(farmbot_id, job_id):
+    path = dash.get_farmbot_job_thumbnail_path(farmbot_id, job_id)
+    if not path:
+        return "Kein Vorschaubild vorhanden.", 404
+    return send_file(path, mimetype="image/png")
+
+
+@app.route("/api/farmbots/<farmbot_id>/jobs/<job_id>", methods=["DELETE"])
+def api_farmbot_job_delete(farmbot_id, job_id):
+    ok = dash.delete_farmbot_job(farmbot_id, job_id)
+    if not ok:
+        return jsonify({"error": "Warteschlangen-Eintrag nicht gefunden."}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/farmbots/<farmbot_id>/jobs/reorder", methods=["POST"])
+def api_farmbot_jobs_reorder(farmbot_id):
+    """v2.7.0: setzt eine vollstaendig neue, haendisch vom Nutzer
+    gewaehlte Reihenfolge, Body {"order": [job_id, ...]} - siehe
+    PrintQueueStore.reorder() fuer die Validierung. Diese manuelle
+    Reihenfolge bleibt bestehen, bis der naechste Auftrag hinzugefuegt
+    wird - DANACH wird automatisch wieder neu sortiert (siehe
+    DashboardApp.add_farmbot_job()/_reorder_farmbot_queue())."""
+    data = request.get_json(force=True) or {}
+    order = data.get("order")
+    if not isinstance(order, list) or not order:
+        return jsonify({"error": "order (Liste von job_ids) fehlt."}), 400
+    ok = dash.reorder_farmbot_queue(farmbot_id, order)
+    if not ok:
+        return jsonify({
+            "error": "Reihenfolge passt nicht zur aktuellen Warteschlange (evtl. zwischenzeitlich "
+                     "geaendert) - bitte Ansicht neu laden."
+        }), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/api/farmbots/<farmbot_id>/pick", methods=["POST"])
+def api_farmbot_pick(farmbot_id):
+    """Ermittelt OHNE Seiteneffekt den naechsten Auftrag + einen dazu
+    passenden, gerade freien Zieldrucker (siehe DashboardApp.
+    pick_farmbot_job()) - fuer den 'Naechsten Druck starten'-Knopf.
+    Body optional {"exclude_printer_ids": [...]}, genutzt, wenn der
+    Nutzer im Kamera-Dialog 'anderer Drucker' waehlt."""
+    data = request.get_json(force=True) or {}
+    exclude = data.get("exclude_printer_ids") or []
+    ok, err, result = dash.pick_farmbot_job(farmbot_id, exclude_printer_ids=exclude)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/farmbots/<farmbot_id>/assign", methods=["POST"])
+def api_farmbot_assign(farmbot_id):
+    """Fuehrt das Ergebnis von /pick tatsaechlich aus (siehe DashboardApp.
+    assign_farmbot_job()), Body {"job_id": "...", "printer_id": "..."}.
+    Bei Bambu-Druckern liefert die Antwort dieselben Felder wie
+    /print/prepare (job_id, filename, filaments, ams_trays,
+    total_filaments) - das Frontend oeffnet darauf denselben bestehenden
+    AMS-Zuordnungsdialog und bestaetigt ueber den bestehenden Endpunkt
+    POST /api/printers/<printer_id>/print/confirm; bei Ultimaker wurde der
+    Druck bereits gestartet, Fortschritt ueber den bestehenden Endpunkt
+    GET /api/printers/<printer_id>/print/progress/<job_id>."""
+    data = request.get_json(force=True) or {}
+    job_id = data.get("job_id")
+    printer_id = data.get("printer_id")
+    if not job_id or not printer_id:
+        return jsonify({"error": "job_id und printer_id sind Pflichtfelder."}), 400
+    ok, err, result = dash.assign_farmbot_job(farmbot_id, job_id, printer_id)
+    if not ok:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "printer_id": printer_id, **result})
+
+
 @app.route("/api/version", methods=["GET"])
 def api_version():
     return jsonify({"version": APP_VERSION})
@@ -6178,6 +6842,28 @@ INDEX_HTML = r"""
   }
   .camera-card .name{ font-size:15px; font-weight:600; }
 
+  /* v2.6.0: FarmBot-Feld(er) - sitzt bewusst AUSSERHALB von #printerList
+     (eigenes display:grid), da FarmBot keine group_id/Raum-Zuordnung hat
+     und immer oberhalb der Drucker erscheinen soll, siehe
+     renderFarmbotPanel(). Jede Karte in eigenem, schmaleren Grid (mehrere
+     FarmBots nebeneinander), damit sie sich optisch klar von den
+     Drucker-Kacheln darunter abhebt. */
+  #farmbotPanel{
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));
+    gap:14px; margin-bottom:18px;
+  }
+  .farmbot-card{
+    background:var(--panel); border:1px solid #6b5b2a; border-radius:10px;
+    padding:16px 20px;
+  }
+  .farmbot-card .card-head{
+    display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px;
+  }
+  .farmbot-card .name{ font-size:15px; font-weight:600; }
+  .farmbot-card .farmbot-sub{ color:var(--text-dim); font-size:12px; margin-top:2px; }
+  .farmbot-card .farmbot-actions{ display:flex; align-items:center; gap:8px; }
+  .farmbot-card.disabled{ opacity:0.55; }
+
   .cam-modal .modal{ width:auto; padding:0; overflow:hidden; }
   .cam-modal img{ display:block; max-width:90vw; max-height:80vh; background:#000; }
   .cam-modal .cam-close{
@@ -6283,6 +6969,12 @@ INDEX_HTML = r"""
   </div>
 </header>
 
+<!-- v2.6.0: FarmBot-Feld(er) - ausserhalb der Raum-Gruppierung, da FarmBot
+     keine group_id hat (siehe DashboardApp "FarmBot"-Abschnitt). Nur
+     sichtbar, wenn mindestens ein FarmBot angelegt wurde, siehe
+     renderFarmbotPanel(). -->
+<div id="farmbotPanel"></div>
+
 <main id="printerList"></main>
 
 <!-- v2.3.0: Einstellungen-Modus - Drucker-/Raum-/Kamera-Verwaltung sowie
@@ -6301,6 +6993,23 @@ INDEX_HTML = r"""
     </div>
     <button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button>
     <div id="printerManageList" style="margin-top:14px;"></div>
+  </div>
+
+  <!-- v2.6.0: FarmBot - siehe DashboardApp-Abschnitt "FarmBot". Mehrere
+       unabhaengige FarmBots moeglich, jeweils mit eigenem Namenszusatz,
+       eigener Hersteller-/Familienauswahl, eigenem Arbeitstag-Fenster und
+       eigener maximaler Wartezeit. -->
+  <div class="settings-section">
+    <h2>FarmBot</h2>
+    <div class="hint-text">
+      Eigenstaendige Druckauftrags-Warteschlange(n), die automatisch einem
+      gerade freien Drucker der gewaehlten Hersteller-/Familienauswahl
+      zugewiesen werden - unabhaengig von der Warteschlange einzelner
+      Drucker. Aktiviert erscheint je FarmBot ein eigenes Feld oberhalb
+      der Drucker im Bedien-Modus.
+    </div>
+    <button class="btn" onclick="openAddFarmbotModal()">+ FarmBot hinzufuegen</button>
+    <div id="farmbotManageList" style="margin-top:14px;"></div>
   </div>
 
   <div class="settings-section">
@@ -6665,6 +7374,116 @@ INDEX_HTML = r"""
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeAssignModal()">Abbrechen</button>
       <button class="btn" onclick="confirmAssign()">Zuweisen</button>
+    </div>
+  </div>
+</div>
+
+<!-- v2.6.0: Modal: FarmBot-Warteschlange (Liste der Auftraege, die auf
+     Zuweisung an einen freien Drucker warten) - Aufbau bewusst identisch
+     zum Warteschlangen-Modal eines einzelnen Druckers (queueModal), ABER
+     ohne manuelle Umsortier-Pfeile, da die Reihenfolge hier IMMER
+     automatisch berechnet wird (siehe DashboardApp._reorder_farmbot_queue()). -->
+<div class="modal-backdrop" id="farmbotQueueModal">
+  <div class="modal history-modal">
+    <h2 id="farmbotQueueModalTitle">FarmBot-Warteschlange</h2>
+    <div class="modal-actions modal-actions-top">
+      <button class="btn btn-ghost" onclick="closeFarmbotQueueModal()">Schliessen</button>
+      <button class="btn" id="farmbotQueueNextBtn" onclick="farmbotStartNext(farmbotQueueModalId)">Naechsten Druck starten</button>
+    </div>
+    <div class="hint-text" id="farmbotQueueHint"></div>
+    <!-- v2.7.0: haendische Umsortierung per ▲/▼ moeglich (siehe
+         moveFarmbotQueueEntry()) - wird beim naechsten Datei-Upload
+         automatisch wieder ueberschrieben. -->
+    <div class="hint-text">
+      Reihenfolge laesst sich per ▲/▼ haendisch aendern - bei der
+      naechsten hochgeladenen Datei wird automatisch wieder umsortiert.
+    </div>
+    <div class="drop-zone queue-drop-zone" id="farmbotQueueDropZone"
+         ondragover="dzDragOver(event)"
+         ondragleave="dzDragLeave(event)"
+         ondrop="farmbotDzDropIntoModal(event)">
+      Datei hier ablegen, um sie dieser FarmBot-Warteschlange hinzuzufuegen
+      <div class="dz-hint">
+        oder
+        <label class="btn-mini file-btn">
+          Datei auswaehlen
+          <input type="file" style="display:none" onchange="addFileToFarmbotQueue(farmbotQueueModalId, this)">
+        </label>
+      </div>
+    </div>
+    <div id="farmbotQueueModalBody" class="history-modal-scroll"></div>
+  </div>
+</div>
+
+<!-- v2.6.0: Modal: Kamera-Bestaetigung "Druckraum frei", bevor FarmBot
+     einen Auftrag auf einem Drucker startet, der zuvor bereits etwas
+     fertig gedruckt hat (siehe DashboardApp._update_bed_confirm_flags()/
+     pick_farmbot_job() - auf ausdruecklichen Nutzerwunsch: "Nur wenn der
+     Drucker zuvor etwas fertig gedruckt hat"). -->
+<div class="modal-backdrop" id="farmbotBedModal">
+  <div class="modal">
+    <h2>Druckraum freigeben</h2>
+    <div class="hint-text" id="farmbotBedModalHint"></div>
+    <img id="farmbotBedCamImg" src="" style="width:100%; border-radius:8px; background:#000; margin:10px 0;">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="farmbotBedOtherPrinter()">Anderer Drucker</button>
+      <button class="btn" onclick="farmbotBedConfirmFree()">Druckraum frei</button>
+    </div>
+  </div>
+</div>
+
+<!-- v2.6.0: Modal: FarmBot anlegen/bearbeiten (Einstellungen-Modus) -
+     Aufbau bewusst angelehnt an addModal (Hersteller-/Familienauswahl
+     identisch zum Anlegen eines Druckers), siehe FARMBOT_MANUFACTURERS. -->
+<div class="modal-backdrop" id="farmbotModal">
+  <div class="modal">
+    <h2 id="farmbotModalTitle">FarmBot hinzufuegen</h2>
+    <div class="error-msg" id="farmbotModalError"></div>
+
+    <label>Namenszusatz (optional)</label>
+    <input id="fb_name_suffix" placeholder="z. B. Werkstatt">
+    <div class="checkbox-row">
+      <input type="checkbox" id="fb_enabled" checked>
+      <label style="margin:0;">Aktiviert</label>
+    </div>
+
+    <label>Hersteller</label>
+    <select id="fb_manufacturer" onchange="toggleFarmbotManufacturerFields()">
+      <option value="bambu">Bambu Lab</option>
+      <option value="ultimaker">Ultimaker</option>
+    </select>
+
+    <div id="farmbotBambuFields">
+      <label>Druckerfamilie</label>
+      <select id="fb_bambu_family">
+        <option value="x1">X1-Serie (X1C, X1E)</option>
+        <option value="a1">A1-Serie (A1, A1 Mini)</option>
+        <option value="h2">H2-Serie (H2S, H2D, H2D Pro, H2C)</option>
+        <option value="p1">P1-Serie (P1P, P1S)</option>
+        <option value="p2">P2-Serie (P2S)</option>
+        <option value="x2">X2-Serie (X2D)</option>
+      </select>
+    </div>
+    <div class="hint-text" id="farmbotUltimakerHint" style="display:none;">
+      Es werden nur bereits mit dem Dashboard gekoppelte Ultimaker-Drucker
+      beruecksichtigt (siehe "Drucker verwalten").
+    </div>
+
+    <label>Arbeitstag von</label>
+    <input id="fb_work_start" placeholder="08:00">
+    <label>Arbeitstag bis</label>
+    <input id="fb_work_end" placeholder="18:00">
+    <label>Maximale Wartezeit in der Warteschlange (Tage)</label>
+    <input id="fb_max_queue_days" placeholder="3">
+    <div class="hint-text">
+      Auftraege, die diese Wartezeit erreichen, werden bei der naechsten
+      automatischen Neuberechnung der Reihenfolge unabhaengig von ihrer
+      Druckdauer vorrangig abgearbeitet.
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeFarmbotModal()">Abbrechen</button>
+      <button class="btn" onclick="submitFarmbotModal()">Speichern</button>
     </div>
   </div>
 </div>
@@ -8024,6 +8843,10 @@ async function refresh(){
   lastGroupList = groups;
   lastCamsList = cams;
   lastStandaloneExtrasList = standaloneExtras;
+  // v2.6.0: FarmBot-Feld(er) oberhalb der Raeume - eigener, von Raeumen
+  // unabhaengiger Abruf (siehe renderFarmbotPanel()/#farmbotPanel).
+  refreshFarmbotPanel();
+  if(farmbotQueueModalId) refreshFarmbotQueueModal();
   // v2.0.1: haelt den "Druckraum leer"-Knopf live aktuell, falls die
   // Warteschlange gerade offen ist (z. B. der Nutzer wartet darauf, dass
   // ein Bambu-Lab-Drucker fertig wird, ohne das Modal zu schliessen).
@@ -8860,6 +9683,10 @@ function enterSettingsMode(){
   document.getElementById('operatorControls').style.display = 'none';
   document.getElementById('settingsModeControls').style.display = 'flex';
   document.getElementById('printerList').style.display = 'none';
+  // v2.6.0: FarmBot-Feld(er) gehoeren zum Bedien-Modus, nicht zur
+  // Einstellungen-Verwaltung (dafuer gibt es den eigenen Abschnitt
+  // "FarmBot" im Einstellungen-Modus) - siehe #farmbotPanel.
+  document.getElementById('farmbotPanel').style.display = 'none';
   document.getElementById('settingsPanel').style.display = 'block';
   refreshSettingsPanel();
 }
@@ -8868,6 +9695,7 @@ function exitSettingsMode(){
   document.getElementById('operatorControls').style.display = 'flex';
   document.getElementById('settingsModeControls').style.display = 'none';
   document.getElementById('printerList').style.display = '';
+  document.getElementById('farmbotPanel').style.display = '';
   document.getElementById('settingsPanel').style.display = 'none';
   refresh();
 }
@@ -8890,6 +9718,10 @@ async function refreshSettingsPanel(){
   refreshPrinterManageList(printers, groups);
   refreshGroupsManageList(groups);
   refreshCamerasManageList(cams, groups);
+  // v2.6.0: FarmBot-Verwaltung - eigener Abruf, unabhaengig von den
+  // obigen Listen (siehe refreshFarmbotManageList()).
+  fetch('/api/farmbots').then(r => r.json()).then(refreshFarmbotManageList)
+    .catch(() => showToast('FarmBot-Liste konnte nicht geladen werden.', 'err'));
   // v2.5.1: MQTT-Bereich jetzt inline statt in einem eigenen Modal - wird
   // hier wie die anderen Verwaltungslisten mit aktualisiert (lastGroupList
   // ist zu diesem Zeitpunkt bereits befuellt, siehe renderMqttExtrasList()
@@ -9215,6 +10047,500 @@ async function saveHistorySettings(){
   } catch(e){
     showToast('Netzwerkfehler beim Speichern.', 'err');
   }
+}
+
+// ----------------------------------------------------------------------
+// v2.6.0 NEUES FEATURE: FarmBot - eigenstaendige, drucker-unabhaengige
+// Warteschlange mit automatischer Terminierung und Zuweisung an einen
+// freien Drucker der gewaehlten Hersteller-/Familienauswahl. Siehe
+// DashboardApp-Abschnitt "FarmBot" in app.py fuer den vollstaendigen
+// Ablauf und die Begruendung der einzelnen Entscheidungen.
+// ----------------------------------------------------------------------
+let lastFarmbotList = [];
+
+async function refreshFarmbotPanel(){
+  let farmbots;
+  try{
+    farmbots = await fetch('/api/farmbots').then(r => r.json());
+  } catch(e){
+    return; // best effort - ein fehlender Abruf soll refresh() nicht blockieren
+  }
+  lastFarmbotList = farmbots;
+  const el = document.getElementById('farmbotPanel');
+  if(!el) return;
+  const enabled = farmbots.filter(f => f.enabled);
+  if(enabled.length === 0){
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = enabled.map(cardForFarmbot).join('');
+}
+
+function cardForFarmbot(fb){
+  const isUltimaker = fb.manufacturer === 'ultimaker';
+  const sub = (isUltimaker ? 'Ultimaker' : ('Bambu Lab &middot; ' + (fb.bambu_family || '').toUpperCase()))
+    + ` &middot; Arbeitstag ${fb.work_start}&ndash;${fb.work_end} Uhr &middot; max. ${fb.max_queue_days} Tage Wartezeit`;
+  const fitsText = fb.queue_count
+    ? `${fb.fits_in_workday} von ${fb.queue_count} Auftraegen koennen rechnerisch heute noch gestartet werden (der jeweils letzte darf dabei unbeaufsichtigt ueber den Feierabend hinaus weiterdrucken).`
+    : 'Warteschlange ist leer.';
+  return `
+    <div class="farmbot-card">
+      <div class="card-head">
+        <div>
+          <div class="name">${fb.display_name}</div>
+          <div class="farmbot-sub">${sub}</div>
+        </div>
+        <div class="farmbot-actions">
+          <span class="type-badge">${fb.queue_count} wartend</span>
+          <button class="btn-mini" onclick="openFarmbotQueueModal('${fb.id}')">Warteschlange</button>
+        </div>
+      </div>
+      <div class="hint-text">${fitsText}</div>
+      <div class="drop-zone" id="farmbot-dz-${fb.id}"
+           ondragover="dzDragOver(event)" ondragleave="dzDragLeave(event)"
+           ondrop="farmbotDzDrop(event,'${fb.id}')">
+        ${isUltimaker ? 'Fertig gesclicte .gcode-Datei' : 'Fertig gesclicte .gcode.3mf-Datei'} hier ablegen
+      </div>
+      <div class="modal-actions" style="padding-top:12px;">
+        <button class="btn" onclick="farmbotStartNext('${fb.id}')">Naechsten Druck starten</button>
+      </div>
+    </div>`;
+}
+
+// v2.6.0: gemeinsame Upload-Logik fuer Drag&Drop direkt auf die Karte,
+// Drag&Drop in das Warteschlangen-Modal UND den Datei-Auswahl-Button dort
+// - siehe farmbotDzDrop()/farmbotDzDropIntoModal()/addFileToFarmbotQueue().
+async function uploadFileToFarmbot(farmbotId, file, zoneEl){
+  const fb = lastFarmbotList.find(f => f.id === farmbotId);
+  const wantsGcode = fb && fb.manufacturer === 'ultimaker';
+  const lower = file.name.toLowerCase();
+  if(wantsGcode ? !lower.endsWith('.gcode') : !lower.endsWith('.gcode.3mf')){
+    showToast(wantsGcode
+      ? 'Nur fertig gesclicte .gcode-Dateien werden unterstuetzt (Export aus Cura).'
+      : 'Nur fertig gesclicte .gcode.3mf-Dateien werden unterstuetzt (Export aus Bambu Studio/OrcaSlicer).', 'err');
+    return;
+  }
+  if(zoneEl) zoneEl.classList.add('uploading');
+  const form = new FormData();
+  form.append('file', file);
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId + '/jobs', { method:'POST', body: form });
+    const data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Fehler beim Hinzufuegen zur FarmBot-Warteschlange.', 'err');
+      return;
+    }
+    showToast('Zur FarmBot-Warteschlange hinzugefuegt.', 'ok');
+  } catch(e){
+    showToast('Netzwerkfehler beim Hochladen.', 'err');
+    return;
+  } finally {
+    if(zoneEl) zoneEl.classList.remove('uploading');
+  }
+  await refreshFarmbotPanel();
+  if(farmbotQueueModalId === farmbotId) await refreshFarmbotQueueModal();
+}
+
+async function farmbotDzDrop(ev, farmbotId){
+  ev.preventDefault();
+  const zone = ev.currentTarget;
+  zone.classList.remove('dragover');
+  const files = ev.dataTransfer.files;
+  if(!files || files.length === 0) return;
+  await uploadFileToFarmbot(farmbotId, files[0], zone);
+}
+
+async function farmbotDzDropIntoModal(ev){
+  ev.preventDefault();
+  const zone = ev.currentTarget;
+  zone.classList.remove('dragover');
+  const files = ev.dataTransfer.files;
+  if(!files || files.length === 0 || !farmbotQueueModalId) return;
+  await uploadFileToFarmbot(farmbotQueueModalId, files[0], zone);
+}
+
+async function addFileToFarmbotQueue(farmbotId, inputEl){
+  const file = inputEl.files[0];
+  inputEl.value = '';
+  if(!file) return;
+  await uploadFileToFarmbot(farmbotId, file, null);
+}
+
+// v2.6.0: Warteschlangen-Modal eines FarmBot - Aufbau/Verhalten bewusst
+// angelehnt an das Warteschlangen-Modal eines einzelnen Druckers
+// (openQueueModal()/refreshQueueModal()), aber OHNE manuelle Umsortier-
+// Pfeile (die Reihenfolge wird hier immer automatisch neu berechnet,
+// siehe DashboardApp._reorder_farmbot_queue()).
+let farmbotQueueModalId = null;
+
+async function openFarmbotQueueModal(farmbotId){
+  farmbotQueueModalId = farmbotId;
+  const fb = lastFarmbotList.find(f => f.id === farmbotId);
+  document.getElementById('farmbotQueueModalTitle').textContent =
+    (fb ? fb.display_name : 'FarmBot') + ' - Warteschlange';
+  document.getElementById('farmbotQueueModalBody').innerHTML = '<div class="history-empty">Wird geladen ...</div>';
+  document.getElementById('farmbotQueueModal').classList.add('show');
+  await refreshFarmbotQueueModal();
+}
+
+function closeFarmbotQueueModal(){
+  document.getElementById('farmbotQueueModal').classList.remove('show');
+  document.getElementById('farmbotQueueModalBody').innerHTML = '';
+  farmbotQueueModalId = null;
+}
+
+async function refreshFarmbotQueueModal(){
+  const farmbotId = farmbotQueueModalId;
+  if(!farmbotId) return;
+  const body = document.getElementById('farmbotQueueModalBody');
+  const hint = document.getElementById('farmbotQueueHint');
+  const btn = document.getElementById('farmbotQueueNextBtn');
+  let entries;
+  try{
+    entries = await fetch('/api/farmbots/' + farmbotId + '/jobs').then(r => r.json());
+  } catch(e){
+    body.innerHTML = '<div class="history-empty">Warteschlange konnte nicht geladen werden.</div>';
+    return;
+  }
+  if(farmbotQueueModalId !== farmbotId) return; // Modal wurde inzwischen geschlossen/gewechselt
+  btn.disabled = !(entries && entries.length);
+  hint.textContent = (entries && entries.length) ? '' : 'Die Warteschlange ist leer.';
+  if(!entries || entries.length === 0){
+    body.innerHTML = '<div class="history-empty">Die Warteschlange ist leer.</div>';
+    return;
+  }
+  // Aeltester (=naechster) Auftrag zuerst - siehe PrintQueueStore-Kommentar.
+  // v2.7.0: Pfeile fuer haendische Umsortierung (siehe moveFarmbotQueueEntry())
+  // - wird beim naechsten Datei-Upload automatisch wieder ueberschrieben
+  // (siehe Hinweistext unten und DashboardApp.add_farmbot_job()).
+  body.innerHTML = entries.map((e, i) => {
+    const thumb = e.has_image
+      ? `<img class="history-thumb" src="/api/farmbots/${farmbotId}/jobs/${e.job_id}/thumbnail" alt="">`
+      : `<div class="history-thumb-placeholder">${FILE_ICON}</div>`;
+    const label = (i === 0) ? '<b>Naechster:</b> ' : '';
+    const durText = formatDuration(e.duration_sec);
+    const durHtml = durText ? ` &middot; Druckzeit ca. ${durText}` : ' &middot; Druckzeit unbekannt (wird ans Ende gestellt)';
+    return `
+      <div class="history-item queue-item">
+        <div class="queue-order-btns">
+          <button class="btn-mini" ${i === 0 ? 'disabled' : ''} title="Nach oben" onclick="moveFarmbotQueueEntry('${farmbotId}','${e.job_id}',-1)">&uarr;</button>
+          <button class="btn-mini" ${i === entries.length - 1 ? 'disabled' : ''} title="Nach unten" onclick="moveFarmbotQueueEntry('${farmbotId}','${e.job_id}',1)">&darr;</button>
+        </div>
+        ${thumb}
+        <div class="history-body">
+          <div class="history-filename">${label}${e.filename}</div>
+          <div class="history-date">In Warteschlange seit ${e.added_at}${durHtml}</div>
+        </div>
+        <div class="history-actions">
+          <button class="btn-mini btn-delete" onclick="deleteFarmbotQueueEntry('${farmbotId}','${e.job_id}')">Loeschen</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// v2.7.0: haendische Umsortierung der FarmBot-Warteschlange, auf
+// ausdruecklichen Nutzerwunsch - Aufbau identisch zu moveQueueEntry()
+// (Warteschlange eines einzelnen Druckers). Die so gewaehlte Reihenfolge
+// bleibt bestehen, bis der naechste Auftrag hinzugefuegt wird - DANACH
+// sortiert DashboardApp.add_farmbot_job() automatisch wieder neu (siehe
+// _reorder_farmbot_queue()), unveraendert wie seit v2.6.0.
+async function moveFarmbotQueueEntry(farmbotId, jobId, direction){
+  let entries;
+  try{
+    entries = await fetch('/api/farmbots/' + farmbotId + '/jobs').then(r => r.json());
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  const ids = entries.map(e => e.job_id);
+  const idx = ids.indexOf(jobId);
+  const newIdx = idx + direction;
+  if(idx < 0 || newIdx < 0 || newIdx >= ids.length) return;
+  [ids[idx], ids[newIdx]] = [ids[newIdx], ids[idx]];
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId + '/jobs/reorder', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({order: ids})
+    });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Reihenfolge konnte nicht geaendert werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Umsortieren.', 'err');
+    return;
+  }
+  await refreshFarmbotQueueModal();
+}
+
+async function deleteFarmbotQueueEntry(farmbotId, jobId){
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId + '/jobs/' + jobId, { method:'DELETE' });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'Warteschlangen-Eintrag konnte nicht geloescht werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Loeschen.', 'err');
+    return;
+  }
+  await refreshFarmbotPanel();
+  if(farmbotQueueModalId === farmbotId) await refreshFarmbotQueueModal();
+}
+
+// v2.6.0: "Naechsten Druck starten" - zweistufig: pick_farmbot_job()
+// (serverseitig OHNE Seiteneffekt) ermittelt Auftrag + Zieldrucker und
+// meldet, ob eine Kamera-Bestaetigung "Druckraum frei" noetig ist (siehe
+// DashboardApp.pick_farmbot_job() - nur wenn der Zieldrucker zuvor etwas
+// fertig gedruckt hat); erst danach fuehrt farmbotDoAssign() die
+// tatsaechliche Zuweisung/den Druckstart aus (assign_farmbot_job()).
+let farmbotPendingPick = null;
+
+async function farmbotStartNext(farmbotId, excludePrinterIds){
+  let data;
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId + '/pick', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ exclude_printer_ids: excludePrinterIds || [] })
+    });
+    data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Aktuell kein naechster Druck moeglich.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler.', 'err');
+    return;
+  }
+  farmbotPendingPick = {
+    farmbotId: farmbotId,
+    jobId: data.job_id,
+    printerId: data.printer_id,
+    excludePrinterIds: (excludePrinterIds || []).slice(),
+  };
+  if(data.needs_bed_confirm){
+    openFarmbotBedModal(data);
+  } else {
+    await farmbotDoAssign();
+  }
+}
+
+// v2.6.0: Kamera-Bestaetigung "Druckraum frei" - nur wenn der Zieldrucker
+// zuvor etwas fertig gedruckt hat (siehe pick_farmbot_job()). "Anderer
+// Drucker" wiederholt die Auswahl unter Ausschluss dieses Druckers.
+function openFarmbotBedModal(data){
+  document.getElementById('farmbotBedModalHint').textContent =
+    `"${data.filename}" soll auf "${data.printer_name}" gedruckt werden - dieser Drucker hat zuvor bereits ` +
+    `etwas fertig gedruckt. Bitte zunaechst den Druckraum leeren, dann bestaetigen - oder einen anderen ` +
+    `Drucker waehlen lassen.`;
+  const img = document.getElementById('farmbotBedCamImg');
+  img.onerror = function(){ img.style.display = 'none'; };
+  img.style.display = '';
+  img.src = '/camera/' + data.printer_id + '?_=' + Date.now();
+  document.getElementById('farmbotBedModal').classList.add('show');
+}
+
+function closeFarmbotBedModal(){
+  const img = document.getElementById('farmbotBedCamImg');
+  img.onerror = null;
+  img.src = '';
+  document.getElementById('farmbotBedModal').classList.remove('show');
+}
+
+async function farmbotBedOtherPrinter(){
+  if(!farmbotPendingPick) return;
+  const { farmbotId, printerId, excludePrinterIds } = farmbotPendingPick;
+  farmbotPendingPick = null;
+  closeFarmbotBedModal();
+  await farmbotStartNext(farmbotId, excludePrinterIds.concat([printerId]));
+}
+
+async function farmbotBedConfirmFree(){
+  closeFarmbotBedModal();
+  await farmbotDoAssign();
+}
+
+async function farmbotDoAssign(){
+  if(!farmbotPendingPick) return;
+  const { farmbotId, jobId, printerId } = farmbotPendingPick;
+  farmbotPendingPick = null;
+  let data;
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId + '/assign', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ job_id: jobId, printer_id: printerId })
+    });
+    data = await res.json();
+    if(!res.ok){
+      showToast(data.error || 'Fehler beim Starten des Druckauftrags.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Starten.', 'err');
+    return;
+  }
+  if(data.mode === 'bambu'){
+    // v2.6.0: Zuordnung erfolgt bewusst HIER (nach Drucker-Auswahl UND
+    // Bestaetigung der Verfuegbarkeit) - siehe assign_farmbot_job(). Der
+    // bestehende AMS-Dialog kuemmert sich um den Rest (confirmAmsModal()
+    // sendet an /api/printers/<id>/print/confirm, identisch zum manuellen
+    // Drag&Drop-Upload).
+    openAmsModal(data.printer_id, data);
+  } else {
+    showToast('Druck gestartet.', 'ok');
+  }
+  await refreshFarmbotPanel();
+  if(farmbotQueueModalId === farmbotId) await refreshFarmbotQueueModal();
+}
+
+// v2.6.0: FarmBot-Verwaltung im Einstellungen-Modus (Anlegen/Bearbeiten/
+// Loeschen/Aktivieren) - Aufbau angelehnt an refreshCamerasManageList()/
+// openCameraModal().
+function refreshFarmbotManageList(farmbots){
+  lastFarmbotList = farmbots;
+  const el = document.getElementById('farmbotManageList');
+  if(!farmbots.length){
+    el.innerHTML = '<div class="hint-text">Noch kein FarmBot angelegt.</div>';
+    return;
+  }
+  el.innerHTML = farmbots.map(fb => `
+    <div class="manage-row">
+      <div class="manage-info">
+        ${fb.display_name}${fb.enabled ? '' : ' <span class="hint-text">(deaktiviert)</span>'}
+        <div class="manage-sub">
+          ${fb.manufacturer === 'bambu' ? 'Bambu Lab &middot; ' + (fb.bambu_family || '').toUpperCase() : 'Ultimaker'}
+          &middot; Arbeitstag ${fb.work_start}&ndash;${fb.work_end} Uhr &middot; max. ${fb.max_queue_days} Tage
+        </div>
+      </div>
+      <div class="manage-actions">
+        <button class="btn-mini" onclick="toggleFarmbotEnabled('${fb.id}', ${!fb.enabled})">${fb.enabled ? 'Deaktivieren' : 'Aktivieren'}</button>
+        <button class="btn-mini" title="Bearbeiten" onclick="startEditFarmbot('${fb.id}')">Bearbeiten</button>
+        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteFarmbot('${fb.id}')">&times;</button>
+      </div>
+    </div>`).join('');
+}
+
+async function toggleFarmbotEnabled(farmbotId, newEnabled){
+  const fb = lastFarmbotList.find(f => f.id === farmbotId);
+  if(!fb) return;
+  await saveFarmbotFields(farmbotId, Object.assign({}, fb, { enabled: newEnabled }));
+}
+
+let farmbotModalEditId = null;
+
+function toggleFarmbotManufacturerFields(){
+  const isUltimaker = document.getElementById('fb_manufacturer').value === 'ultimaker';
+  document.getElementById('farmbotBambuFields').style.display = isUltimaker ? 'none' : '';
+  document.getElementById('farmbotUltimakerHint').style.display = isUltimaker ? '' : 'none';
+}
+
+function openAddFarmbotModal(){
+  farmbotModalEditId = null;
+  document.getElementById('farmbotModalTitle').textContent = 'FarmBot hinzufuegen';
+  document.getElementById('farmbotModalError').style.display = 'none';
+  document.getElementById('fb_name_suffix').value = '';
+  document.getElementById('fb_enabled').checked = true;
+  document.getElementById('fb_manufacturer').value = 'bambu';
+  document.getElementById('fb_bambu_family').value = 'x1';
+  document.getElementById('fb_work_start').value = '08:00';
+  document.getElementById('fb_work_end').value = '18:00';
+  document.getElementById('fb_max_queue_days').value = '3';
+  toggleFarmbotManufacturerFields();
+  document.getElementById('farmbotModal').classList.add('show');
+}
+
+function startEditFarmbot(farmbotId){
+  const fb = lastFarmbotList.find(f => f.id === farmbotId);
+  if(!fb) return;
+  farmbotModalEditId = farmbotId;
+  document.getElementById('farmbotModalTitle').textContent = 'FarmBot bearbeiten';
+  document.getElementById('farmbotModalError').style.display = 'none';
+  document.getElementById('fb_name_suffix').value = fb.name_suffix || '';
+  document.getElementById('fb_enabled').checked = !!fb.enabled;
+  document.getElementById('fb_manufacturer').value = fb.manufacturer;
+  document.getElementById('fb_bambu_family').value = fb.bambu_family || 'x1';
+  document.getElementById('fb_work_start').value = fb.work_start;
+  document.getElementById('fb_work_end').value = fb.work_end;
+  document.getElementById('fb_max_queue_days').value = fb.max_queue_days;
+  toggleFarmbotManufacturerFields();
+  document.getElementById('farmbotModal').classList.add('show');
+}
+
+function closeFarmbotModal(){
+  document.getElementById('farmbotModal').classList.remove('show');
+  farmbotModalEditId = null;
+}
+
+function collectFarmbotModalFields(){
+  return {
+    name_suffix: document.getElementById('fb_name_suffix').value.trim(),
+    enabled: document.getElementById('fb_enabled').checked,
+    manufacturer: document.getElementById('fb_manufacturer').value,
+    bambu_family: document.getElementById('fb_bambu_family').value,
+    work_start: document.getElementById('fb_work_start').value.trim(),
+    work_end: document.getElementById('fb_work_end').value.trim(),
+    max_queue_days: document.getElementById('fb_max_queue_days').value.trim(),
+  };
+}
+
+async function submitFarmbotModal(){
+  const data = collectFarmbotModalFields();
+  const errBox = document.getElementById('farmbotModalError');
+  errBox.style.display = 'none';
+  const isEdit = !!farmbotModalEditId;
+  let res, resData;
+  try{
+    res = await fetch(isEdit ? '/api/farmbots/' + farmbotModalEditId : '/api/farmbots', {
+      method: isEdit ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)
+    });
+    resData = await res.json().catch(() => ({}));
+  } catch(e){
+    errBox.textContent = 'Netzwerkfehler beim Speichern.';
+    errBox.style.display = 'block';
+    return;
+  }
+  if(!res.ok){
+    errBox.textContent = resData.error || 'FarmBot konnte nicht gespeichert werden.';
+    errBox.style.display = 'block';
+    return;
+  }
+  closeFarmbotModal();
+  showToast('Gespeichert.', 'ok');
+  refreshSettingsPanel();
+}
+
+async function saveFarmbotFields(farmbotId, data){
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId, {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)
+    });
+    if(!res.ok){
+      const resData = await res.json().catch(() => ({}));
+      showToast(resData.error || 'Aenderung konnte nicht gespeichert werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Speichern.', 'err');
+    return;
+  }
+  refreshSettingsPanel();
+}
+
+async function deleteFarmbot(farmbotId){
+  try{
+    const res = await fetch('/api/farmbots/' + farmbotId, { method:'DELETE' });
+    if(!res.ok){
+      const data = await res.json().catch(() => ({}));
+      showToast(data.error || 'FarmBot konnte nicht entfernt werden.', 'err');
+      return;
+    }
+  } catch(e){
+    showToast('Netzwerkfehler beim Entfernen.', 'err');
+    return;
+  }
+  showToast('FarmBot entfernt.', 'ok');
+  refreshSettingsPanel();
 }
 
 setLayoutCols(getLayoutCols());

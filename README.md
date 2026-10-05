@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.5.5).
+> den aktuellen Stand (v2.5.6).
 
 ---
 
@@ -422,6 +422,13 @@ Einstellungen-Modus - genau wie bei "Drucker verwalten"/"Raeume"/
 einem einzelnen "MQTT-Geraete verwalten"-Knopf in einem grossen,
 eigenen Dialogfenster, als einziger Abschnitt mit abweichendem
 Bedienkonzept.
+
+**Sparkline-Farbe eigenstaendiger Sensoren (seit v2.5.6 korrekt):** ein
+eigenstaendiger MQTT-Sensor mit der Anzeigeart "Bei Luftfeuchtigkeit
+anzeigen" zeigt sein Verlaufsdiagramm jetzt genau wie ein gleichartiger,
+druckergebundener Sensor in Blau - unabhaengig davon, ob er einem
+Drucker zugeordnet ist oder nicht (vorher war die eigenstaendige Kachel
+immer in der Default-Farbe Rot).
 
 ---
 

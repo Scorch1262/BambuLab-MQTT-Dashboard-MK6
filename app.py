@@ -116,7 +116,15 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # Drucker-Firmware selbst in Ordnung ist. Keine Code-Aenderung noetig -
 # nur Kommentare/Log-Text/Dokumentation von "Experiment"/"probeweise" auf
 # bestaetigten, dauerhaften Fix aktualisiert. Siehe UEBERGABE.md v2.5.5.
-APP_VERSION = "2.5.5"
+#
+# v2.5.6: PATCH, auf ausdruecklichen Nutzerwunsch: ein eigenstaendiger
+# (keinem Drucker zugeordneter) MQTT-Sensor mit "display": "humidity"
+# zeigte sein Verlaufsdiagramm bisher in der Default-Farbe (temp-spark,
+# rot) statt wie sein druckergebundenes Gegenstueck (siehe extraChip())
+# in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
+# Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
+# Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
+APP_VERSION = "2.5.6"
 
 import os
 import sys
@@ -7989,13 +7997,19 @@ function cardForStandaloneExtra(e){
   if(isNumeric) recordTempHistory('__standalone__', 'extra_' + e.id, num);
   const history = (tempHistory['__standalone__'] && tempHistory['__standalone__']['extra_' + e.id]) || [];
   const val = isNumeric ? formatTemp(num) : ((raw === undefined || raw === null || raw === '') ? '–' : raw);
+  // v2.5.6: Sparkline-Farbe wie bei druckergebundenen Extras (siehe
+  // extraChip() oben) nach "display" waehlen, statt immer die Default-
+  // Farbe (temp-spark/rot) zu nehmen - ein eigenstaendiger Sensor mit
+  // "display": "humidity" soll genauso blau sein wie derselbe Sensor,
+  // waere er einem Drucker zugeordnet.
+  const sparkClass = (e.display === 'humidity') ? 'humidity-spark' : 'temp-spark';
   return `
     <div class="camera-card">
       <div>
         <span class="name">${e.label}</span>
         <span class="type-badge">Sensor</span>
       </div>
-      <div><b>${val}${e.unit ? ' ' + e.unit : ''}</b>${isNumeric ? sparklineSvg(history) : ''}</div>
+      <div><b>${val}${e.unit ? ' ' + e.unit : ''}</b>${isNumeric ? sparklineSvg(history, sparkClass) : ''}</div>
     </div>`;
 }
 

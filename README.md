@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.7.0).
+> den aktuellen Stand (v2.8.0).
 
 ---
 
@@ -35,6 +35,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [6. Grenzen & Hinweise](#6-grenzen--hinweise)
 - [7. Bedien-/Einstellungsmodus, Raeume & externe Kameras (seit v2.3.0)](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)
 - [8. FarmBot: automatische Warteschlange ueber mehrere Drucker (seit v2.6.0)](#8-farmbot-automatische-warteschlange-ueber-mehrere-drucker-seit-v260)
+- [9. Sprache der Oberflaeche (seit v2.8.0)](#9-sprache-der-oberflaeche-seit-v280)
 
 ---
 
@@ -502,6 +503,39 @@ Druckers.
 unabhaengig von der direkten, manuellen Zuweisung von Druckauftraegen
 an einzelne Drucker ueber das Dashboard - beide Wege koennen
 gleichzeitig genutzt werden, ohne sich gegenseitig zu beeinflussen.
+
+---
+
+## 9. Sprache der Oberflaeche (seit v2.8.0)
+
+Die Oberflaeche des Dashboards kann zwischen **sieben Sprachen**
+umgeschaltet werden: Deutsch, Englisch, Franzoesisch, Spanisch,
+Chinesisch, Japanisch und Tuerkisch.
+
+**Umschalten:** Einstellungen → Abschnitt "Sprache" (ganz oben) →
+Dropdown. Die Umschaltung wirkt sofort auf alle Labels, Schaltflaechen,
+Hinweistexte und Platzhalter - ein Neuladen der Seite ist nicht
+erforderlich. Die Wahl wird in `config.json` gespeichert (Feld
+`"language"`) und gilt fuer alle Geraete/Browser, die auf dasselbe
+Dashboard zugreifen (es ist eine Server-Einstellung, keine
+browserlokale).
+
+**Erststart:** Existiert beim Programmstart noch keine `config.json`
+(z. B. bei einer frischen Installation), erscheint die Sprachauswahl
+als allererstes Fenster, noch bevor der Rest der Seite aufgebaut wird.
+Die Auswahl erfolgt dabei anhand der jeweils eigenen Sprachbezeichnung
+(z. B. "Deutsch", "English", "中文"), damit sie unabhaengig von der noch
+unbekannten Zielsprache verstanden werden kann. Nach der Auswahl startet
+das Dashboard normal in der gewaehlten Sprache.
+
+**Bekannte Einschraenkung:** Uebersetzt wird ausschliesslich die
+*Oberflaeche* (Labels, Schaltflaechen, Hinweis- und Platzhaltertexte).
+Fehlermeldungen, die vom Server kommen (z. B. bei einem fehlgeschlagenen
+Verbindungsversuch zu einem Drucker, oder bei einer ungueltigen
+Eingabe), bleiben unabhaengig von der gewaehlten Oberflaechensprache
+**immer auf Deutsch** - diese Meldungen stammen aus dem Python-Teil des
+Dashboards und wurden bewusst nicht in den Umfang dieser Umstellung
+aufgenommen.
 
 ---
 

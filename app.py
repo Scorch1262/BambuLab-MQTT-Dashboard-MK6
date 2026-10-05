@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 
 import os
 import sys
@@ -248,6 +248,11 @@ DEFAULT_CONFIG = {
         "port": 8000
     },
     "preform_server": "http://localhost:44388",
+    # v2.8.0: Oberflaechensprache (siehe SUPPORTED_LANGUAGES weiter unten
+    # und den Abschnitt "Mehrsprachigkeit" in UEBERGABE.md) - "de" als
+    # Standardwert, damit bestehende config.json-Dateien ohne dieses Feld
+    # (siehe load_config()-Migration) unveraendert auf Deutsch weiterlaufen.
+    "language": "de",
     # v2.2.21: ueber config.json einstellbar (siehe _resolve_history_max_jobs()
     # und README Abschnitt 3) - Standardwert unveraendert wie zuvor fest
     # codiert (PRINT_HISTORY_MAX_JOBS = 30).
@@ -299,6 +304,24 @@ KNOWN_TYPES = ("bambu",) + FORMLABS_TYPES + ("octoprint",) + CREALITY_TYPES + ("
 # v2.6.0 fuer die bewusste Entscheidung, das vorerst NICHT zusaetzlich
 # nachzuruesten.
 FARMBOT_MANUFACTURERS = ("bambu", "ultimaker")
+
+# v2.8.0: Mehrsprachigkeit - die eigentlichen Uebersetzungen liegen
+# vollstaendig im Frontend (siehe I18N-Objekt im <script>-Block von
+# INDEX_HTML); das Backend kennt nur die gueltigen Sprachcodes zur
+# Validierung von config.json/PUT /api/settings. Server-Fehlermeldungen
+# (jsonify({"error": ...})) bleiben bewusst auf Deutsch - siehe
+# UEBERGABE.md v2.8.0 fuer die Begruendung dieser Abgrenzung.
+SUPPORTED_LANGUAGES = ("de", "en", "fr", "es", "zh", "ja", "tr")
+
+# v2.8.0: True, solange seit dem Start dieses Prozesses noch KEINE
+# config.json existierte (vor dem allerersten load_config()-Aufruf unten)
+# UND seitdem noch keine Einstellung gespeichert wurde - siehe
+# get_settings()/update_language() sowie den Sprachauswahl-Dialog, der
+# serverseitig genau in diesem Fall beim Oeffnen der Seite als Erstes
+# angezeigt werden soll (auf ausdruecklichen Nutzerwunsch). Wird beim
+# ersten erfolgreichen PUT /api/settings wieder auf False gesetzt, damit
+# der Dialog in diesem Prozess danach nicht erneut erscheint.
+CONFIG_WAS_FRESH = False
 
 
 # ----------------------------------------------------------------------
@@ -851,13 +874,22 @@ class PrintQueueStore:
 
 
 def load_config() -> dict:
+    global CONFIG_WAS_FRESH
     if not os.path.exists(CONFIG_PATH):
+        # v2.8.0: merken, dass config.json beim Start dieses Prozesses
+        # noch nicht existierte - siehe CONFIG_WAS_FRESH/get_settings().
+        CONFIG_WAS_FRESH = True
         save_config(DEFAULT_CONFIG)
         return json.loads(json.dumps(DEFAULT_CONFIG))
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     cfg.setdefault("server", DEFAULT_CONFIG["server"])
     cfg.setdefault("preform_server", DEFAULT_CONFIG["preform_server"])
+    # v2.8.0: ungueltiger/fehlender Sprachcode faellt defensiv auf Deutsch
+    # zurueck (unveraendertes Verhalten fuer bestehende config.json-Dateien
+    # ohne dieses Feld).
+    if cfg.get("language") not in SUPPORTED_LANGUAGES:
+        cfg["language"] = DEFAULT_CONFIG["language"]
     cfg.setdefault("history_max_jobs", DEFAULT_CONFIG["history_max_jobs"])
     cfg.setdefault("extras_mqtt", json.loads(json.dumps(DEFAULT_CONFIG["extras_mqtt"])))
     cfg.setdefault("groups", [])
@@ -4082,13 +4114,35 @@ class DashboardApp:
     # laufenden PrintHistoryStore) SOFORT uebernommen, kein Neustart noetig.
     # ------------------------------------------------------------------
     def get_settings(self):
-        return {"history_max_jobs": self.cfg.get("history_max_jobs")}
+        return {
+            "history_max_jobs": self.cfg.get("history_max_jobs"),
+            # v2.8.0: siehe SUPPORTED_LANGUAGES/CONFIG_WAS_FRESH/update_language().
+            "language": self.cfg.get("language", "de"),
+            "first_run": CONFIG_WAS_FRESH,
+        }
 
     def update_history_max_jobs(self, raw_value):
         self.cfg["history_max_jobs"] = raw_value
         save_config(self.cfg)
         self.history.max_jobs_per_printer = _resolve_history_max_jobs(raw_value)
         return True
+
+    def update_language(self, lang):
+        """v2.8.0: auf ausdruecklichen Nutzerwunsch - Oberflaechensprache,
+        umschaltbar im Einstellungen-Modus UND (beim allerersten Start
+        ohne vorhandene config.json) ueber den Sprachauswahl-Dialog, der
+        dann als Erstes beim Oeffnen der Seite erscheint (siehe
+        CONFIG_WAS_FRESH/get_settings()). Setzt CONFIG_WAS_FRESH IMMER mit
+        zurueck, auch wenn der Nutzer zufaellig die bereits aktive Sprache
+        erneut waehlt - der Dialog darf in diesem Prozess danach in jedem
+        Fall nicht mehr erscheinen."""
+        global CONFIG_WAS_FRESH
+        if lang not in SUPPORTED_LANGUAGES:
+            return False, "Unbekannter Sprachcode."
+        self.cfg["language"] = lang
+        save_config(self.cfg)
+        CONFIG_WAS_FRESH = False
+        return True, None
 
     def _resolve_extras(self, printer_cfg):
         out = []
@@ -5742,6 +5796,10 @@ def api_update_settings():
         if isinstance(raw_value, bool):
             return jsonify({"error": "history_max_jobs muss eine Zahl, null oder 'unendlich' sein."}), 400
         dash.update_history_max_jobs(raw_value)
+    if "language" in data:
+        ok, err = dash.update_language(data["language"])
+        if not ok:
+            return jsonify({"error": err}), 400
     return jsonify(dash.get_settings())
 
 
@@ -6950,22 +7008,22 @@ INDEX_HTML = r"""
        cardForCamera()/refresh(). -->
   <div style="display:flex; align-items:center; gap:14px;" id="operatorControls">
     <!-- MK6: Layout-Umschalter 1/2/3/4-spaltig, siehe setLayoutCols()/getLayoutCols() -->
-    <div class="layout-switch" title="Kartenlayout">
+    <div class="layout-switch" title="Kartenlayout" data-i18n-title="layout_switch_title">
       <button type="button" class="layout-btn" data-cols="1" onclick="setLayoutCols(1)">1</button>
       <button type="button" class="layout-btn" data-cols="2" onclick="setLayoutCols(2)">2</button>
       <button type="button" class="layout-btn" data-cols="3" onclick="setLayoutCols(3)">3</button>
       <button type="button" class="layout-btn" data-cols="4" onclick="setLayoutCols(4)">4</button>
     </div>
-    <button class="btn" onclick="enterSettingsMode()">&#9881; Einstellungen</button>
+    <button class="btn" onclick="enterSettingsMode()">&#9881; <span data-i18n="btn_settings">Einstellungen</span></button>
   </div>
   <div style="display:none; align-items:center; gap:14px;" id="settingsModeControls">
-    <button class="btn" onclick="exitSettingsMode()">&larr; Zur Bedienung</button>
+    <button class="btn" onclick="exitSettingsMode()">&larr; <span data-i18n="btn_back_to_operation">Zur Bedienung</span></button>
     <!-- v2.5.0: hierher verschoben (vorher im "Druckverlauf"-Abschnitt
          weiter unten) - dort sah es so aus, als gehoere "Speichern" zum
          Druckverlauf, dabei speichert es dort ausschliesslich das Feld
          "Maximal gespeicherte Druckauftraege je Drucker" (siehe
          saveHistorySettings()). Funktional unveraendert. -->
-    <button class="btn" onclick="saveHistorySettings()">Speichern</button>
+    <button class="btn" onclick="saveHistorySettings()" data-i18n="btn_save">Speichern</button>
   </div>
 </header>
 
@@ -6984,14 +7042,26 @@ INDEX_HTML = r"""
      zu haben erleichtert das Zuweisen von Druckern zu Raeumen. -->
 <div id="settingsPanel" style="display:none;">
 
+  <!-- v2.8.0: Sprache - siehe SUPPORTED_LANGUAGES/I18N weiter unten im
+       <script>-Block. Bewusst als ERSTER Abschnitt, gut sichtbar. -->
   <div class="settings-section">
-    <h2>Drucker verwalten</h2>
-    <div class="hint-text">
+    <h2 data-i18n="settings_language_title">Sprache</h2>
+    <div class="hint-text" data-i18n="settings_language_hint">
+      Oberflaechensprache des Dashboards - wirkt sich sofort auf alle
+      Labels, Schaltflaechen und Hinweistexte aus. Fehlermeldungen vom
+      Server bleiben unabhaengig von dieser Einstellung auf Deutsch.
+    </div>
+    <select id="languageSelect" onchange="changeLanguage(this.value)"></select>
+  </div>
+
+  <div class="settings-section">
+    <h2 data-i18n="settings_printers_title">Drucker verwalten</h2>
+    <div class="hint-text" data-i18n="settings_printers_hint">
       Hinzufuegen, entfernen, einem Raum zuweisen und die Anzeige-
       Reihenfolge aendern. Die Kamera-Anzeige und alle Druckfunktionen
       bleiben im Bedien-Modus.
     </div>
-    <button class="btn" onclick="openAddModal()">+ Drucker hinzufuegen</button>
+    <button class="btn" onclick="openAddModal()" data-i18n="btn_add_printer">+ Drucker hinzufuegen</button>
     <div id="printerManageList" style="margin-top:14px;"></div>
   </div>
 
@@ -7001,34 +7071,34 @@ INDEX_HTML = r"""
        eigener maximaler Wartezeit. -->
   <div class="settings-section">
     <h2>FarmBot</h2>
-    <div class="hint-text">
+    <div class="hint-text" data-i18n="settings_farmbot_hint">
       Eigenstaendige Druckauftrags-Warteschlange(n), die automatisch einem
       gerade freien Drucker der gewaehlten Hersteller-/Familienauswahl
       zugewiesen werden - unabhaengig von der Warteschlange einzelner
       Drucker. Aktiviert erscheint je FarmBot ein eigenes Feld oberhalb
       der Drucker im Bedien-Modus.
     </div>
-    <button class="btn" onclick="openAddFarmbotModal()">+ FarmBot hinzufuegen</button>
+    <button class="btn" onclick="openAddFarmbotModal()" data-i18n="btn_add_farmbot">+ FarmBot hinzufuegen</button>
     <div id="farmbotManageList" style="margin-top:14px;"></div>
   </div>
 
   <div class="settings-section">
-    <h2>Raeume / Gruppen</h2>
-    <div class="hint-text">
+    <h2 data-i18n="settings_groups_title">Raeume / Gruppen</h2>
+    <div class="hint-text" data-i18n="settings_groups_hint">
       Drucker koennen im Bedien-Modus nach Raum gruppiert angezeigt
       werden. Ein geloeschter Raum loescht KEINE Drucker - sie erscheinen
       danach unter "Ohne Raum".
     </div>
     <div class="settings-inline-form">
-      <input id="newGroupName" placeholder="Name des neuen Raums (z. B. Werkstatt)">
-      <button class="btn" onclick="createGroup()">+ Raum anlegen</button>
+      <input id="newGroupName" placeholder="Name des neuen Raums (z. B. Werkstatt)" data-i18n-placeholder="placeholder_new_group_name">
+      <button class="btn" onclick="createGroup()" data-i18n="btn_add_group">+ Raum anlegen</button>
     </div>
     <div id="groupsManageList" style="margin-top:10px;"></div>
   </div>
 
   <div class="settings-section">
-    <h2>Externe RTSP-Kameras</h2>
-    <div class="hint-text">
+    <h2 data-i18n="settings_cameras_title">Externe RTSP-Kameras</h2>
+    <div class="hint-text" data-i18n="settings_cameras_hint">
       Zusaetzlich zu den Drucker-eigenen Kameras koennen beliebige weitere
       RTSP(S)-Kameras hinterlegt werden (z. B. eine Raumuebersicht) - sie
       erscheinen danach als eigene Kachel im Bedien-Modus, im zugewiesenen
@@ -7036,51 +7106,51 @@ INDEX_HTML = r"""
       (Benutzername/Passwort). Benoetigt FFmpeg (siehe README/
       LINUX-INSTALL.md), genau wie die RTSPS-Kamera der X1/P1/P2/H2/X2-Serie.
     </div>
-    <button class="btn" onclick="openCameraModal()">+ Kamera hinzufuegen</button>
+    <button class="btn" onclick="openCameraModal()" data-i18n="btn_add_camera">+ Kamera hinzufuegen</button>
     <div id="camerasManageList" style="margin-top:14px;"></div>
   </div>
 
   <div class="settings-section">
-    <h2>MQTT-Geraete (Sensoren/Schalter)</h2>
-    <div class="hint-text">
+    <h2 data-i18n="settings_mqtt_title">MQTT-Geraete (Sensoren/Schalter)</h2>
+    <div class="hint-text" data-i18n="settings_mqtt_hint">
       Zweiter, von den Druckern unabhaengiger MQTT-Broker fuer frei
       definierte Sensoren (Anzeige eines Werts, mit Verlaufsdiagramm) und
       Schaltflaechen (senden fester An-/Aus-Nachrichten) - wahlweise je
       Drucker oder eigenstaendig (siehe "Kein Drucker" beim Anlegen).
     </div>
 
-    <div class="field-label" style="margin-top:10px;">Broker-Einstellungen</div>
+    <div class="field-label" style="margin-top:10px;" data-i18n="field_broker_settings">Broker-Einstellungen</div>
     <div class="checkbox-row">
       <input type="checkbox" id="mq_enabled">
-      <label style="margin:0;">Aktiviert</label>
+      <label style="margin:0;" data-i18n="label_enabled">Aktiviert</label>
     </div>
-    <label>Broker-Adresse</label>
+    <label data-i18n="label_broker_address">Broker-Adresse</label>
     <input id="mq_host" placeholder="192.168.1.5">
-    <label>Port</label>
+    <label data-i18n="label_port">Port</label>
     <input id="mq_port" placeholder="1883">
-    <label>Benutzername (optional)</label>
+    <label data-i18n="label_username_optional">Benutzername (optional)</label>
     <input id="mq_user" placeholder="">
-    <label>Passwort (optional, leer lassen = unveraendert)</label>
+    <label data-i18n="label_password_optional_unchanged">Passwort (optional, leer lassen = unveraendert)</label>
     <input id="mq_pass" type="password" placeholder="">
     <div class="checkbox-row">
       <input type="checkbox" id="mq_tls">
-      <label style="margin:0;">TLS verwenden</label>
+      <label style="margin:0;" data-i18n="label_use_tls">TLS verwenden</label>
     </div>
     <div class="settings-inline-form" style="margin-top:4px;">
-      <button class="btn" onclick="saveExtrasMqttSettings()">Broker-Einstellungen speichern</button>
+      <button class="btn" onclick="saveExtrasMqttSettings()" data-i18n="btn_save_broker_settings">Broker-Einstellungen speichern</button>
     </div>
     <div class="hint-text" id="mqttStatusHint" style="margin-top:4px;"></div>
 
-    <div class="field-label" style="margin-top:14px;">Sensoren &amp; Schalter</div>
+    <div class="field-label" style="margin-top:14px;" data-i18n="field_sensors_switches">Sensoren &amp; Schalter</div>
     <button class="btn" onclick="openAddMqttExtraModal()">+ Sensor/Schalter hinzufuegen</button>
     <div id="mqttExtrasList" style="margin-top:14px;" class="hint-text">Noch keine Sensoren/Schalter angelegt.</div>
   </div>
 
   <div class="settings-section">
-    <h2>Druckverlauf</h2>
-    <label>Maximal gespeicherte Druckauftraege je Drucker (leer lassen = unbegrenzt)</label>
+    <h2 data-i18n="settings_history_title">Druckverlauf</h2>
+    <label data-i18n="label_history_max_jobs">Maximal gespeicherte Druckauftraege je Drucker (leer lassen = unbegrenzt)</label>
     <input id="historyMaxJobsInput" style="max-width:160px;" placeholder="z. B. 30">
-    <div class="hint-text">
+    <div class="hint-text" data-i18n="hint_history_save">
       Wird ueber den "Speichern"-Knopf oben neben "&larr; Zur Bedienung"
       gesichert (siehe dort) - gilt nur fuer dieses Feld.
     </div>
@@ -7091,27 +7161,27 @@ INDEX_HTML = r"""
 <!-- Modal: externe RTSP-Kamera anlegen/bearbeiten (Einstellungen-Modus) -->
 <div class="modal-backdrop" id="cameraModal">
   <div class="modal">
-    <h2 id="cameraModalTitle">Kamera hinzufuegen</h2>
+    <h2 id="cameraModalTitle" data-i18n="modal_camera_add_title">Kamera hinzufuegen</h2>
     <div class="error-msg" id="cameraModalError"></div>
 
-    <label>Name</label>
+    <label data-i18n="label_name">Name</label>
     <input id="cam_name" placeholder="z. B. Werkstatt-Uebersicht">
-    <label>RTSP(S)-URL</label>
+    <label data-i18n="label_rtsp_url">RTSP(S)-URL</label>
     <input id="cam_url" placeholder="rtsp(s)://IP:Port/Pfad">
-    <div class="hint-text">
+    <div class="hint-text" data-i18n="hint_camera_credentials">
       Ohne Zugangsdaten in der URL selbst - die beiden Felder unten
       werden automatisch (inkl. Sonderzeichen) eingebaut.
     </div>
-    <label>Benutzername (optional)</label>
+    <label data-i18n="label_username_optional">Benutzername (optional)</label>
     <input id="cam_username" placeholder="nur falls die Kamera eine Anmeldung verlangt">
-    <label>Passwort (optional)</label>
+    <label data-i18n="label_password_optional">Passwort (optional)</label>
     <input id="cam_password" type="password" placeholder="nur falls die Kamera eine Anmeldung verlangt">
-    <label>Raum (optional)</label>
-    <select id="cam_group"><option value="">Kein Raum</option></select>
+    <label data-i18n="label_room_optional">Raum (optional)</label>
+    <select id="cam_group"><option value="" data-i18n="option_no_room">Kein Raum</option></select>
 
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeCameraModal()">Abbrechen</button>
-      <button class="btn" onclick="submitCameraModal()">Speichern</button>
+      <button class="btn btn-ghost" onclick="closeCameraModal()" data-i18n="btn_cancel">Abbrechen</button>
+      <button class="btn" onclick="submitCameraModal()" data-i18n="btn_save">Speichern</button>
     </div>
   </div>
 </div>
@@ -7119,13 +7189,13 @@ INDEX_HTML = r"""
 <!-- Modal: Drucker hinzufuegen -->
 <div class="modal-backdrop" id="addModal">
   <div class="modal">
-    <h2>Neuen Drucker hinzufuegen</h2>
+    <h2 data-i18n="modal_add_printer_title">Neuen Drucker hinzufuegen</h2>
     <div class="error-msg" id="addError"></div>
 
-    <label>Druckertyp</label>
+    <label data-i18n="label_printer_type">Druckertyp</label>
     <select id="f_type" onchange="toggleTypeFields()">
       <option value="bambu">Bambu Lab</option>
-      <option value="formlabs">Formlabs (Drucker)</option>
+      <option value="formlabs" data-i18n="type_formlabs">Formlabs (Drucker)</option>
       <option value="formlabs_wash">Formlabs Wash L</option>
       <option value="formlabs_cure">Formlabs Cure L</option>
       <option value="octoprint">OctoPrint</option>
@@ -7133,21 +7203,21 @@ INDEX_HTML = r"""
       <option value="creality_k1c">Creality K1C</option>
       <option value="creality_k1max">Creality K1 Max</option>
       <option value="creality_k1se">Creality K1 SE</option>
-      <option value="creality_other">Creality (sonstiger Klipper-Drucker)</option>
+      <option value="creality_other" data-i18n="type_creality_other">Creality (sonstiger Klipper-Drucker)</option>
       <option value="ultimaker">Ultimaker</option>
     </select>
 
-    <label>Name</label>
+    <label data-i18n="label_name">Name</label>
     <input id="f_name" placeholder="z. B. X1C Werkstatt">
-    <label>IP-Adresse des Geraets</label>
+    <label data-i18n="label_device_ip">IP-Adresse des Geraets</label>
     <input id="f_ip" placeholder="192.168.1.50">
 
     <div id="bambuFields">
-      <label>Access Code (LAN-Modus, Drucker-Display &rarr; Einstellungen)</label>
+      <label data-i18n="label_access_code">Access Code (LAN-Modus, Drucker-Display &rarr; Einstellungen)</label>
       <input id="f_code" placeholder="8-stelliger Code">
-      <label>Seriennummer</label>
+      <label data-i18n="label_serial">Seriennummer</label>
       <input id="f_serial" placeholder="z. B. 01P00A123456789">
-      <label>Druckerfamilie</label>
+      <label data-i18n="label_printer_family">Druckerfamilie</label>
       <select id="f_bambu_family">
         <option value="x1">X1-Serie (X1C, X1E)</option>
         <option value="a1">A1-Serie (A1, A1 Mini)</option>
@@ -7156,7 +7226,7 @@ INDEX_HTML = r"""
         <option value="p2">P2-Serie (P2S)</option>
         <option value="x2">X2-Serie (X2D)</option>
       </select>
-      <div class="hint-text">
+      <div class="hint-text" data-i18n="hint_bambu_family">
         Bestimmt, welche Verbindungseinstellung fuer den Datei-Upload
         beim ersten Versuch benutzt wird (X1- und A1-Serie brauchen
         unterschiedliche, teils gegensaetzliche Einstellungen). Bei
@@ -7169,51 +7239,51 @@ INDEX_HTML = r"""
       </div>
     </div>
 
-    <div id="formlabsHint" class="hint-text">
+    <div id="formlabsHint" class="hint-text" data-i18n="hint_formlabs">
       Benoetigt den lokal laufenden "PreFormServer" (Formlabs Local API,
       Teil der PreForm-Installation) - siehe README.
     </div>
 
     <div id="octoprintFields">
-      <label>API-Key</label>
+      <label data-i18n="label_api_key">API-Key</label>
       <input id="f_apikey" placeholder="OctoPrint-Einstellungen &rarr; API">
-      <label>Port</label>
+      <label data-i18n="label_port">Port</label>
       <input id="f_port" placeholder="80">
       <div class="checkbox-row">
         <input type="checkbox" id="f_https">
-        <label style="margin:0;">HTTPS verwenden</label>
+        <label style="margin:0;" data-i18n="label_use_https">HTTPS verwenden</label>
       </div>
-      <label>Webcam-URL (optional)</label>
+      <label data-i18n="label_webcam_url_optional">Webcam-URL (optional)</label>
       <input id="f_webcam" placeholder="http://IP:8080/webcam/?action=stream">
     </div>
 
     <div id="crealityFields">
-      <div class="hint-text">
+      <div class="hint-text" data-i18n="hint_creality_moonraker">
         Benoetigt Moonraker auf dem Drucker (bei werkseitigen K1/K1C/K1 Max/
         K1 SE muss dafuer erst per SSH "gerootet" werden) - siehe README.
       </div>
-      <label>API-Key (meist nicht noetig, siehe README)</label>
+      <label data-i18n="label_api_key_optional_see_readme">API-Key (meist nicht noetig, siehe README)</label>
       <input id="f_creality_apikey" placeholder="optional">
-      <label>Moonraker-Port</label>
+      <label data-i18n="label_moonraker_port">Moonraker-Port</label>
       <input id="f_creality_port" placeholder="7125">
-      <label>Webcam-URL (optional)</label>
+      <label data-i18n="label_webcam_url_optional">Webcam-URL (optional)</label>
       <input id="f_creality_webcam" placeholder="http://IP/webcam/?action=stream">
     </div>
 
     <div id="ultimakerFields">
-      <div class="hint-text">
+      <div class="hint-text" data-i18n="hint_ultimaker_api">
         Nutzt die offizielle, unauthentifizierte lokale Ultimaker-API -
         kein Login/API-Key noetig, siehe README.
       </div>
-      <label>Port (optional)</label>
+      <label data-i18n="label_port_optional">Port (optional)</label>
       <input id="f_ultimaker_port" placeholder="80">
-      <label>Webcam-URL (optional)</label>
+      <label data-i18n="label_webcam_url_optional">Webcam-URL (optional)</label>
       <input id="f_ultimaker_webcam" placeholder="http://IP:8080/?action=stream">
     </div>
 
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeAddModal()">Abbrechen</button>
-      <button class="btn" onclick="submitAdd()">Hinzufuegen</button>
+      <button class="btn btn-ghost" onclick="closeAddModal()" data-i18n="btn_cancel">Abbrechen</button>
+      <button class="btn" onclick="submitAdd()" data-i18n="btn_add">Hinzufuegen</button>
     </div>
   </div>
 </div>
@@ -7298,7 +7368,7 @@ INDEX_HTML = r"""
 <!-- Modal: AMS-Zuordnung pruefen/korrigieren vor dem Drucken -->
 <div class="modal-backdrop" id="amsModal">
   <div class="modal ams-modal">
-    <h2>AMS-Zuordnung pruefen</h2>
+    <h2 data-i18n="modal_ams_title">AMS-Zuordnung pruefen</h2>
     <div class="file-name" id="amsModalFilename" style="margin-bottom:16px;"></div>
     <div id="amsModalRows"></div>
     <div class="ams-progress-wrap" id="amsProgressWrap" style="display:none;">
@@ -7306,8 +7376,8 @@ INDEX_HTML = r"""
       <div class="ams-progress-label" id="amsProgressLabel"></div>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-ghost" id="amsModalCancelBtn" onclick="cancelAmsModal()">Abbrechen</button>
-      <button class="btn" id="amsModalConfirmBtn" onclick="confirmAmsModal()">Drucken starten</button>
+      <button class="btn btn-ghost" id="amsModalCancelBtn" onclick="cancelAmsModal()" data-i18n="btn_cancel">Abbrechen</button>
+      <button class="btn" id="amsModalConfirmBtn" onclick="confirmAmsModal()" data-i18n="btn_start_print">Drucken starten</button>
     </div>
   </div>
 </div>
@@ -7315,7 +7385,7 @@ INDEX_HTML = r"""
 <!-- Modal: Druckauftrags-Verlauf (MK6) -->
 <div class="modal-backdrop" id="historyModal">
   <div class="modal history-modal">
-    <h2>Druckauftrags-Verlauf</h2>
+    <h2 data-i18n="modal_history_title">Druckauftrags-Verlauf</h2>
     <!-- v2.2.4: Schliessen-Schaltflaeche jetzt OBEN statt unten - bei
          langen Verlaufslisten war der Knopf am Ende der (langen) Liste
          nur nach vollstaendigem Durchscrollen erreichbar. Siehe auch
@@ -7323,10 +7393,10 @@ INDEX_HTML = r"""
          unten im CSS: nur die Liste selbst scrollt jetzt, Kopf- und
          Aktionsbereich bleiben stets sichtbar. -->
     <div class="modal-actions modal-actions-top">
-      <button class="btn btn-ghost" onclick="closeHistoryModal()">Schliessen</button>
+      <button class="btn btn-ghost" onclick="closeHistoryModal()" data-i18n="btn_close">Schliessen</button>
     </div>
     <div class="history-modal-tools">
-      <button class="btn-mini" id="historySortBtn" onclick="toggleHistorySort()">Sortierung: Neueste zuerst</button>
+      <button class="btn-mini" id="historySortBtn" onclick="toggleHistorySort()" data-i18n="sort_newest_first">Sortierung: Neueste zuerst</button>
     </div>
     <div id="historyModalBody" class="history-modal-scroll"></div>
   </div>
@@ -7335,13 +7405,13 @@ INDEX_HTML = r"""
 <!-- Modal: Warteschlange (MK6 v1.2.0) -->
 <div class="modal-backdrop" id="queueModal">
   <div class="modal history-modal">
-    <h2>Warteschlange</h2>
+    <h2 data-i18n="modal_queue_title">Warteschlange</h2>
     <!-- v2.2.4: siehe Kommentar bei historyModal oben - Schliessen UND
          "Druckraum leer" sind jetzt OBEN, bleiben also bei langen
          Warteschlangen ohne Scrollen erreichbar. -->
     <div class="modal-actions modal-actions-top">
-      <button class="btn btn-ghost" onclick="closeQueueModal()">Schliessen</button>
-      <button class="btn" id="queueSendNextBtn" onclick="sendNextQueued(queueModalPrinterId)">Druckraum leer - naechsten senden</button>
+      <button class="btn btn-ghost" onclick="closeQueueModal()" data-i18n="btn_close">Schliessen</button>
+      <button class="btn" id="queueSendNextBtn" onclick="sendNextQueued(queueModalPrinterId)" data-i18n="btn_bed_empty_send_next">Druckraum leer - naechsten senden</button>
     </div>
     <!-- v2.0.1: Hinweistext + Deaktivierung siehe updateQueueSendButtonState() -->
     <div class="hint-text" id="queueSendHint"></div>
@@ -7352,11 +7422,11 @@ INDEX_HTML = r"""
          ondragover="dzDragOver(event)"
          ondragleave="dzDragLeave(event)"
          ondrop="dzDropQueue(event)">
-      Datei hier ablegen, um sie in die Warteschlange zu legen
+      <span data-i18n="dz_drop_to_queue">Datei hier ablegen, um sie in die Warteschlange zu legen</span>
       <div class="dz-hint">
-        oder
+        <span data-i18n="dz_or">oder</span>
         <label class="btn-mini file-btn">
-          Datei auswaehlen
+          <span data-i18n="dz_choose_file">Datei auswaehlen</span>
           <input type="file" style="display:none" onchange="addFileToQueue(queueModalPrinterId, this)">
         </label>
       </div>
@@ -7368,12 +7438,12 @@ INDEX_HTML = r"""
 <!-- Modal: Auftrag einem anderen Drucker zuweisen (MK6 v1.2.0) -->
 <div class="modal-backdrop" id="assignModal">
   <div class="modal">
-    <h2>Auftrag zuweisen</h2>
-    <label>Ziel-Drucker</label>
+    <h2 data-i18n="modal_assign_title">Auftrag zuweisen</h2>
+    <label data-i18n="label_target_printer">Ziel-Drucker</label>
     <select id="assignTargetSelect"></select>
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeAssignModal()">Abbrechen</button>
-      <button class="btn" onclick="confirmAssign()">Zuweisen</button>
+      <button class="btn btn-ghost" onclick="closeAssignModal()" data-i18n="btn_cancel">Abbrechen</button>
+      <button class="btn" onclick="confirmAssign()" data-i18n="btn_assign">Zuweisen</button>
     </div>
   </div>
 </div>
@@ -7387,14 +7457,14 @@ INDEX_HTML = r"""
   <div class="modal history-modal">
     <h2 id="farmbotQueueModalTitle">FarmBot-Warteschlange</h2>
     <div class="modal-actions modal-actions-top">
-      <button class="btn btn-ghost" onclick="closeFarmbotQueueModal()">Schliessen</button>
-      <button class="btn" id="farmbotQueueNextBtn" onclick="farmbotStartNext(farmbotQueueModalId)">Naechsten Druck starten</button>
+      <button class="btn btn-ghost" onclick="closeFarmbotQueueModal()" data-i18n="btn_close">Schliessen</button>
+      <button class="btn" id="farmbotQueueNextBtn" onclick="farmbotStartNext(farmbotQueueModalId)" data-i18n="btn_start_next_print">Naechsten Druck starten</button>
     </div>
     <div class="hint-text" id="farmbotQueueHint"></div>
     <!-- v2.7.0: haendische Umsortierung per ▲/▼ moeglich (siehe
          moveFarmbotQueueEntry()) - wird beim naechsten Datei-Upload
          automatisch wieder ueberschrieben. -->
-    <div class="hint-text">
+    <div class="hint-text" data-i18n="hint_farmbot_manual_reorder">
       Reihenfolge laesst sich per ▲/▼ haendisch aendern - bei der
       naechsten hochgeladenen Datei wird automatisch wieder umsortiert.
     </div>
@@ -7402,11 +7472,11 @@ INDEX_HTML = r"""
          ondragover="dzDragOver(event)"
          ondragleave="dzDragLeave(event)"
          ondrop="farmbotDzDropIntoModal(event)">
-      Datei hier ablegen, um sie dieser FarmBot-Warteschlange hinzuzufuegen
+      <span data-i18n="dz_drop_to_farmbot_queue">Datei hier ablegen, um sie dieser FarmBot-Warteschlange hinzuzufuegen</span>
       <div class="dz-hint">
-        oder
+        <span data-i18n="dz_or">oder</span>
         <label class="btn-mini file-btn">
-          Datei auswaehlen
+          <span data-i18n="dz_choose_file">Datei auswaehlen</span>
           <input type="file" style="display:none" onchange="addFileToFarmbotQueue(farmbotQueueModalId, this)">
         </label>
       </div>
@@ -7422,12 +7492,12 @@ INDEX_HTML = r"""
      Drucker zuvor etwas fertig gedruckt hat"). -->
 <div class="modal-backdrop" id="farmbotBedModal">
   <div class="modal">
-    <h2>Druckraum freigeben</h2>
+    <h2 data-i18n="modal_farmbot_bed_title">Druckraum freigeben</h2>
     <div class="hint-text" id="farmbotBedModalHint"></div>
     <img id="farmbotBedCamImg" src="" style="width:100%; border-radius:8px; background:#000; margin:10px 0;">
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="farmbotBedOtherPrinter()">Anderer Drucker</button>
-      <button class="btn" onclick="farmbotBedConfirmFree()">Druckraum frei</button>
+      <button class="btn btn-ghost" onclick="farmbotBedOtherPrinter()" data-i18n="btn_other_printer">Anderer Drucker</button>
+      <button class="btn" onclick="farmbotBedConfirmFree()" data-i18n="btn_bed_free">Druckraum frei</button>
     </div>
   </div>
 </div>
@@ -7440,21 +7510,21 @@ INDEX_HTML = r"""
     <h2 id="farmbotModalTitle">FarmBot hinzufuegen</h2>
     <div class="error-msg" id="farmbotModalError"></div>
 
-    <label>Namenszusatz (optional)</label>
+    <label data-i18n="label_name_suffix_optional">Namenszusatz (optional)</label>
     <input id="fb_name_suffix" placeholder="z. B. Werkstatt">
     <div class="checkbox-row">
       <input type="checkbox" id="fb_enabled" checked>
-      <label style="margin:0;">Aktiviert</label>
+      <label style="margin:0;" data-i18n="label_enabled">Aktiviert</label>
     </div>
 
-    <label>Hersteller</label>
+    <label data-i18n="label_manufacturer">Hersteller</label>
     <select id="fb_manufacturer" onchange="toggleFarmbotManufacturerFields()">
       <option value="bambu">Bambu Lab</option>
       <option value="ultimaker">Ultimaker</option>
     </select>
 
     <div id="farmbotBambuFields">
-      <label>Druckerfamilie</label>
+      <label data-i18n="label_printer_family">Druckerfamilie</label>
       <select id="fb_bambu_family">
         <option value="x1">X1-Serie (X1C, X1E)</option>
         <option value="a1">A1-Serie (A1, A1 Mini)</option>
@@ -7464,26 +7534,26 @@ INDEX_HTML = r"""
         <option value="x2">X2-Serie (X2D)</option>
       </select>
     </div>
-    <div class="hint-text" id="farmbotUltimakerHint" style="display:none;">
+    <div class="hint-text" id="farmbotUltimakerHint" style="display:none;" data-i18n="hint_farmbot_ultimaker">
       Es werden nur bereits mit dem Dashboard gekoppelte Ultimaker-Drucker
       beruecksichtigt (siehe "Drucker verwalten").
     </div>
 
-    <label>Arbeitstag von</label>
+    <label data-i18n="label_workday_from">Arbeitstag von</label>
     <input id="fb_work_start" placeholder="08:00">
-    <label>Arbeitstag bis</label>
+    <label data-i18n="label_workday_to">Arbeitstag bis</label>
     <input id="fb_work_end" placeholder="18:00">
-    <label>Maximale Wartezeit in der Warteschlange (Tage)</label>
+    <label data-i18n="label_max_queue_days">Maximale Wartezeit in der Warteschlange (Tage)</label>
     <input id="fb_max_queue_days" placeholder="3">
-    <div class="hint-text">
+    <div class="hint-text" data-i18n="hint_max_queue_days">
       Auftraege, die diese Wartezeit erreichen, werden bei der naechsten
       automatischen Neuberechnung der Reihenfolge unabhaengig von ihrer
       Druckdauer vorrangig abgearbeitet.
     </div>
 
     <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeFarmbotModal()">Abbrechen</button>
-      <button class="btn" onclick="submitFarmbotModal()">Speichern</button>
+      <button class="btn btn-ghost" onclick="closeFarmbotModal()" data-i18n="btn_cancel">Abbrechen</button>
+      <button class="btn" onclick="submitFarmbotModal()" data-i18n="btn_save">Speichern</button>
     </div>
   </div>
 </div>
@@ -7492,6 +7562,1046 @@ INDEX_HTML = r"""
 <div class="toast-container" id="toastContainer"></div>
 
 <script>
+// v2.8.0: Mehrsprachige Oberflaeche (de/en/fr/es/zh/ja/tr) - siehe
+// SUPPORTED_LANGUAGES im Python-Teil. Es wird NUR die Oberflaeche
+// (Labels, Schaltflaechen, Hinweistexte) uebersetzt; Fehlermeldungen vom
+// Server (jsonify({"error": ...})) bleiben unabhaengig von dieser
+// Einstellung auf Deutsch (siehe README, Abschnitt "Mehrsprachigkeit").
+// t(key, vars) liefert den uebersetzten Text fuer die aktuell aktive
+// Sprache (currentLang, siehe changeLanguage()); vars erlaubt einfache
+// {platzhalter}-Ersetzung fuer Texte mit eingebetteten Werten (siehe
+// z. B. farmbot_sub_bambu). Fehlt ein Key in der Zielsprache, wird auf
+// Deutsch zurueckgefallen (und, falls auch das fehlt, der Key selbst
+// angezeigt) - so bleibt die Oberflaeche auch bei einer unvollstaendigen
+// Uebersetzung benutzbar.
+let currentLang = 'de';
+
+const I18N = {
+de: {
+  layout_switch_title: "Kartenlayout",
+  btn_settings: "Einstellungen",
+  btn_back_to_operation: "Zur Bedienung",
+  btn_save: "Speichern",
+  settings_language_title: "Sprache",
+  settings_language_hint: "Oberflaechensprache des Dashboards - wirkt sich sofort auf alle Labels, Schaltflaechen und Hinweistexte aus. Fehlermeldungen vom Server bleiben unabhaengig von dieser Einstellung auf Deutsch.",
+  settings_printers_title: "Drucker verwalten",
+  settings_printers_hint: "Hinzufuegen, entfernen, einem Raum zuweisen und die Anzeige-Reihenfolge aendern. Die Kamera-Anzeige und alle Druckfunktionen bleiben im Bedien-Modus.",
+  btn_add_printer: "+ Drucker hinzufuegen",
+  settings_farmbot_hint: "Eigenstaendige Druckauftrags-Warteschlange(n), die automatisch einem gerade freien Drucker der gewaehlten Hersteller-/Familienauswahl zugewiesen werden - unabhaengig von der Warteschlange einzelner Drucker. Aktiviert erscheint je FarmBot ein eigenes Feld oberhalb der Drucker im Bedien-Modus.",
+  btn_add_farmbot: "+ FarmBot hinzufuegen",
+  settings_groups_title: "Raeume / Gruppen",
+  settings_groups_hint: "Drucker koennen im Bedien-Modus nach Raum gruppiert angezeigt werden. Ein geloeschter Raum loescht KEINE Drucker - sie erscheinen danach unter \"Ohne Raum\".",
+  placeholder_new_group_name: "Name des neuen Raums (z. B. Werkstatt)",
+  btn_add_group: "+ Raum anlegen",
+  settings_cameras_title: "Externe RTSP-Kameras",
+  settings_cameras_hint: "Zusaetzlich zu den Drucker-eigenen Kameras koennen beliebige weitere RTSP(S)-Kameras hinterlegt werden (z. B. eine Raumuebersicht) - sie erscheinen danach als eigene Kachel im Bedien-Modus, im zugewiesenen Raum (oder unter \"Ohne Raum\"). Bei Bedarf mit eigener Anmeldung (Benutzername/Passwort). Benoetigt FFmpeg (siehe README/LINUX-INSTALL.md), genau wie die RTSPS-Kamera der X1/P1/P2/H2/X2-Serie.",
+  btn_add_camera: "+ Kamera hinzufuegen",
+  settings_mqtt_title: "MQTT-Geraete (Sensoren/Schalter)",
+  settings_mqtt_hint: "Zweiter, von den Druckern unabhaengiger MQTT-Broker fuer frei definierte Sensoren (Anzeige eines Werts, mit Verlaufsdiagramm) und Schaltflaechen (senden fester An-/Aus-Nachrichten) - wahlweise je Drucker oder eigenstaendig (siehe \"Kein Drucker\" beim Anlegen).",
+  field_broker_settings: "Broker-Einstellungen",
+  label_enabled: "Aktiviert",
+  label_broker_address: "Broker-Adresse",
+  label_port: "Port",
+  label_username_optional: "Benutzername (optional)",
+  label_password_optional_unchanged: "Passwort (optional, leer lassen = unveraendert)",
+  label_use_tls: "TLS verwenden",
+  btn_save_broker_settings: "Broker-Einstellungen speichern",
+  field_sensors_switches: "Sensoren & Schalter",
+  settings_history_title: "Druckverlauf",
+  label_history_max_jobs: "Maximal gespeicherte Druckauftraege je Drucker (leer lassen = unbegrenzt)",
+  hint_history_save: "Wird ueber den \"Speichern\"-Knopf oben neben \"← Zur Bedienung\" gesichert (siehe dort) - gilt nur fuer dieses Feld.",
+  modal_camera_add_title: "Kamera hinzufuegen",
+  label_name: "Name",
+  label_rtsp_url: "RTSP(S)-URL",
+  hint_camera_credentials: "Ohne Zugangsdaten in der URL selbst - die beiden Felder unten werden automatisch (inkl. Sonderzeichen) eingebaut.",
+  label_password_optional: "Passwort (optional)",
+  label_room_optional: "Raum (optional)",
+  option_no_room: "Kein Raum",
+  btn_cancel: "Abbrechen",
+  modal_add_printer_title: "Neuen Drucker hinzufuegen",
+  label_printer_type: "Druckertyp",
+  type_formlabs: "Formlabs (Drucker)",
+  type_creality_other: "Creality (sonstiger Klipper-Drucker)",
+  label_device_ip: "IP-Adresse des Geraets",
+  label_access_code: "Access Code (LAN-Modus, Drucker-Display → Einstellungen)",
+  label_serial: "Seriennummer",
+  label_printer_family: "Druckerfamilie",
+  hint_bambu_family: "Bestimmt, welche Verbindungseinstellung fuer den Datei-Upload beim ersten Versuch benutzt wird (X1- und A1-Serie brauchen unterschiedliche, teils gegensaetzliche Einstellungen). Bei falscher Wahl wird automatisch die jeweils andere Einstellung im zweiten Versuch ausprobiert - der Druck funktioniert also so oder so, eine korrekte Auswahl spart nur einen Fehlversuch. Fuer die H2-, P1-, P2- und X2-Serie liegen noch keine eigenen Erkenntnisse vor - sie nutzen vorerst dieselbe Einstellung wie die X1-Serie.",
+  hint_formlabs: "Benoetigt den lokal laufenden \"PreFormServer\" (Formlabs Local API, Teil der PreForm-Installation) - siehe README.",
+  label_api_key: "API-Key",
+  label_use_https: "HTTPS verwenden",
+  label_webcam_url_optional: "Webcam-URL (optional)",
+  hint_creality_moonraker: "Benoetigt Moonraker auf dem Drucker (bei werkseitigen K1/K1C/K1 Max/K1 SE muss dafuer erst per SSH \"gerootet\" werden) - siehe README.",
+  label_api_key_optional_see_readme: "API-Key (meist nicht noetig, siehe README)",
+  label_moonraker_port: "Moonraker-Port",
+  hint_ultimaker_api: "Nutzt die offizielle, unauthentifizierte lokale Ultimaker-API - kein Login/API-Key noetig, siehe README.",
+  label_port_optional: "Port (optional)",
+  btn_add: "Hinzufuegen",
+  modal_ams_title: "AMS-Zuordnung pruefen",
+  btn_start_print: "Drucken starten",
+  modal_history_title: "Druckauftrags-Verlauf",
+  btn_close: "Schliessen",
+  sort_newest_first: "Sortierung: Neueste zuerst",
+  modal_queue_title: "Warteschlange",
+  btn_bed_empty_send_next: "Druckraum leer - naechsten senden",
+  dz_drop_to_queue: "Datei hier ablegen, um sie in die Warteschlange zu legen",
+  dz_or: "oder",
+  dz_choose_file: "Datei auswaehlen",
+  modal_assign_title: "Auftrag zuweisen",
+  label_target_printer: "Ziel-Drucker",
+  btn_assign: "Zuweisen",
+  btn_start_next_print: "Naechsten Druck starten",
+  hint_farmbot_manual_reorder: "Reihenfolge laesst sich per ▲/▼ haendisch aendern - bei der naechsten hochgeladenen Datei wird automatisch wieder umsortiert.",
+  dz_drop_to_farmbot_queue: "Datei hier ablegen, um sie dieser FarmBot-Warteschlange hinzuzufuegen",
+  modal_farmbot_bed_title: "Druckraum freigeben",
+  btn_other_printer: "Anderer Drucker",
+  btn_bed_free: "Druckraum frei",
+  label_name_suffix_optional: "Namenszusatz (optional)",
+  label_manufacturer: "Hersteller",
+  hint_farmbot_ultimaker: "Es werden nur bereits mit dem Dashboard gekoppelte Ultimaker-Drucker beruecksichtigt (siehe \"Drucker verwalten\").",
+  label_workday_from: "Arbeitstag von",
+  label_workday_to: "Arbeitstag bis",
+  label_max_queue_days: "Maximale Wartezeit in der Warteschlange (Tage)",
+  hint_max_queue_days: "Auftraege, die diese Wartezeit erreichen, werden bei der naechsten automatischen Neuberechnung der Reihenfolge unabhaengig von ihrer Druckdauer vorrangig abgearbeitet.",
+  temp_nozzle: "Duese",
+  temp_bed: "Bett",
+  temp_chamber: "Kammer",
+  tooltip_show_camera: "Kamera anzeigen",
+  tooltip_history: "Druckauftrags-Verlauf",
+  ams_filament_title: "AMS / Filament",
+  empty_no_printers: "Noch keine Drucker hinterlegt.",
+  btn_add_printer_empty: "+ Drucker hinzufuegen",
+  dz_hint_developer_mode: "Erfordert Developer Mode / LAN-Modus am Drucker",
+  dz_hint_cura_export: "Export aus Cura, z. B. ueber \"Datei speichern\"",
+  camera_type_badge: "Kamera",
+  switch_type_badge: "Schalter",
+  sensor_type_badge: "Sensor",
+  btn_on: "Ein",
+  btn_off: "Aus",
+  hint_octoprint_no_chamber: "OctoPrint liefert keine Kammertemperatur / kein AMS-Aequivalent.",
+  hint_creality_chamber: "Ueber Moonraker angebunden. Kammertemperatur nur sichtbar, falls im Klipper-Setup ein entsprechender Sensor konfiguriert ist.",
+  hint_ultimaker_no_chamber: "Ultimaker-Desktopdrucker haben keinen Kammertemperatursensor.",
+  title_progress_thumb: "Vorschau des aktuellen/letzten Druckauftrags",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; Arbeitstag {start}&ndash;{end} Uhr &middot; max. {days} Tage Wartezeit",
+  farmbot_fits_text: "{fits} von {total} Auftraegen koennen rechnerisch heute noch gestartet werden (der jeweils letzte darf dabei unbeaufsichtigt ueber den Feierabend hinaus weiterdrucken).",
+  farmbot_queue_empty: "Warteschlange ist leer.",
+  farmbot_queue_waiting_badge: "{count} wartend",
+  btn_farmbot_queue: "Warteschlange",
+  farmbot_dz_gcode: "Fertig gesclicte .gcode-Datei hier ablegen",
+  farmbot_dz_gcode3mf: "Fertig gesclicte .gcode.3mf-Datei hier ablegen",
+  btn_farmbot_start_next: "Naechsten Druck starten",
+  btn_edit: "Bearbeiten",
+  btn_delete: "Loeschen",
+  btn_show: "Anzeigen",
+  btn_remove: "Entfernen",
+  btn_enable: "Aktivieren",
+  btn_disable: "Deaktivieren",
+  empty_no_farmbots: "Noch kein FarmBot angelegt.",
+  farmbot_disabled_hint: "(deaktiviert)",
+  farmbot_manage_sub_suffix: " &middot; Arbeitstag {start}&ndash;{end} Uhr &middot; max. {days} Tage",
+  sort_alpha: "Sortierung: A-Z",
+  history_empty: "Noch keine Druckauftraege ueber das Dashboard gesendet.",
+  farmbot_queue_modal_title_suffix: " - Warteschlange",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "Wird geladen ...",
+  field_current_file: "Aktuelle Datei"
+},
+en: {
+  layout_switch_title: "Card layout",
+  btn_settings: "Settings",
+  btn_back_to_operation: "Back to operation",
+  btn_save: "Save",
+  settings_language_title: "Language",
+  settings_language_hint: "Interface language of the dashboard - takes effect immediately on all labels, buttons and hint texts. Error messages from the server stay in German regardless of this setting.",
+  settings_printers_title: "Manage printers",
+  settings_printers_hint: "Add, remove, assign to a room and change the display order. The camera view and all print functions remain in operation mode.",
+  btn_add_printer: "+ Add printer",
+  settings_farmbot_hint: "Standalone print-job queue(s) that are automatically assigned to a currently free printer matching the selected manufacturer/family - independent of any individual printer's own queue. When enabled, each FarmBot shows its own tile above the printers in operation mode.",
+  btn_add_farmbot: "+ Add FarmBot",
+  settings_groups_title: "Rooms / groups",
+  settings_groups_hint: "Printers can be shown grouped by room in operation mode. Deleting a room does NOT delete any printers - they then appear under \"No room\".",
+  placeholder_new_group_name: "Name of the new room (e.g. workshop)",
+  btn_add_group: "+ Create room",
+  settings_cameras_title: "External RTSP cameras",
+  settings_cameras_hint: "In addition to the printers' built-in cameras, any number of other RTSP(S) cameras can be added (e.g. a room overview) - they then appear as their own tile in operation mode, in the assigned room (or under \"No room\"). Optionally with its own login (username/password). Requires FFmpeg (see README/LINUX-INSTALL.md), just like the RTSPS camera of the X1/P1/P2/H2/X2 series.",
+  btn_add_camera: "+ Add camera",
+  settings_mqtt_title: "MQTT devices (sensors/switches)",
+  settings_mqtt_hint: "A second MQTT broker, independent of the printers, for freely defined sensors (display of a value, with a history chart) and switches (sending fixed on/off messages) - either per printer or standalone (see \"No printer\" when creating one).",
+  field_broker_settings: "Broker settings",
+  label_enabled: "Enabled",
+  label_broker_address: "Broker address",
+  label_port: "Port",
+  label_username_optional: "Username (optional)",
+  label_password_optional_unchanged: "Password (optional, leave blank = unchanged)",
+  label_use_tls: "Use TLS",
+  btn_save_broker_settings: "Save broker settings",
+  field_sensors_switches: "Sensors & switches",
+  settings_history_title: "Print history",
+  label_history_max_jobs: "Maximum stored print jobs per printer (leave blank = unlimited)",
+  hint_history_save: "Saved via the \"Save\" button above next to \"← Back to operation\" (see there) - applies only to this field.",
+  modal_camera_add_title: "Add camera",
+  label_name: "Name",
+  label_rtsp_url: "RTSP(S) URL",
+  hint_camera_credentials: "Without credentials in the URL itself - the two fields below are inserted automatically (including special characters).",
+  label_password_optional: "Password (optional)",
+  label_room_optional: "Room (optional)",
+  option_no_room: "No room",
+  btn_cancel: "Cancel",
+  modal_add_printer_title: "Add new printer",
+  label_printer_type: "Printer type",
+  type_formlabs: "Formlabs (printer)",
+  type_creality_other: "Creality (other Klipper printer)",
+  label_device_ip: "IP address of the device",
+  label_access_code: "Access code (LAN mode, printer display → settings)",
+  label_serial: "Serial number",
+  label_printer_family: "Printer family",
+  hint_bambu_family: "Determines which connection setting is used for the first file-upload attempt (the X1 and A1 series need different, partly opposite settings). If the wrong one is chosen, the other setting is automatically tried on the second attempt - printing works either way, a correct choice only saves one failed attempt. There is no dedicated data yet for the H2, P1, P2 and X2 series - they currently use the same setting as the X1 series.",
+  hint_formlabs: "Requires the locally running \"PreFormServer\" (Formlabs Local API, part of the PreForm installation) - see README.",
+  label_api_key: "API key",
+  label_use_https: "Use HTTPS",
+  label_webcam_url_optional: "Webcam URL (optional)",
+  hint_creality_moonraker: "Requires Moonraker on the printer (factory K1/K1C/K1 Max/K1 SE units must first be \"rooted\" via SSH) - see README.",
+  label_api_key_optional_see_readme: "API key (usually not needed, see README)",
+  label_moonraker_port: "Moonraker port",
+  hint_ultimaker_api: "Uses the official, unauthenticated local Ultimaker API - no login/API key needed, see README.",
+  label_port_optional: "Port (optional)",
+  btn_add: "Add",
+  modal_ams_title: "Check AMS assignment",
+  btn_start_print: "Start print",
+  modal_history_title: "Print history",
+  btn_close: "Close",
+  sort_newest_first: "Sort: newest first",
+  modal_queue_title: "Queue",
+  btn_bed_empty_send_next: "Bed empty - send next",
+  dz_drop_to_queue: "Drop a file here to add it to the queue",
+  dz_or: "or",
+  dz_choose_file: "Choose file",
+  modal_assign_title: "Assign job",
+  label_target_printer: "Target printer",
+  btn_assign: "Assign",
+  btn_start_next_print: "Start next print",
+  hint_farmbot_manual_reorder: "The order can be changed manually with ▲/▼ - it will be re-sorted automatically again the next time a file is uploaded.",
+  dz_drop_to_farmbot_queue: "Drop a file here to add it to this FarmBot's queue",
+  modal_farmbot_bed_title: "Free up print bed",
+  btn_other_printer: "Other printer",
+  btn_bed_free: "Bed free",
+  label_name_suffix_optional: "Name suffix (optional)",
+  label_manufacturer: "Manufacturer",
+  hint_farmbot_ultimaker: "Only Ultimaker printers already paired with the dashboard are considered (see \"Manage printers\").",
+  label_workday_from: "Workday from",
+  label_workday_to: "Workday to",
+  label_max_queue_days: "Maximum wait time in the queue (days)",
+  hint_max_queue_days: "Jobs that reach this wait time are processed with priority, regardless of print duration, the next time the order is recalculated automatically.",
+  temp_nozzle: "Nozzle",
+  temp_bed: "Bed",
+  temp_chamber: "Chamber",
+  tooltip_show_camera: "Show camera",
+  tooltip_history: "Print history",
+  ams_filament_title: "AMS / filament",
+  empty_no_printers: "No printers added yet.",
+  btn_add_printer_empty: "+ Add printer",
+  dz_hint_developer_mode: "Requires Developer Mode / LAN mode on the printer",
+  dz_hint_cura_export: "Exported from Cura, e.g. via \"Save to file\"",
+  camera_type_badge: "Camera",
+  switch_type_badge: "Switch",
+  sensor_type_badge: "Sensor",
+  btn_on: "On",
+  btn_off: "Off",
+  hint_octoprint_no_chamber: "OctoPrint does not provide a chamber temperature / no AMS equivalent.",
+  hint_creality_chamber: "Connected via Moonraker. Chamber temperature only visible if a corresponding sensor is configured in the Klipper setup.",
+  hint_ultimaker_no_chamber: "Ultimaker desktop printers have no chamber temperature sensor.",
+  title_progress_thumb: "Preview of the current/last print job",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; Workday {start}&ndash;{end} &middot; max. {days} days wait time",
+  farmbot_fits_text: "{fits} of {total} jobs can theoretically still be started today (the last one may keep printing unattended beyond closing time).",
+  farmbot_queue_empty: "Queue is empty.",
+  farmbot_queue_waiting_badge: "{count} waiting",
+  btn_farmbot_queue: "Queue",
+  farmbot_dz_gcode: "Drop a sliced .gcode file here",
+  farmbot_dz_gcode3mf: "Drop a sliced .gcode.3mf file here",
+  btn_farmbot_start_next: "Start next print",
+  btn_edit: "Edit",
+  btn_delete: "Delete",
+  btn_show: "Show",
+  btn_remove: "Remove",
+  btn_enable: "Enable",
+  btn_disable: "Disable",
+  empty_no_farmbots: "No FarmBot set up yet.",
+  farmbot_disabled_hint: "(disabled)",
+  farmbot_manage_sub_suffix: " &middot; Workday {start}&ndash;{end} &middot; max. {days} days",
+  sort_alpha: "Sort: A-Z",
+  history_empty: "No print jobs sent via the dashboard yet.",
+  farmbot_queue_modal_title_suffix: " - Queue",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "Loading ...",
+  field_current_file: "Current file"
+},
+fr: {
+  layout_switch_title: "Disposition des cartes",
+  btn_settings: "Parametres",
+  btn_back_to_operation: "Retour a l'exploitation",
+  btn_save: "Enregistrer",
+  settings_language_title: "Langue",
+  settings_language_hint: "Langue de l'interface du tableau de bord - s'applique immediatement a tous les libelles, boutons et textes d'aide. Les messages d'erreur du serveur restent en allemand independamment de ce reglage.",
+  settings_printers_title: "Gerer les imprimantes",
+  settings_printers_hint: "Ajouter, supprimer, assigner a une piece et modifier l'ordre d'affichage. L'affichage camera et toutes les fonctions d'impression restent en mode exploitation.",
+  btn_add_printer: "+ Ajouter une imprimante",
+  settings_farmbot_hint: "File(s) d'attente de travaux d'impression autonome(s), assignee(s) automatiquement a une imprimante actuellement libre du fabricant/de la famille choisie - independamment de la file d'attente de chaque imprimante. Une fois active, chaque FarmBot affiche sa propre carte au-dessus des imprimantes en mode exploitation.",
+  btn_add_farmbot: "+ Ajouter un FarmBot",
+  settings_groups_title: "Pieces / groupes",
+  settings_groups_hint: "Les imprimantes peuvent etre affichees groupees par piece en mode exploitation. Supprimer une piece ne supprime AUCUNE imprimante - elles apparaissent alors sous \"Sans piece\".",
+  placeholder_new_group_name: "Nom de la nouvelle piece (p. ex. atelier)",
+  btn_add_group: "+ Creer une piece",
+  settings_cameras_title: "Cameras RTSP externes",
+  settings_cameras_hint: "En plus des cameras integrees aux imprimantes, n'importe quelle autre camera RTSP(S) peut etre ajoutee (p. ex. une vue d'ensemble de la piece) - elle apparait alors comme sa propre carte en mode exploitation, dans la piece assignee (ou sous \"Sans piece\"). Avec identifiants propres si besoin (nom d'utilisateur/mot de passe). Necessite FFmpeg (voir README/LINUX-INSTALL.md), tout comme la camera RTSPS des series X1/P1/P2/H2/X2.",
+  btn_add_camera: "+ Ajouter une camera",
+  settings_mqtt_title: "Appareils MQTT (capteurs/interrupteurs)",
+  settings_mqtt_hint: "Second courtier MQTT, independant des imprimantes, pour des capteurs librement definis (affichage d'une valeur, avec graphique d'historique) et des interrupteurs (envoi de messages marche/arret fixes) - soit par imprimante, soit autonome (voir \"Aucune imprimante\" lors de la creation).",
+  field_broker_settings: "Parametres du courtier",
+  label_enabled: "Active",
+  label_broker_address: "Adresse du courtier",
+  label_port: "Port",
+  label_username_optional: "Nom d'utilisateur (optionnel)",
+  label_password_optional_unchanged: "Mot de passe (optionnel, laisser vide = inchange)",
+  label_use_tls: "Utiliser TLS",
+  btn_save_broker_settings: "Enregistrer les parametres du courtier",
+  field_sensors_switches: "Capteurs & interrupteurs",
+  settings_history_title: "Historique d'impression",
+  label_history_max_jobs: "Nombre maximal de travaux d'impression conserves par imprimante (vide = illimite)",
+  hint_history_save: "Enregistre via le bouton \"Enregistrer\" en haut, pres de \"← Retour a l'exploitation\" (voir ci-dessus) - s'applique uniquement a ce champ.",
+  modal_camera_add_title: "Ajouter une camera",
+  label_name: "Nom",
+  label_rtsp_url: "URL RTSP(S)",
+  hint_camera_credentials: "Sans identifiants dans l'URL elle-meme - les deux champs ci-dessous sont inseres automatiquement (caracteres speciaux inclus).",
+  label_password_optional: "Mot de passe (optionnel)",
+  label_room_optional: "Piece (optionnel)",
+  option_no_room: "Aucune piece",
+  btn_cancel: "Annuler",
+  modal_add_printer_title: "Ajouter une nouvelle imprimante",
+  label_printer_type: "Type d'imprimante",
+  type_formlabs: "Formlabs (imprimante)",
+  type_creality_other: "Creality (autre imprimante Klipper)",
+  label_device_ip: "Adresse IP de l'appareil",
+  label_access_code: "Code d'acces (mode LAN, ecran de l'imprimante → parametres)",
+  label_serial: "Numero de serie",
+  label_printer_family: "Famille d'imprimante",
+  hint_bambu_family: "Determine quel parametre de connexion est utilise lors de la premiere tentative de transfert de fichier (les series X1 et A1 necessitent des parametres differents, parfois opposes). En cas de mauvais choix, l'autre parametre est automatiquement essaye lors de la deuxieme tentative - l'impression fonctionne donc de toute facon, un bon choix ne fait qu'eviter un echec. Aucune donnee propre n'existe encore pour les series H2, P1, P2 et X2 - elles utilisent pour l'instant le meme parametre que la serie X1.",
+  hint_formlabs: "Necessite le \"PreFormServer\" local (Formlabs Local API, inclus dans l'installation de PreForm) - voir README.",
+  label_api_key: "Cle API",
+  label_use_https: "Utiliser HTTPS",
+  label_webcam_url_optional: "URL de la webcam (optionnel)",
+  hint_creality_moonraker: "Necessite Moonraker sur l'imprimante (les K1/K1C/K1 Max/K1 SE de serie doivent d'abord etre \"rootes\" via SSH) - voir README.",
+  label_api_key_optional_see_readme: "Cle API (generalement pas necessaire, voir README)",
+  label_moonraker_port: "Port Moonraker",
+  hint_ultimaker_api: "Utilise l'API locale officielle et non authentifiee d'Ultimaker - aucune connexion/cle API necessaire, voir README.",
+  label_port_optional: "Port (optionnel)",
+  btn_add: "Ajouter",
+  modal_ams_title: "Verifier l'assignation AMS",
+  btn_start_print: "Lancer l'impression",
+  modal_history_title: "Historique d'impression",
+  btn_close: "Fermer",
+  sort_newest_first: "Tri : plus recent d'abord",
+  modal_queue_title: "File d'attente",
+  btn_bed_empty_send_next: "Plateau vide - envoyer le suivant",
+  dz_drop_to_queue: "Deposer un fichier ici pour l'ajouter a la file d'attente",
+  dz_or: "ou",
+  dz_choose_file: "Choisir un fichier",
+  modal_assign_title: "Assigner le travail",
+  label_target_printer: "Imprimante cible",
+  btn_assign: "Assigner",
+  btn_start_next_print: "Lancer l'impression suivante",
+  hint_farmbot_manual_reorder: "L'ordre peut etre modifie manuellement avec ▲/▼ - il sera automatiquement retrie lors du prochain fichier televerse.",
+  dz_drop_to_farmbot_queue: "Deposer un fichier ici pour l'ajouter a la file d'attente de ce FarmBot",
+  modal_farmbot_bed_title: "Liberer le plateau d'impression",
+  btn_other_printer: "Autre imprimante",
+  btn_bed_free: "Plateau libre",
+  label_name_suffix_optional: "Complement de nom (optionnel)",
+  label_manufacturer: "Fabricant",
+  hint_farmbot_ultimaker: "Seules les imprimantes Ultimaker deja couplees au tableau de bord sont prises en compte (voir \"Gerer les imprimantes\").",
+  label_workday_from: "Journee de travail de",
+  label_workday_to: "Journee de travail a",
+  label_max_queue_days: "Temps d'attente maximal dans la file (jours)",
+  hint_max_queue_days: "Les travaux atteignant ce temps d'attente sont traites en priorite, independamment de leur duree d'impression, lors du prochain recalcul automatique de l'ordre.",
+  temp_nozzle: "Buse",
+  temp_bed: "Plateau",
+  temp_chamber: "Chambre",
+  tooltip_show_camera: "Afficher la camera",
+  tooltip_history: "Historique d'impression",
+  ams_filament_title: "AMS / filament",
+  empty_no_printers: "Aucune imprimante ajoutee pour l'instant.",
+  btn_add_printer_empty: "+ Ajouter une imprimante",
+  dz_hint_developer_mode: "Necessite le mode developpeur / mode LAN sur l'imprimante",
+  dz_hint_cura_export: "Exporte depuis Cura, p. ex. via \"Enregistrer dans un fichier\"",
+  camera_type_badge: "Camera",
+  switch_type_badge: "Interrupteur",
+  sensor_type_badge: "Capteur",
+  btn_on: "Marche",
+  btn_off: "Arret",
+  hint_octoprint_no_chamber: "OctoPrint ne fournit pas de temperature de chambre / pas d'equivalent AMS.",
+  hint_creality_chamber: "Connecte via Moonraker. Temperature de chambre visible uniquement si un capteur correspondant est configure dans Klipper.",
+  hint_ultimaker_no_chamber: "Les imprimantes de bureau Ultimaker n'ont pas de capteur de temperature de chambre.",
+  title_progress_thumb: "Apercu du travail d'impression actuel/dernier",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; Journee {start}&ndash;{end} &middot; max. {days} jours d'attente",
+  farmbot_fits_text: "{fits} travaux sur {total} peuvent theoriquement encore etre lances aujourd'hui (le dernier peut continuer d'imprimer sans surveillance apres la fin de journee).",
+  farmbot_queue_empty: "La file d'attente est vide.",
+  farmbot_queue_waiting_badge: "{count} en attente",
+  btn_farmbot_queue: "File d'attente",
+  farmbot_dz_gcode: "Deposer ici un fichier .gcode decoupe",
+  farmbot_dz_gcode3mf: "Deposer ici un fichier .gcode.3mf decoupe",
+  btn_farmbot_start_next: "Lancer l'impression suivante",
+  btn_edit: "Modifier",
+  btn_delete: "Supprimer",
+  btn_show: "Afficher",
+  btn_remove: "Retirer",
+  btn_enable: "Activer",
+  btn_disable: "Desactiver",
+  empty_no_farmbots: "Aucun FarmBot cree pour l'instant.",
+  farmbot_disabled_hint: "(desactive)",
+  farmbot_manage_sub_suffix: " &middot; Journee {start}&ndash;{end} &middot; max. {days} jours",
+  sort_alpha: "Tri : A-Z",
+  history_empty: "Aucun travail d'impression envoye via le tableau de bord pour l'instant.",
+  farmbot_queue_modal_title_suffix: " - File d'attente",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "Chargement ...",
+  field_current_file: "Fichier actuel"
+},
+es: {
+  layout_switch_title: "Disposicion de tarjetas",
+  btn_settings: "Ajustes",
+  btn_back_to_operation: "Volver a la operacion",
+  btn_save: "Guardar",
+  settings_language_title: "Idioma",
+  settings_language_hint: "Idioma de la interfaz del panel - se aplica de inmediato a todas las etiquetas, botones y textos de ayuda. Los mensajes de error del servidor permanecen en aleman independientemente de este ajuste.",
+  settings_printers_title: "Gestionar impresoras",
+  settings_printers_hint: "Anadir, eliminar, asignar a una sala y cambiar el orden de visualizacion. La vista de camara y todas las funciones de impresion permanecen en el modo de operacion.",
+  btn_add_printer: "+ Anadir impresora",
+  settings_farmbot_hint: "Cola(s) de trabajos de impresion independiente(s), asignada(s) automaticamente a una impresora actualmente libre del fabricante/familia seleccionados - independiente de la cola de cada impresora individual. Al activarse, cada FarmBot muestra su propia tarjeta encima de las impresoras en el modo de operacion.",
+  btn_add_farmbot: "+ Anadir FarmBot",
+  settings_groups_title: "Salas / grupos",
+  settings_groups_hint: "Las impresoras pueden mostrarse agrupadas por sala en el modo de operacion. Eliminar una sala NO elimina ninguna impresora - estas aparecen entonces bajo \"Sin sala\".",
+  placeholder_new_group_name: "Nombre de la nueva sala (p. ej. taller)",
+  btn_add_group: "+ Crear sala",
+  settings_cameras_title: "Camaras RTSP externas",
+  settings_cameras_hint: "Ademas de las camaras integradas de las impresoras, se puede anadir cualquier otra camara RTSP(S) (p. ej. una vista general de la sala) - aparecera entonces como su propia tarjeta en el modo de operacion, en la sala asignada (o bajo \"Sin sala\"). Opcionalmente con su propio inicio de sesion (usuario/contrasena). Requiere FFmpeg (ver README/LINUX-INSTALL.md), igual que la camara RTSPS de la serie X1/P1/P2/H2/X2.",
+  btn_add_camera: "+ Anadir camara",
+  settings_mqtt_title: "Dispositivos MQTT (sensores/interruptores)",
+  settings_mqtt_hint: "Un segundo broker MQTT, independiente de las impresoras, para sensores definidos libremente (muestra un valor, con grafico de historial) e interruptores (envian mensajes fijos de encendido/apagado) - ya sea por impresora o independiente (ver \"Sin impresora\" al crearlo).",
+  field_broker_settings: "Ajustes del broker",
+  label_enabled: "Activado",
+  label_broker_address: "Direccion del broker",
+  label_port: "Puerto",
+  label_username_optional: "Nombre de usuario (opcional)",
+  label_password_optional_unchanged: "Contrasena (opcional, dejar en blanco = sin cambios)",
+  label_use_tls: "Usar TLS",
+  btn_save_broker_settings: "Guardar ajustes del broker",
+  field_sensors_switches: "Sensores e interruptores",
+  settings_history_title: "Historial de impresion",
+  label_history_max_jobs: "Numero maximo de trabajos de impresion guardados por impresora (en blanco = ilimitado)",
+  hint_history_save: "Se guarda mediante el boton \"Guardar\" de arriba, junto a \"← Volver a la operacion\" (ver alli) - solo se aplica a este campo.",
+  modal_camera_add_title: "Anadir camara",
+  label_name: "Nombre",
+  label_rtsp_url: "URL RTSP(S)",
+  hint_camera_credentials: "Sin credenciales en la propia URL - los dos campos de abajo se insertan automaticamente (incluyendo caracteres especiales).",
+  label_password_optional: "Contrasena (opcional)",
+  label_room_optional: "Sala (opcional)",
+  option_no_room: "Sin sala",
+  btn_cancel: "Cancelar",
+  modal_add_printer_title: "Anadir nueva impresora",
+  label_printer_type: "Tipo de impresora",
+  type_formlabs: "Formlabs (impresora)",
+  type_creality_other: "Creality (otra impresora Klipper)",
+  label_device_ip: "Direccion IP del dispositivo",
+  label_access_code: "Codigo de acceso (modo LAN, pantalla de la impresora → ajustes)",
+  label_serial: "Numero de serie",
+  label_printer_family: "Familia de impresora",
+  hint_bambu_family: "Determina que ajuste de conexion se usa en el primer intento de subida de archivo (las series X1 y A1 necesitan ajustes distintos, en parte opuestos). Si se elige el equivocado, se prueba automaticamente el otro ajuste en el segundo intento - la impresion funciona de todos modos, una eleccion correcta solo evita un intento fallido. Todavia no hay datos propios para las series H2, P1, P2 y X2 - por ahora usan el mismo ajuste que la serie X1.",
+  hint_formlabs: "Requiere el \"PreFormServer\" local (Formlabs Local API, parte de la instalacion de PreForm) - ver README.",
+  label_api_key: "Clave API",
+  label_use_https: "Usar HTTPS",
+  label_webcam_url_optional: "URL de la webcam (opcional)",
+  hint_creality_moonraker: "Requiere Moonraker en la impresora (las unidades de fabrica K1/K1C/K1 Max/K1 SE deben \"rootearse\" primero via SSH) - ver README.",
+  label_api_key_optional_see_readme: "Clave API (normalmente no necesaria, ver README)",
+  label_moonraker_port: "Puerto de Moonraker",
+  hint_ultimaker_api: "Usa la API local oficial y no autenticada de Ultimaker - no se necesita inicio de sesion/clave API, ver README.",
+  label_port_optional: "Puerto (opcional)",
+  btn_add: "Anadir",
+  modal_ams_title: "Comprobar asignacion de AMS",
+  btn_start_print: "Iniciar impresion",
+  modal_history_title: "Historial de impresion",
+  btn_close: "Cerrar",
+  sort_newest_first: "Orden: mas reciente primero",
+  modal_queue_title: "Cola",
+  btn_bed_empty_send_next: "Cama vacia - enviar siguiente",
+  dz_drop_to_queue: "Suelta un archivo aqui para anadirlo a la cola",
+  dz_or: "o",
+  dz_choose_file: "Elegir archivo",
+  modal_assign_title: "Asignar trabajo",
+  label_target_printer: "Impresora de destino",
+  btn_assign: "Asignar",
+  btn_start_next_print: "Iniciar siguiente impresion",
+  hint_farmbot_manual_reorder: "El orden se puede cambiar manualmente con ▲/▼ - se reordenara automaticamente de nuevo con el siguiente archivo subido.",
+  dz_drop_to_farmbot_queue: "Suelta un archivo aqui para anadirlo a la cola de este FarmBot",
+  modal_farmbot_bed_title: "Liberar cama de impresion",
+  btn_other_printer: "Otra impresora",
+  btn_bed_free: "Cama libre",
+  label_name_suffix_optional: "Sufijo de nombre (opcional)",
+  label_manufacturer: "Fabricante",
+  hint_farmbot_ultimaker: "Solo se consideran las impresoras Ultimaker ya emparejadas con el panel (ver \"Gestionar impresoras\").",
+  label_workday_from: "Jornada laboral desde",
+  label_workday_to: "Jornada laboral hasta",
+  label_max_queue_days: "Tiempo maximo de espera en la cola (dias)",
+  hint_max_queue_days: "Los trabajos que alcancen este tiempo de espera se procesan con prioridad, independientemente de su duracion de impresion, en el siguiente recalculo automatico del orden.",
+  temp_nozzle: "Boquilla",
+  temp_bed: "Cama",
+  temp_chamber: "Camara",
+  tooltip_show_camera: "Mostrar camara",
+  tooltip_history: "Historial de impresion",
+  ams_filament_title: "AMS / filamento",
+  empty_no_printers: "Todavia no hay impresoras anadidas.",
+  btn_add_printer_empty: "+ Anadir impresora",
+  dz_hint_developer_mode: "Requiere el modo de desarrollador / modo LAN en la impresora",
+  dz_hint_cura_export: "Exportado desde Cura, p. ej. mediante \"Guardar en archivo\"",
+  camera_type_badge: "Camara",
+  switch_type_badge: "Interruptor",
+  sensor_type_badge: "Sensor",
+  btn_on: "Encendido",
+  btn_off: "Apagado",
+  hint_octoprint_no_chamber: "OctoPrint no proporciona temperatura de camara / no hay equivalente a AMS.",
+  hint_creality_chamber: "Conectado via Moonraker. La temperatura de camara solo es visible si hay un sensor correspondiente configurado en Klipper.",
+  hint_ultimaker_no_chamber: "Las impresoras de escritorio Ultimaker no tienen sensor de temperatura de camara.",
+  title_progress_thumb: "Vista previa del trabajo de impresion actual/ultimo",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; Jornada {start}&ndash;{end} &middot; max. {days} dias de espera",
+  farmbot_fits_text: "{fits} de {total} trabajos pueden iniciarse hoy en teoria (el ultimo puede seguir imprimiendo sin supervision mas alla del cierre).",
+  farmbot_queue_empty: "La cola esta vacia.",
+  farmbot_queue_waiting_badge: "{count} en espera",
+  btn_farmbot_queue: "Cola",
+  farmbot_dz_gcode: "Suelta aqui un archivo .gcode laminado",
+  farmbot_dz_gcode3mf: "Suelta aqui un archivo .gcode.3mf laminado",
+  btn_farmbot_start_next: "Iniciar siguiente impresion",
+  btn_edit: "Editar",
+  btn_delete: "Eliminar",
+  btn_show: "Mostrar",
+  btn_remove: "Quitar",
+  btn_enable: "Activar",
+  btn_disable: "Desactivar",
+  empty_no_farmbots: "Todavia no se ha creado ningun FarmBot.",
+  farmbot_disabled_hint: "(desactivado)",
+  farmbot_manage_sub_suffix: " &middot; Jornada {start}&ndash;{end} &middot; max. {days} dias",
+  sort_alpha: "Orden: A-Z",
+  history_empty: "Todavia no se ha enviado ningun trabajo de impresion a traves del panel.",
+  farmbot_queue_modal_title_suffix: " - Cola",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "Cargando ...",
+  field_current_file: "Archivo actual"
+},
+zh: {
+  layout_switch_title: "卡片布局",
+  btn_settings: "设置",
+  btn_back_to_operation: "返回操作",
+  btn_save: "保存",
+  settings_language_title: "语言",
+  settings_language_hint: "仪表盘的界面语言 - 立即应用于所有标签、按钮和提示文本。服务器的错误消息始终为德语，不受此设置影响。",
+  settings_printers_title: "管理打印机",
+  settings_printers_hint: "添加、删除、分配到房间以及更改显示顺序。摄像头显示和所有打印功能保留在操作模式中。",
+  btn_add_printer: "+ 添加打印机",
+  settings_farmbot_hint: "独立的打印任务队列，会自动分配给当前空闲且符合所选制造商/系列的打印机 - 与各打印机自身的队列无关。启用后，每个 FarmBot 会在操作模式下的打印机上方显示自己的卡片。",
+  btn_add_farmbot: "+ 添加 FarmBot",
+  settings_groups_title: "房间 / 分组",
+  settings_groups_hint: "在操作模式下，打印机可以按房间分组显示。删除房间不会删除任何打印机 - 它们会显示在\"无房间\"下。",
+  placeholder_new_group_name: "新房间名称（例如：车间）",
+  btn_add_group: "+ 创建房间",
+  settings_cameras_title: "外部 RTSP 摄像头",
+  settings_cameras_hint: "除了打印机自带的摄像头外，还可以添加任意数量的其他 RTSP(S) 摄像头（例如房间全景）- 之后会在操作模式下作为独立卡片显示在所分配的房间（或\"无房间\"）中。如有需要可配置独立登录信息（用户名/密码）。需要 FFmpeg（参见 README/LINUX-INSTALL.md），与 X1/P1/P2/H2/X2 系列的 RTSPS 摄像头相同。",
+  btn_add_camera: "+ 添加摄像头",
+  settings_mqtt_title: "MQTT 设备（传感器/开关）",
+  settings_mqtt_hint: "一个独立于打印机的第二个 MQTT 代理，用于自由定义的传感器（显示数值及历史图表）和开关（发送固定的开/关消息）- 可按打印机绑定，也可独立使用（创建时参见\"无打印机\"）。",
+  field_broker_settings: "代理设置",
+  label_enabled: "已启用",
+  label_broker_address: "代理地址",
+  label_port: "端口",
+  label_username_optional: "用户名（可选）",
+  label_password_optional_unchanged: "密码（可选，留空表示不更改）",
+  label_use_tls: "使用 TLS",
+  btn_save_broker_settings: "保存代理设置",
+  field_sensors_switches: "传感器和开关",
+  settings_history_title: "打印历史",
+  label_history_max_jobs: "每台打印机保存的最大打印任务数（留空表示不限）",
+  hint_history_save: "通过上方\"← 返回操作\"旁的\"保存\"按钮保存（参见那里）- 仅适用于此字段。",
+  modal_camera_add_title: "添加摄像头",
+  label_name: "名称",
+  label_rtsp_url: "RTSP(S) 地址",
+  hint_camera_credentials: "URL 本身不含凭据 - 下面两个字段会自动插入（含特殊字符）。",
+  label_password_optional: "密码（可选）",
+  label_room_optional: "房间（可选）",
+  option_no_room: "无房间",
+  btn_cancel: "取消",
+  modal_add_printer_title: "添加新打印机",
+  label_printer_type: "打印机类型",
+  type_formlabs: "Formlabs（打印机）",
+  type_creality_other: "Creality（其他 Klipper 打印机）",
+  label_device_ip: "设备 IP 地址",
+  label_access_code: "访问代码（LAN 模式，打印机显示屏 → 设置）",
+  label_serial: "序列号",
+  label_printer_family: "打印机系列",
+  hint_bambu_family: "决定首次文件上传尝试时使用哪种连接设置（X1 和 A1 系列需要不同、部分相反的设置）。若选择错误，第二次尝试会自动使用另一种设置 - 因此打印总能成功，正确选择只是省去一次失败尝试。H2、P1、P2 和 X2 系列目前尚无专门数据 - 暂时使用与 X1 系列相同的设置。",
+  hint_formlabs: "需要本地运行的\"PreFormServer\"（Formlabs Local API，PreForm 安装的一部分）- 参见 README。",
+  label_api_key: "API 密钥",
+  label_use_https: "使用 HTTPS",
+  label_webcam_url_optional: "网络摄像头地址（可选）",
+  hint_creality_moonraker: "需要在打印机上运行 Moonraker（原厂 K1/K1C/K1 Max/K1 SE 需先通过 SSH \"root\"）- 参见 README。",
+  label_api_key_optional_see_readme: "API 密钥（通常不需要，参见 README）",
+  label_moonraker_port: "Moonraker 端口",
+  hint_ultimaker_api: "使用官方的、无需认证的本地 Ultimaker API - 不需要登录/API 密钥，参见 README。",
+  label_port_optional: "端口（可选）",
+  btn_add: "添加",
+  modal_ams_title: "检查 AMS 分配",
+  btn_start_print: "开始打印",
+  modal_history_title: "打印历史",
+  btn_close: "关闭",
+  sort_newest_first: "排序：最新在前",
+  modal_queue_title: "队列",
+  btn_bed_empty_send_next: "打印舱已空 - 发送下一个",
+  dz_drop_to_queue: "将文件拖放到此处以加入队列",
+  dz_or: "或",
+  dz_choose_file: "选择文件",
+  modal_assign_title: "分配任务",
+  label_target_printer: "目标打印机",
+  btn_assign: "分配",
+  btn_start_next_print: "开始下一个打印",
+  hint_farmbot_manual_reorder: "可以用 ▲/▼ 手动调整顺序 - 下次上传文件时会自动重新排序。",
+  dz_drop_to_farmbot_queue: "将文件拖放到此处以加入此 FarmBot 的队列",
+  modal_farmbot_bed_title: "释放打印舱",
+  btn_other_printer: "其他打印机",
+  btn_bed_free: "打印舱空闲",
+  label_name_suffix_optional: "名称后缀（可选）",
+  label_manufacturer: "制造商",
+  hint_farmbot_ultimaker: "仅考虑已与仪表盘配对的 Ultimaker 打印机（参见\"管理打印机\"）。",
+  label_workday_from: "工作时间从",
+  label_workday_to: "工作时间到",
+  label_max_queue_days: "队列中的最长等待时间（天）",
+  hint_max_queue_days: "达到此等待时间的任务，将在下次自动重新计算顺序时优先处理，不论其打印时长。",
+  temp_nozzle: "喷嘴",
+  temp_bed: "热床",
+  temp_chamber: "机箱",
+  tooltip_show_camera: "显示摄像头",
+  tooltip_history: "打印历史",
+  ams_filament_title: "AMS / 耗材",
+  empty_no_printers: "尚未添加任何打印机。",
+  btn_add_printer_empty: "+ 添加打印机",
+  dz_hint_developer_mode: "需要在打印机上启用开发者模式 / LAN 模式",
+  dz_hint_cura_export: "从 Cura 导出，例如通过\"保存到文件\"",
+  camera_type_badge: "摄像头",
+  switch_type_badge: "开关",
+  sensor_type_badge: "传感器",
+  btn_on: "开",
+  btn_off: "关",
+  hint_octoprint_no_chamber: "OctoPrint 不提供机箱温度 / 没有 AMS 对应功能。",
+  hint_creality_chamber: "通过 Moonraker 连接。只有在 Klipper 配置中设置了相应传感器时，才会显示机箱温度。",
+  hint_ultimaker_no_chamber: "Ultimaker 桌面打印机没有机箱温度传感器。",
+  title_progress_thumb: "当前/最后一个打印任务的预览图",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; 工作时间 {start}&ndash;{end} &middot; 最长等待 {days} 天",
+  farmbot_fits_text: "理论上今天还能开始 {total} 个任务中的 {fits} 个（其中最后一个可以在下班后无人值守继续打印）。",
+  farmbot_queue_empty: "队列为空。",
+  farmbot_queue_waiting_badge: "{count} 个等待中",
+  btn_farmbot_queue: "队列",
+  farmbot_dz_gcode: "将已切片的 .gcode 文件拖放到此处",
+  farmbot_dz_gcode3mf: "将已切片的 .gcode.3mf 文件拖放到此处",
+  btn_farmbot_start_next: "开始下一个打印",
+  btn_edit: "编辑",
+  btn_delete: "删除",
+  btn_show: "显示",
+  btn_remove: "移除",
+  btn_enable: "启用",
+  btn_disable: "停用",
+  empty_no_farmbots: "尚未创建任何 FarmBot。",
+  farmbot_disabled_hint: "（已停用）",
+  farmbot_manage_sub_suffix: " &middot; 工作时间 {start}&ndash;{end} &middot; 最长 {days} 天",
+  sort_alpha: "排序：A-Z",
+  history_empty: "尚未通过仪表盘发送任何打印任务。",
+  farmbot_queue_modal_title_suffix: " - 队列",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "正在加载...",
+  field_current_file: "当前文件"
+},
+ja: {
+  layout_switch_title: "カードレイアウト",
+  btn_settings: "設定",
+  btn_back_to_operation: "操作画面に戻る",
+  btn_save: "保存",
+  settings_language_title: "言語",
+  settings_language_hint: "ダッシュボードの表示言語です - すべてのラベル、ボタン、ヒントテキストに即時反映されます。サーバーからのエラーメッセージはこの設定に関わらずドイツ語のままです。",
+  settings_printers_title: "プリンターの管理",
+  settings_printers_hint: "追加、削除、部屋への割り当て、表示順の変更ができます。カメラ表示とすべての印刷機能は操作モードのままです。",
+  btn_add_printer: "+ プリンターを追加",
+  settings_farmbot_hint: "選択したメーカー/ファミリーに合う、現在空いているプリンターに自動的に割り当てられる独立した印刷ジョブの待機列です - 各プリンター自身の待機列とは独立しています。有効にすると、操作モードでプリンターの上に各 FarmBot 専用のカードが表示されます。",
+  btn_add_farmbot: "+ FarmBot を追加",
+  settings_groups_title: "部屋 / グループ",
+  settings_groups_hint: "操作モードではプリンターを部屋ごとにグループ化して表示できます。部屋を削除してもプリンターは削除されません - その後は「部屋なし」に表示されます。",
+  placeholder_new_group_name: "新しい部屋の名前（例：工房）",
+  btn_add_group: "+ 部屋を作成",
+  settings_cameras_title: "外部 RTSP カメラ",
+  settings_cameras_hint: "プリンター内蔵カメラに加えて、任意の RTSP(S) カメラを追加できます（例：部屋全体の様子）- 操作モードでは割り当てられた部屋（または「部屋なし」）に専用カードとして表示されます。必要に応じて専用のログイン情報（ユーザー名/パスワード）を設定できます。X1/P1/P2/H2/X2 シリーズの RTSPS カメラと同様に FFmpeg が必要です（README/LINUX-INSTALL.md 参照）。",
+  btn_add_camera: "+ カメラを追加",
+  settings_mqtt_title: "MQTT デバイス（センサー/スイッチ）",
+  settings_mqtt_hint: "プリンターとは独立した、自由に定義できるセンサー（値の表示、履歴グラフ付き）とスイッチ（固定のオン/オフメッセージ送信）用の第二の MQTT ブローカーです - プリンターごと、または独立（作成時に「プリンターなし」を参照）のいずれかで使用できます。",
+  field_broker_settings: "ブローカー設定",
+  label_enabled: "有効",
+  label_broker_address: "ブローカーアドレス",
+  label_port: "ポート",
+  label_username_optional: "ユーザー名（任意）",
+  label_password_optional_unchanged: "パスワード（任意、空欄のままなら変更なし）",
+  label_use_tls: "TLS を使用",
+  btn_save_broker_settings: "ブローカー設定を保存",
+  field_sensors_switches: "センサー＆スイッチ",
+  settings_history_title: "印刷履歴",
+  label_history_max_jobs: "プリンターごとに保存する印刷ジョブの最大数（空欄なら無制限）",
+  hint_history_save: "上部の「← 操作画面に戻る」の横にある「保存」ボタンで保存されます（そちら参照）- この項目にのみ適用されます。",
+  modal_camera_add_title: "カメラを追加",
+  label_name: "名前",
+  label_rtsp_url: "RTSP(S) URL",
+  hint_camera_credentials: "URL 自体には認証情報を含めません - 下の2つの項目が自動的に（特殊文字含めて）組み込まれます。",
+  label_password_optional: "パスワード（任意）",
+  label_room_optional: "部屋（任意）",
+  option_no_room: "部屋なし",
+  btn_cancel: "キャンセル",
+  modal_add_printer_title: "新しいプリンターを追加",
+  label_printer_type: "プリンターの種類",
+  type_formlabs: "Formlabs（プリンター）",
+  type_creality_other: "Creality（その他の Klipper プリンター）",
+  label_device_ip: "デバイスの IP アドレス",
+  label_access_code: "アクセスコード（LAN モード、プリンターのディスプレイ → 設定）",
+  label_serial: "シリアル番号",
+  label_printer_family: "プリンターファミリー",
+  hint_bambu_family: "最初のファイルアップロード時にどの接続設定を使うかを決めます（X1 シリーズと A1 シリーズでは異なる、場合によっては正反対の設定が必要です）。選択を誤った場合は2回目の試行で自動的に別の設定が試されます - いずれにしても印刷は実行されますが、正しく選べば失敗を1回減らせます。H2、P1、P2、X2 シリーズについては独自のデータがまだなく、現時点では X1 シリーズと同じ設定を使用します。",
+  hint_formlabs: "ローカルで動作する「PreFormServer」（Formlabs Local API、PreForm インストールの一部）が必要です - README を参照してください。",
+  label_api_key: "API キー",
+  label_use_https: "HTTPS を使用",
+  label_webcam_url_optional: "ウェブカメラ URL（任意）",
+  hint_creality_moonraker: "プリンター上で Moonraker が必要です（出荷時の K1/K1C/K1 Max/K1 SE はまず SSH で「root 化」が必要）- README を参照してください。",
+  label_api_key_optional_see_readme: "API キー（通常は不要、README を参照）",
+  label_moonraker_port: "Moonraker のポート",
+  hint_ultimaker_api: "公式の認証不要なローカル Ultimaker API を使用します - ログインや API キーは不要です、README を参照してください。",
+  label_port_optional: "ポート（任意）",
+  btn_add: "追加",
+  modal_ams_title: "AMS の割り当てを確認",
+  btn_start_print: "印刷を開始",
+  modal_history_title: "印刷履歴",
+  btn_close: "閉じる",
+  sort_newest_first: "並び順：新しい順",
+  modal_queue_title: "待機列",
+  btn_bed_empty_send_next: "プレート空 - 次を送信",
+  dz_drop_to_queue: "ここにファイルをドロップして待機列に追加",
+  dz_or: "または",
+  dz_choose_file: "ファイルを選択",
+  modal_assign_title: "ジョブを割り当て",
+  label_target_printer: "対象プリンター",
+  btn_assign: "割り当て",
+  btn_start_next_print: "次の印刷を開始",
+  hint_farmbot_manual_reorder: "▲/▼ で順序を手動変更できます - 次にファイルがアップロードされると自動的に再ソートされます。",
+  dz_drop_to_farmbot_queue: "ここにファイルをドロップしてこの FarmBot の待機列に追加",
+  modal_farmbot_bed_title: "印刷プレートを解放",
+  btn_other_printer: "別のプリンター",
+  btn_bed_free: "プレート空き",
+  label_name_suffix_optional: "名前の補足（任意）",
+  label_manufacturer: "メーカー",
+  hint_farmbot_ultimaker: "ダッシュボードに既に接続済みの Ultimaker プリンターのみが対象です（「プリンターの管理」参照）。",
+  label_workday_from: "稼働時間（開始）",
+  label_workday_to: "稼働時間（終了）",
+  label_max_queue_days: "待機列での最大待機時間（日数）",
+  hint_max_queue_days: "この待機時間に達したジョブは、次回の順序の自動再計算時に印刷時間に関わらず優先的に処理されます。",
+  temp_nozzle: "ノズル",
+  temp_bed: "ベッド",
+  temp_chamber: "チャンバー",
+  tooltip_show_camera: "カメラを表示",
+  tooltip_history: "印刷履歴",
+  ams_filament_title: "AMS / フィラメント",
+  empty_no_printers: "まだプリンターが登録されていません。",
+  btn_add_printer_empty: "+ プリンターを追加",
+  dz_hint_developer_mode: "プリンターのデベロッパーモード / LAN モードが必要です",
+  dz_hint_cura_export: "Cura からのエクスポート、例：「ファイルに保存」経由",
+  camera_type_badge: "カメラ",
+  switch_type_badge: "スイッチ",
+  sensor_type_badge: "センサー",
+  btn_on: "オン",
+  btn_off: "オフ",
+  hint_octoprint_no_chamber: "OctoPrint はチャンバー温度を提供しません / AMS に相当する機能はありません。",
+  hint_creality_chamber: "Moonraker 経由で接続されています。チャンバー温度は Klipper の設定で対応するセンサーが設定されている場合のみ表示されます。",
+  hint_ultimaker_no_chamber: "Ultimaker のデスクトッププリンターにはチャンバー温度センサーがありません。",
+  title_progress_thumb: "現在/直前の印刷ジョブのプレビュー",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; 稼働時間 {start}&ndash;{end} &middot; 最大待機 {days} 日",
+  farmbot_fits_text: "理論上、本日中に {total} 件中 {fits} 件のジョブを開始できます（最後の1件は終業後も無人のまま印刷を継続できます）。",
+  farmbot_queue_empty: "待機列は空です。",
+  farmbot_queue_waiting_badge: "{count} 件待機中",
+  btn_farmbot_queue: "待機列",
+  farmbot_dz_gcode: "スライス済みの .gcode ファイルをここにドロップ",
+  farmbot_dz_gcode3mf: "スライス済みの .gcode.3mf ファイルをここにドロップ",
+  btn_farmbot_start_next: "次の印刷を開始",
+  btn_edit: "編集",
+  btn_delete: "削除",
+  btn_show: "表示",
+  btn_remove: "削除（登録解除）",
+  btn_enable: "有効化",
+  btn_disable: "無効化",
+  empty_no_farmbots: "まだ FarmBot が作成されていません。",
+  farmbot_disabled_hint: "（無効）",
+  farmbot_manage_sub_suffix: " &middot; 稼働時間 {start}&ndash;{end} &middot; 最大 {days} 日",
+  sort_alpha: "並び順：A-Z",
+  history_empty: "まだダッシュボード経由で送信された印刷ジョブはありません。",
+  farmbot_queue_modal_title_suffix: " - 待機列",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "読み込み中...",
+  field_current_file: "現在のファイル"
+},
+tr: {
+  layout_switch_title: "Kart duzeni",
+  btn_settings: "Ayarlar",
+  btn_back_to_operation: "Calismaya geri don",
+  btn_save: "Kaydet",
+  settings_language_title: "Dil",
+  settings_language_hint: "Panelin arayuz dili - tum etiketlere, dugmelere ve ipucu metinlerine hemen uygulanir. Sunucudan gelen hata mesajlari bu ayardan bagimsiz olarak Almanca kalir.",
+  settings_printers_title: "Yazicilari yonet",
+  settings_printers_hint: "Ekle, kaldir, bir odaya ata ve goruntuleme sirasini degistir. Kamera gorunumu ve tum yazdirma islevleri calisma modunda kalir.",
+  btn_add_printer: "+ Yazici ekle",
+  settings_farmbot_hint: "Secilen uretici/aile ile eslesen, su anda bos olan bir yaziciya otomatik olarak atanan bagimsiz yazdirma gorevi kuyrugu/kuyruklari - her yazicinin kendi kuyrugundan bagimsizdir. Etkinlestirildiginde, calisma modunda yazicilarin ustunde her FarmBot icin ayri bir kart gorunur.",
+  btn_add_farmbot: "+ FarmBot ekle",
+  settings_groups_title: "Odalar / gruplar",
+  settings_groups_hint: "Yazicilar calisma modunda odaya gore gruplanarak gosterilebilir. Bir odanin silinmesi HICBIR yaziciyi silmez - bu yazicilar daha sonra \"Oda yok\" altinda gorunur.",
+  placeholder_new_group_name: "Yeni odanin adi (orn. atolye)",
+  btn_add_group: "+ Oda olustur",
+  settings_cameras_title: "Harici RTSP kameralar",
+  settings_cameras_hint: "Yazicilara ait kameralara ek olarak, istenilen sayida baska RTSP(S) kamera eklenebilir (orn. oda genel gorunumu) - bunlar daha sonra calisma modunda, atanan odada (veya \"Oda yok\" altinda) kendi karti olarak gorunur. Gerekirse kendi oturum bilgileriyle (kullanici adi/sifre). X1/P1/P2/H2/X2 serisinin RTSPS kamerasi gibi FFmpeg gerektirir (bkz. README/LINUX-INSTALL.md).",
+  btn_add_camera: "+ Kamera ekle",
+  settings_mqtt_title: "MQTT cihazlari (sensorler/anahtarlar)",
+  settings_mqtt_hint: "Yazicilardan bagimsiz, ozgurce tanimlanabilen sensorler (bir degerin gosterimi, gecmis grafigiyle) ve anahtarlar (sabit acma/kapama mesajlari gonderir) icin ikinci bir MQTT broker'i - yaziciya bagli veya bagimsiz olarak (olusturulurken \"Yazici yok\" secenegine bakin).",
+  field_broker_settings: "Broker ayarlari",
+  label_enabled: "Etkin",
+  label_broker_address: "Broker adresi",
+  label_port: "Port",
+  label_username_optional: "Kullanici adi (istege bagli)",
+  label_password_optional_unchanged: "Sifre (istege bagli, bos birakilirsa degismez)",
+  label_use_tls: "TLS kullan",
+  btn_save_broker_settings: "Broker ayarlarini kaydet",
+  field_sensors_switches: "Sensorler ve anahtarlar",
+  settings_history_title: "Yazdirma gecmisi",
+  label_history_max_jobs: "Yazici basina saklanan maksimum yazdirma gorevi sayisi (bos = sinirsiz)",
+  hint_history_save: "Yukarida \"← Calismaya geri don\" yanindaki \"Kaydet\" dugmesiyle kaydedilir (bkz. orada) - yalnizca bu alan icin gecerlidir.",
+  modal_camera_add_title: "Kamera ekle",
+  label_name: "Ad",
+  label_rtsp_url: "RTSP(S) URL",
+  hint_camera_credentials: "URL'nin kendisinde kimlik bilgisi olmadan - asagidaki iki alan otomatik olarak (ozel karakterler dahil) eklenir.",
+  label_password_optional: "Sifre (istege bagli)",
+  label_room_optional: "Oda (istege bagli)",
+  option_no_room: "Oda yok",
+  btn_cancel: "Vazgec",
+  modal_add_printer_title: "Yeni yazici ekle",
+  label_printer_type: "Yazici turu",
+  type_formlabs: "Formlabs (yazici)",
+  type_creality_other: "Creality (diger Klipper yazici)",
+  label_device_ip: "Cihazin IP adresi",
+  label_access_code: "Erisim kodu (LAN modu, yazici ekrani → ayarlar)",
+  label_serial: "Seri numarasi",
+  label_printer_family: "Yazici ailesi",
+  hint_bambu_family: "Ilk dosya yukleme denemesinde hangi baglanti ayarinin kullanilacagini belirler (X1 ve A1 serisi farkli, kismen zit ayarlar gerektirir). Yanlis secim yapilirsa, ikinci denemede diger ayar otomatik olarak denenir - yazdirma her halde calisir, dogru secim sadece bir basarisiz denemeyi onler. H2, P1, P2 ve X2 serisi icin henuz kendi verisi yoktur - su an icin X1 serisiyle ayni ayari kullanirlar.",
+  hint_formlabs: "Yerel olarak calisan \"PreFormServer\" (Formlabs Local API, PreForm kurulumunun bir parcasi) gerektirir - bkz. README.",
+  label_api_key: "API anahtari",
+  label_use_https: "HTTPS kullan",
+  label_webcam_url_optional: "Webcam URL'si (istege bagli)",
+  hint_creality_moonraker: "Yazicida Moonraker gerektirir (fabrika K1/K1C/K1 Max/K1 SE cihazlari once SSH ile \"root\" edilmelidir) - bkz. README.",
+  label_api_key_optional_see_readme: "API anahtari (genellikle gerekli degildir, bkz. README)",
+  label_moonraker_port: "Moonraker portu",
+  hint_ultimaker_api: "Resmi, kimlik dogrulamasi gerektirmeyen yerel Ultimaker API'sini kullanir - oturum acma/API anahtari gerekmez, bkz. README.",
+  label_port_optional: "Port (istege bagli)",
+  btn_add: "Ekle",
+  modal_ams_title: "AMS atamasini kontrol et",
+  btn_start_print: "Yazdirmayi baslat",
+  modal_history_title: "Yazdirma gecmisi",
+  btn_close: "Kapat",
+  sort_newest_first: "Siralama: once en yeni",
+  modal_queue_title: "Kuyruk",
+  btn_bed_empty_send_next: "Tabla bos - sonrakini gonder",
+  dz_drop_to_queue: "Kuyruga eklemek icin dosyayi buraya birakin",
+  dz_or: "veya",
+  dz_choose_file: "Dosya sec",
+  modal_assign_title: "Gorevi ata",
+  label_target_printer: "Hedef yazici",
+  btn_assign: "Ata",
+  btn_start_next_print: "Sonraki yazdirmayi baslat",
+  hint_farmbot_manual_reorder: "Sira ▲/▼ ile elle degistirilebilir - bir sonraki yuklenen dosyada otomatik olarak yeniden siralanir.",
+  dz_drop_to_farmbot_queue: "Bu FarmBot'un kuyruguna eklemek icin dosyayi buraya birakin",
+  modal_farmbot_bed_title: "Yazdirma tablasini bosalt",
+  btn_other_printer: "Diger yazici",
+  btn_bed_free: "Tabla bos",
+  label_name_suffix_optional: "Ad eki (istege bagli)",
+  label_manufacturer: "Uretici",
+  hint_farmbot_ultimaker: "Yalnizca panel ile zaten eslestirilmis Ultimaker yazicilar dikkate alinir (bkz. \"Yazicilari yonet\").",
+  label_workday_from: "Calisma gunu baslangici",
+  label_workday_to: "Calisma gunu bitisi",
+  label_max_queue_days: "Kuyrukta maksimum bekleme suresi (gun)",
+  hint_max_queue_days: "Bu bekleme suresine ulasan gorevler, siranin bir sonraki otomatik yeniden hesaplanmasinda yazdirma suresinden bagimsiz olarak oncelikli islenir.",
+  temp_nozzle: "Nozul",
+  temp_bed: "Tabla",
+  temp_chamber: "Hazne",
+  tooltip_show_camera: "Kamerayi goster",
+  tooltip_history: "Yazdirma gecmisi",
+  ams_filament_title: "AMS / Filament",
+  empty_no_printers: "Henuz yazici eklenmedi.",
+  btn_add_printer_empty: "+ Yazici ekle",
+  dz_hint_developer_mode: "Yazicida Gelistirici Modu / LAN modu gerektirir",
+  dz_hint_cura_export: "Cura'dan disa aktarildi, orn. \"Dosyaya kaydet\" ile",
+  camera_type_badge: "Kamera",
+  switch_type_badge: "Anahtar",
+  sensor_type_badge: "Sensor",
+  btn_on: "Acik",
+  btn_off: "Kapali",
+  hint_octoprint_no_chamber: "OctoPrint hazne sicakligi saglamaz / AMS esdegeri yoktur.",
+  hint_creality_chamber: "Moonraker uzerinden baglanmistir. Hazne sicakligi yalnizca Klipper kurulumunda ilgili bir sensor yapilandirilmissa gorunur.",
+  hint_ultimaker_no_chamber: "Ultimaker masaustu yazicilarin hazne sicaklik sensoru yoktur.",
+  title_progress_thumb: "Guncel/son yazdirma gorevinin onizlemesi",
+  farmbot_sub_ultimaker: "Ultimaker",
+  farmbot_sub_bambu: "Bambu Lab &middot; {family}",
+  farmbot_sub_suffix: " &middot; Calisma gunu {start}&ndash;{end} &middot; maks. {days} gun bekleme",
+  farmbot_fits_text: "{total} gorevden {fits} tanesi teorik olarak bugun hala baslatilabilir (bunlardan sonuncusu mesai disinda gozetimsiz yazdirmaya devam edebilir).",
+  farmbot_queue_empty: "Kuyruk bos.",
+  farmbot_queue_waiting_badge: "{count} bekliyor",
+  btn_farmbot_queue: "Kuyruk",
+  farmbot_dz_gcode: "Dilimlenmis .gcode dosyasini buraya birakin",
+  farmbot_dz_gcode3mf: "Dilimlenmis .gcode.3mf dosyasini buraya birakin",
+  btn_farmbot_start_next: "Sonraki yazdirmayi baslat",
+  btn_edit: "Duzenle",
+  btn_delete: "Sil",
+  btn_show: "Goster",
+  btn_remove: "Kaldir",
+  btn_enable: "Etkinlestir",
+  btn_disable: "Devre disi birak",
+  empty_no_farmbots: "Henuz FarmBot olusturulmadi.",
+  farmbot_disabled_hint: "(devre disi)",
+  farmbot_manage_sub_suffix: " &middot; Calisma gunu {start}&ndash;{end} &middot; maks. {days} gun",
+  sort_alpha: "Siralama: A-Z",
+  history_empty: "Henuz panel uzerinden gonderilmis bir yazdirma gorevi yok.",
+  farmbot_queue_modal_title_suffix: " - Kuyruk",
+  farmbot_default_name: "FarmBot",
+  loading_generic: "Yukleniyor ...",
+  field_current_file: "Guncel dosya"
+}
+};
+
+// native-script Namen fuer den Sprachwaehler (auch fuer das Erststart-
+// Fenster, siehe showFirstRunLanguagePicker() - dort DARF nicht uebersetzt
+// werden, da die Zielsprache beim ersten Aufruf noch unbekannt ist).
+const LANGUAGE_NAMES = {
+  de: "Deutsch",
+  en: "English",
+  fr: "Francais",
+  es: "Espanol",
+  zh: "中文",
+  ja: "日本語",
+  tr: "Turkce"
+};
+
+function t(key, vars){
+  let entry = (I18N[currentLang] && I18N[currentLang][key]);
+  if(entry === undefined) entry = (I18N.de && I18N.de[key]);
+  if(entry === undefined) return key;
+  if(vars){
+    for(const k in vars){
+      entry = entry.split('{' + k + '}').join(vars[k]);
+    }
+  }
+  return entry;
+}
+
+// Wendet die aktuelle Sprache auf alle statisch im HTML vorhandenen,
+// mit data-i18n(-placeholder|-title) markierten Elemente an. Dynamisch
+// per JS erzeugte Inhalte (Kacheln, Modals mit generierten Listen) nutzen
+// stattdessen direkt t() im jeweiligen Template-String und muessen daher
+// nicht hier erfasst werden - sie werden beim naechsten Neuaufbau (z. B.
+// naechster refresh()-Zyklus) automatisch in der neuen Sprache gezeichnet.
+function applyTranslations(){
+  document.documentElement.setAttribute('lang', currentLang);
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = t(el.getAttribute('data-i18n'));
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    el.setAttribute('placeholder', t(el.getAttribute('data-i18n-placeholder')));
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    el.setAttribute('title', t(el.getAttribute('data-i18n-title')));
+  });
+}
+
+async function changeLanguage(lang, skipSave){
+  if(!I18N[lang]) return;
+  currentLang = lang;
+  applyTranslations();
+  // v2.8.0: alle bereits gezeichneten dynamischen Bereiche neu aufbauen,
+  // damit die per t() erzeugten Texte sofort in der neuen Sprache
+  // erscheinen, statt erst beim naechsten periodischen refresh().
+  try{ refresh(); }catch(e){}
+  try{ if(typeof refreshPrinterManageList === 'function' && lastPrinterList) refreshPrinterManageList(lastPrinterList, lastGroupList); }catch(e){}
+  try{ if(typeof refreshGroupsManageList === 'function' && lastGroupList) refreshGroupsManageList(lastGroupList); }catch(e){}
+  try{ if(typeof refreshCamerasManageList === 'function' && lastCamsList) refreshCamerasManageList(lastCamsList); }catch(e){}
+  try{ if(typeof refreshFarmbotManageList === 'function' && lastFarmbotList) refreshFarmbotManageList(lastFarmbotList); }catch(e){}
+  if(!skipSave){
+    try{
+      await fetch('/api/settings', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({language: lang})
+      });
+    }catch(e){}
+  }
+}
+
+function populateLanguageSelect(){
+  const sel = document.getElementById('languageSelect');
+  if(!sel) return;
+  sel.innerHTML = Object.keys(LANGUAGE_NAMES).map(code =>
+    `<option value="${code}" ${code === currentLang ? 'selected' : ''}>${LANGUAGE_NAMES[code]}</option>`
+  ).join('');
+}
+
+// v2.8.0: Erststart-Sprachauswahl - erscheint als allererstes, bevor
+// irgendetwas anderes auf der Seite geladen wird, wenn beim Programmstart
+// noch keine config.json existierte (siehe CONFIG_WAS_FRESH/first_run im
+// Python-Teil). Nutzt bewusst NUR die nativen Sprachnamen (LANGUAGE_NAMES)
+// statt uebersetzter Button-Texte, da die Zielsprache hier per Definition
+// noch nicht feststeht.
+function showFirstRunLanguagePicker(){
+  const overlay = document.createElement('div');
+  overlay.id = 'firstRunLangOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--bg-card,#1e1e24);color:var(--text,#eee);border-radius:12px;padding:28px 32px;max-width:360px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,0.5);';
+  box.innerHTML = '<div style="font-size:15px;margin-bottom:16px;">Sprache / Language / Langue / Idioma / 语言 / 言語 / Dil</div>';
+  const list = document.createElement('div');
+  list.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
+  Object.keys(LANGUAGE_NAMES).forEach(code => {
+    const btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.style.width = '100%';
+    btn.textContent = LANGUAGE_NAMES[code];
+    btn.onclick = async () => {
+      overlay.remove();
+      await changeLanguage(code);
+    };
+    list.appendChild(btn);
+  });
+  box.appendChild(list);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
 const CAM_ICON = `<svg viewBox="0 0 24 24"><path d="M4 7h3l1.5-2h7L17 7h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm8 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg>`;
 const HIST_ICON = `<svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 1 0 8.94 10h-2.02A7 7 0 1 1 13 5v4l5-4-5-4z"/><path d="M12 8v5l4 2-.75 1.3L11 14V8z"/></svg>`;
 const FILE_ICON = `<svg viewBox="0 0 24 24"><path d="M6 2h9l5 5v15H6zm8 1.5V8h4.5z"/></svg>`;
@@ -7644,8 +8754,8 @@ async function renderMqttExtrasList(){
           <div class="mqtt-extra-sub">${sub}</div>
         </div>
         <div>
-          <button class="btn-mini" onclick="startEditMqttExtra('${p.id}','${e.id}')">Bearbeiten</button>
-          <button class="btn-mini btn-delete" onclick="deleteMqttExtra('${p.id}','${e.id}')">Loeschen</button>
+          <button class="btn-mini" onclick="startEditMqttExtra('${p.id}','${e.id}')">${t('btn_edit')}</button>
+          <button class="btn-mini btn-delete" onclick="deleteMqttExtra('${p.id}','${e.id}')">${t('btn_delete')}</button>
         </div>
       </div>`);
     });
@@ -7678,8 +8788,8 @@ async function renderMqttExtrasList(){
       </div>
       <div>
         <select onchange="assignStandaloneExtraGroup('${e.id}', this.value)">${groupOptions}</select>
-        <button class="btn-mini" onclick="startEditMqttExtra('','${e.id}')">Bearbeiten</button>
-        <button class="btn-mini btn-delete" onclick="deleteMqttExtra('','${e.id}')">Loeschen</button>
+        <button class="btn-mini" onclick="startEditMqttExtra('','${e.id}')">${t('btn_edit')}</button>
+        <button class="btn-mini btn-delete" onclick="deleteMqttExtra('','${e.id}')">${t('btn_delete')}</button>
       </div>
     </div>`);
   });
@@ -8021,10 +9131,10 @@ function renderHistoryEntries(){
   const body = document.getElementById('historyModalBody');
   const sortBtn = document.getElementById('historySortBtn');
   if(sortBtn){
-    sortBtn.textContent = (historySortMode === 'date') ? 'Sortierung: Neueste zuerst' : 'Sortierung: A-Z';
+    sortBtn.textContent = (historySortMode === 'date') ? t('sort_newest_first') : t('sort_alpha');
   }
   if(!lastHistoryEntries.length){
-    body.innerHTML = '<div class="history-empty">Noch keine Druckauftraege ueber das Dashboard gesendet.</div>';
+    body.innerHTML = `<div class="history-empty">${t('history_empty')}</div>`;
     return;
   }
   // 'date': Backend liefert bereits neueste zuerst - unveraendert uebernehmen.
@@ -8049,8 +9159,8 @@ function renderHistoryEntries(){
         <div class="history-actions">
           <button class="btn-mini" onclick="reprintHistoryEntry('${printerId}','${e.job_id}')">Erneut drucken</button>
           <button class="btn-mini" onclick="addHistoryEntryToQueue('${printerId}','${e.job_id}')">In Warteschlange</button>
-          <button class="btn-mini" onclick="openAssignModal('history','${printerId}','${e.job_id}')">Zuweisen</button>
-          <button class="btn-mini btn-delete" onclick="deleteHistoryEntry('${printerId}','${e.job_id}')">Loeschen</button>
+          <button class="btn-mini" onclick="openAssignModal('history','${printerId}','${e.job_id}')">${t('btn_assign')}</button>
+          <button class="btn-mini btn-delete" onclick="deleteHistoryEntry('${printerId}','${e.job_id}')">${t('btn_delete')}</button>
         </div>
       </div>`;
   }).join('');
@@ -8216,8 +9326,8 @@ async function refreshQueueModal(){
           <div class="history-date">In Warteschlange seit ${e.added_at}${durHtml}</div>
         </div>
         <div class="history-actions">
-          <button class="btn-mini" onclick="openAssignModal('queue','${printerId}','${e.job_id}')">Zuweisen</button>
-          <button class="btn-mini btn-delete" onclick="deleteQueueEntry('${printerId}','${e.job_id}')">Loeschen</button>
+          <button class="btn-mini" onclick="openAssignModal('queue','${printerId}','${e.job_id}')">${t('btn_assign')}</button>
+          <button class="btn-mini btn-delete" onclick="deleteQueueEntry('${printerId}','${e.job_id}')">${t('btn_delete')}</button>
         </div>
       </div>`;
   }).join('');
@@ -8512,7 +9622,14 @@ function sparklineSvg(values, cssClass){
 function tempChip(printerId, field, label, value){
   recordTempHistory(printerId, field, value);
   const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
-  return `<div class="temp-chip">${label} <b>${formatTemp(value)}&deg;C</b>${sparklineSvg(history)}</div>`;
+  // v2.8.0: label wird ueber den Feldnamen uebersetzt (I18N), statt den
+  // vom Aufrufer uebergebenen deutschen Text direkt zu verwenden - der
+  // dritte Parameter bleibt aus Kompatibilitaetsgruenden erhalten
+  // (Fallback, falls field unbekannt ist), wird aber im Normalfall nicht
+  // mehr benutzt.
+  const key = {nozzle: 'temp_nozzle', bed: 'temp_bed', chamber: 'temp_chamber'}[field];
+  const text = key ? t(key) : label;
+  return `<div class="temp-chip">${text} <b>${formatTemp(value)}&deg;C</b>${sparklineSvg(history)}</div>`;
 }
 
 // v2.2.0: kleines Vorschaubild des aktuellen/zuletzt gestarteten
@@ -8526,7 +9643,7 @@ function tempChip(printerId, field, label, value){
 function progressThumb(p){
   if(!p.current_thumb_has_image || !p.current_thumb_job_id) return '';
   return `<img class="progress-thumb" src="/api/printers/${p.id}/history/${p.current_thumb_job_id}/thumbnail" ` +
-         `alt="" title="Vorschau des aktuellen/letzten Druckauftrags">`;
+         `alt="" title="${t('title_progress_thumb')}">`;
 }
 
 // v2.2.3: Woertliche Einordnung der Bambu-Feuchte-Stufe (1 = trocken/gut
@@ -8718,8 +9835,8 @@ function renderExtras(printerId, extras){
         if(e.kind === 'switch'){
           return `<div class="extra-switch">
             <span>${e.label}</span>
-            <button class="btn-mini" onclick="extraCommand('${printerId}','${e.id}','on')">Ein</button>
-            <button class="btn-mini off" onclick="extraCommand('${printerId}','${e.id}','off')">Aus</button>
+            <button class="btn-mini" onclick="extraCommand('${printerId}','${e.id}','on')">${t('btn_on')}</button>
+            <button class="btn-mini off" onclick="extraCommand('${printerId}','${e.id}','off')">${t('btn_off')}</button>
           </div>`;
         }
         // v2.5.1: zeigt jetzt IMMER ein Verlaufsdiagramm (Sparkline), nicht
@@ -8778,9 +9895,9 @@ function cardForCamera(c){
     <div class="camera-card">
       <div>
         <span class="name">${c.name}</span>
-        <span class="type-badge">Kamera</span>
+        <span class="type-badge">${t('camera_type_badge')}</span>
       </div>
-      <div class="cam-icon" title="Kamera anzeigen" onclick="openExternalCam('${c.id}')">${CAM_ICON}</div>
+      <div class="cam-icon" title="${t('tooltip_show_camera')}" onclick="openExternalCam('${c.id}')">${CAM_ICON}</div>
     </div>`;
 }
 
@@ -8796,11 +9913,11 @@ function cardForStandaloneExtra(e){
       <div class="camera-card">
         <div>
           <span class="name">${e.label}</span>
-          <span class="type-badge">Schalter</span>
+          <span class="type-badge">${t('switch_type_badge')}</span>
         </div>
         <div>
-          <button class="btn-mini" onclick="standaloneExtraCommand('${e.id}','on')">Ein</button>
-          <button class="btn-mini off" onclick="standaloneExtraCommand('${e.id}','off')">Aus</button>
+          <button class="btn-mini" onclick="standaloneExtraCommand('${e.id}','on')">${t('btn_on')}</button>
+          <button class="btn-mini off" onclick="standaloneExtraCommand('${e.id}','off')">${t('btn_off')}</button>
         </div>
       </div>`;
   }
@@ -8826,7 +9943,7 @@ function cardForStandaloneExtra(e){
     <div class="camera-card">
       <div>
         <span class="name">${e.label}</span>
-        <span class="type-badge">Sensor</span>
+        <span class="type-badge">${t('sensor_type_badge')}</span>
       </div>
       <div><b>${val}${e.unit ? ' ' + e.unit : ''}</b>${isNumeric ? sparklineSvg(history, sparkClass) : ''}</div>
     </div>`;
@@ -8855,8 +9972,8 @@ async function refresh(){
 
   if(printers.length === 0 && cams.length === 0 && standaloneExtras.length === 0){
     list.innerHTML = `<div class="empty-state">
-      Noch keine Drucker hinterlegt.
-      <div><button class="btn" onclick="enterSettingsMode()">+ Drucker hinzufuegen</button></div>
+      ${t('empty_no_printers')}
+      <div><button class="btn" onclick="enterSettingsMode()">${t('btn_add_printer_empty')}</button></div>
     </div>`;
     return;
   }
@@ -8935,14 +10052,14 @@ function renderBambuCard(p){
         </div>
         <div class="head-right">
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
-          <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
-          <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          <div class="cam-icon" title="${t('tooltip_show_camera')}" onclick="openCam('${p.id}')">${CAM_ICON}</div>
+          <div class="hist-icon" title="${t('tooltip_history')}" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
           ${renderQueueIcon(p)}
         </div>
       </div>
       <div class="card-body">
         <div>
-          <div class="field-label">Aktuelle Datei</div>
+          <div class="field-label" data-i18n="field_current_file">Aktuelle Datei</div>
           <div class="file-name">${p.file_name || '-'} ${remMin ? ' &middot; ' + remMin : ''}</div>
 
           <div class="field-label">Fortschritt</div>
@@ -8966,7 +10083,7 @@ function renderBambuCard(p){
           </div>
         </div>
         <div>
-          <div class="ams-title">AMS / Filament</div>
+          <div class="ams-title">${t('ams_filament_title')}</div>
           ${renderAms(p.id, p.ams, p.ams_units, p.bambu_family)}
           ${renderDropZone(p.id)}
         </div>
@@ -8982,7 +10099,7 @@ function renderDropZone(printerId){
          ondragleave="dzDragLeave(event)"
          ondrop="dzDrop(event,'${printerId}')">
       Fertig gesclicte .gcode.3mf-Datei hier ablegen zum Drucken
-      <div class="dz-hint">Erfordert Developer Mode / LAN-Modus am Drucker</div>
+      <div class="dz-hint">${t('dz_hint_developer_mode')}</div>
     </div>`;
 }
 
@@ -9317,13 +10434,13 @@ function renderOctoPrintCard(p){
         </div>
         <div class="head-right">
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
-          <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
-          <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          <div class="cam-icon" title="${t('tooltip_show_camera')}" onclick="openCam('${p.id}')">${CAM_ICON}</div>
+          <div class="hist-icon" title="${t('tooltip_history')}" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
         </div>
       </div>
       <div class="card-body">
         <div>
-          <div class="field-label">Aktuelle Datei</div>
+          <div class="field-label" data-i18n="field_current_file">Aktuelle Datei</div>
           <div class="file-name">${p.file_name || '-'} ${remMin ? ' &middot; ' + remMin : ''}</div>
 
           <div class="field-label">Fortschritt</div>
@@ -9343,7 +10460,7 @@ function renderOctoPrintCard(p){
         </div>
         <div>
           <div class="field-label">Hinweis</div>
-          <div class="hint-text" style="margin:0;">OctoPrint liefert keine Kammertemperatur / kein AMS-Aequivalent.</div>
+          <div class="hint-text" style="margin:0;">${t('hint_octoprint_no_chamber')}</div>
         </div>
       </div>
       ${renderExtras(p.id, p.extras)}
@@ -9366,13 +10483,13 @@ function renderCrealityCard(p){
         </div>
         <div class="head-right">
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
-          <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
-          <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          <div class="cam-icon" title="${t('tooltip_show_camera')}" onclick="openCam('${p.id}')">${CAM_ICON}</div>
+          <div class="hist-icon" title="${t('tooltip_history')}" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
         </div>
       </div>
       <div class="card-body">
         <div>
-          <div class="field-label">Aktuelle Datei</div>
+          <div class="field-label" data-i18n="field_current_file">Aktuelle Datei</div>
           <div class="file-name">${p.file_name || '-'}</div>
 
           <div class="field-label">Fortschritt</div>
@@ -9393,7 +10510,7 @@ function renderCrealityCard(p){
         </div>
         <div>
           <div class="field-label">Hinweis</div>
-          <div class="hint-text" style="margin:0;">Ueber Moonraker angebunden. Kammertemperatur nur sichtbar, falls im Klipper-Setup ein entsprechender Sensor konfiguriert ist.</div>
+          <div class="hint-text" style="margin:0;">${t('hint_creality_chamber')}</div>
         </div>
       </div>
       ${renderExtras(p.id, p.extras)}
@@ -9415,14 +10532,14 @@ function renderUltimakerCard(p){
         </div>
         <div class="head-right">
           <span class="state-badge ${stateClass(p.gcode_state)}">${p.gcode_state || 'UNKNOWN'}</span>
-          <div class="cam-icon" title="Kamera anzeigen" onclick="openCam('${p.id}')">${CAM_ICON}</div>
-          <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          <div class="cam-icon" title="${t('tooltip_show_camera')}" onclick="openCam('${p.id}')">${CAM_ICON}</div>
+          <div class="hist-icon" title="${t('tooltip_history')}" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
           ${renderQueueIcon(p)}
         </div>
       </div>
       <div class="card-body">
         <div>
-          <div class="field-label">Aktuelle Datei</div>
+          <div class="field-label" data-i18n="field_current_file">Aktuelle Datei</div>
           <div class="file-name">${p.file_name || '-'} ${remMin ? ' &middot; ' + remMin : ''}</div>
 
           <div class="field-label">Fortschritt</div>
@@ -9443,7 +10560,7 @@ function renderUltimakerCard(p){
         <div>
           <div class="field-label">Druckauftrag senden</div>
           ${renderUltimakerDropZone(p.id, !!p.ultimaker_paired)}
-          <div class="hint-text" style="margin-top:8px;">Ultimaker-Desktopdrucker haben keinen Kammertemperatursensor.</div>
+          <div class="hint-text" style="margin-top:8px;">${t('hint_ultimaker_no_chamber')}</div>
         </div>
       </div>
       ${renderExtras(p.id, p.extras)}
@@ -9467,7 +10584,7 @@ function renderUltimakerDropZone(printerId, paired){
          ondragleave="dzDragLeave(event)"
          ondrop="dzDropUltimaker(event,'${printerId}')">
       Fertig gesclicte .gcode-Datei hier ablegen zum Drucken
-      <div class="dz-hint">Export aus Cura, z. B. ueber "Datei speichern"</div>
+      <div class="dz-hint">${t('dz_hint_cura_export')}</div>
     </div>`;
 }
 
@@ -9601,7 +10718,7 @@ function renderFormlabsCard(p){
         </div>
         <div class="head-right">
           <span class="state-badge ${stateClass(p.device_status)}">${p.device_status || 'UNKNOWN'}</span>
-          <div class="hist-icon" title="Druckauftrags-Verlauf" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
+          <div class="hist-icon" title="${t('tooltip_history')}" onclick="openHistoryModal('${p.id}')">${HIST_ICON}</div>
         </div>
       </div>
       <div class="card-body single-col">
@@ -9730,12 +10847,20 @@ async function refreshSettingsPanel(){
   const histInput = document.getElementById('historyMaxJobsInput');
   histInput.value = (settings.history_max_jobs === null || settings.history_max_jobs === undefined)
     ? '' : settings.history_max_jobs;
+  // v2.8.0: Sprachauswahl im Einstellungsbereich immer passend zur
+  // aktuell aktiven Sprache anzeigen (falls z. B. ueber eine andere
+  // Sitzung/Geraet geaendert).
+  if(settings.language && settings.language !== currentLang){
+    currentLang = settings.language;
+    applyTranslations();
+  }
+  populateLanguageSelect();
 }
 
 function refreshPrinterManageList(printers, groups){
   const el = document.getElementById('printerManageList');
   if(!printers.length){
-    el.innerHTML = '<div class="hint-text">Noch keine Drucker hinterlegt.</div>';
+    el.innerHTML = `<div class="hint-text">${t('empty_no_printers')}</div>`;
     return;
   }
   const sorted = printers.slice().sort((a,b) => (a.order||0) - (b.order||0));
@@ -9756,7 +10881,7 @@ function refreshPrinterManageList(printers, groups){
           <option value="">Kein Raum</option>
           ${groupOptions(p.group_id)}
         </select>
-        <button class="btn-mini btn-delete" title="Entfernen" onclick="deletePrinter('${p.id}')">&times;</button>
+        <button class="btn-mini btn-delete" title="${t('btn_remove')}" onclick="deletePrinter('${p.id}')">&times;</button>
       </div>
     </div>`).join('');
 }
@@ -9815,7 +10940,7 @@ function refreshGroupsManageList(groups){
       <div class="manage-info">${g.name}</div>
       <div class="manage-actions">
         <button class="btn-mini" title="Umbenennen" onclick="renameGroup('${g.id}')">Umbenennen</button>
-        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteGroup('${g.id}')">&times;</button>
+        <button class="btn-mini btn-delete" title="${t('btn_remove')}" onclick="deleteGroup('${g.id}')">&times;</button>
       </div>
     </div>`).join('');
 }
@@ -9916,9 +11041,9 @@ function refreshCamerasManageList(cams, groups){
           <option value="">Kein Raum</option>
           ${groupOptions(c.group_id)}
         </select>
-        <button class="btn-mini" title="Anzeigen" onclick="openExternalCam('${c.id}')">Anzeigen</button>
-        <button class="btn-mini" title="Bearbeiten" onclick="openCameraModal('${c.id}')">Bearbeiten</button>
-        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteRtspCamera('${c.id}')">&times;</button>
+        <button class="btn-mini" title="${t('btn_show')}" onclick="openExternalCam('${c.id}')">${t('btn_show')}</button>
+        <button class="btn-mini" title="${t('btn_edit')}" onclick="openCameraModal('${c.id}')">${t('btn_edit')}</button>
+        <button class="btn-mini btn-delete" title="${t('btn_remove')}" onclick="deleteRtspCamera('${c.id}')">&times;</button>
       </div>
     </div>`).join('');
 }
@@ -10078,11 +11203,11 @@ async function refreshFarmbotPanel(){
 
 function cardForFarmbot(fb){
   const isUltimaker = fb.manufacturer === 'ultimaker';
-  const sub = (isUltimaker ? 'Ultimaker' : ('Bambu Lab &middot; ' + (fb.bambu_family || '').toUpperCase()))
-    + ` &middot; Arbeitstag ${fb.work_start}&ndash;${fb.work_end} Uhr &middot; max. ${fb.max_queue_days} Tage Wartezeit`;
+  const sub = (isUltimaker ? t('farmbot_sub_ultimaker') : t('farmbot_sub_bambu', {family: (fb.bambu_family || '').toUpperCase()}))
+    + t('farmbot_sub_suffix', {start: fb.work_start, end: fb.work_end, days: fb.max_queue_days});
   const fitsText = fb.queue_count
-    ? `${fb.fits_in_workday} von ${fb.queue_count} Auftraegen koennen rechnerisch heute noch gestartet werden (der jeweils letzte darf dabei unbeaufsichtigt ueber den Feierabend hinaus weiterdrucken).`
-    : 'Warteschlange ist leer.';
+    ? t('farmbot_fits_text', {fits: fb.fits_in_workday, total: fb.queue_count})
+    : t('farmbot_queue_empty');
   return `
     <div class="farmbot-card">
       <div class="card-head">
@@ -10091,18 +11216,18 @@ function cardForFarmbot(fb){
           <div class="farmbot-sub">${sub}</div>
         </div>
         <div class="farmbot-actions">
-          <span class="type-badge">${fb.queue_count} wartend</span>
-          <button class="btn-mini" onclick="openFarmbotQueueModal('${fb.id}')">Warteschlange</button>
+          <span class="type-badge">${t('farmbot_queue_waiting_badge', {count: fb.queue_count})}</span>
+          <button class="btn-mini" onclick="openFarmbotQueueModal('${fb.id}')">${t('btn_farmbot_queue')}</button>
         </div>
       </div>
       <div class="hint-text">${fitsText}</div>
       <div class="drop-zone" id="farmbot-dz-${fb.id}"
            ondragover="dzDragOver(event)" ondragleave="dzDragLeave(event)"
            ondrop="farmbotDzDrop(event,'${fb.id}')">
-        ${isUltimaker ? 'Fertig gesclicte .gcode-Datei' : 'Fertig gesclicte .gcode.3mf-Datei'} hier ablegen
+        ${isUltimaker ? t('farmbot_dz_gcode') : t('farmbot_dz_gcode3mf')}
       </div>
       <div class="modal-actions" style="padding-top:12px;">
-        <button class="btn" onclick="farmbotStartNext('${fb.id}')">Naechsten Druck starten</button>
+        <button class="btn" onclick="farmbotStartNext('${fb.id}')">${t('btn_farmbot_start_next')}</button>
       </div>
     </div>`;
 }
@@ -10177,8 +11302,8 @@ async function openFarmbotQueueModal(farmbotId){
   farmbotQueueModalId = farmbotId;
   const fb = lastFarmbotList.find(f => f.id === farmbotId);
   document.getElementById('farmbotQueueModalTitle').textContent =
-    (fb ? fb.display_name : 'FarmBot') + ' - Warteschlange';
-  document.getElementById('farmbotQueueModalBody').innerHTML = '<div class="history-empty">Wird geladen ...</div>';
+    (fb ? fb.display_name : t('farmbot_default_name')) + t('farmbot_queue_modal_title_suffix');
+  document.getElementById('farmbotQueueModalBody').innerHTML = `<div class="history-empty">${t('loading_generic')}</div>`;
   document.getElementById('farmbotQueueModal').classList.add('show');
   await refreshFarmbotQueueModal();
 }
@@ -10232,7 +11357,7 @@ async function refreshFarmbotQueueModal(){
           <div class="history-date">In Warteschlange seit ${e.added_at}${durHtml}</div>
         </div>
         <div class="history-actions">
-          <button class="btn-mini btn-delete" onclick="deleteFarmbotQueueEntry('${farmbotId}','${e.job_id}')">Loeschen</button>
+          <button class="btn-mini btn-delete" onclick="deleteFarmbotQueueEntry('${farmbotId}','${e.job_id}')">${t('btn_delete')}</button>
         </div>
       </div>`;
   }).join('');
@@ -10401,22 +11526,22 @@ function refreshFarmbotManageList(farmbots){
   lastFarmbotList = farmbots;
   const el = document.getElementById('farmbotManageList');
   if(!farmbots.length){
-    el.innerHTML = '<div class="hint-text">Noch kein FarmBot angelegt.</div>';
+    el.innerHTML = `<div class="hint-text">${t('empty_no_farmbots')}</div>`;
     return;
   }
   el.innerHTML = farmbots.map(fb => `
     <div class="manage-row">
       <div class="manage-info">
-        ${fb.display_name}${fb.enabled ? '' : ' <span class="hint-text">(deaktiviert)</span>'}
+        ${fb.display_name}${fb.enabled ? '' : ` <span class="hint-text">(${t('farmbot_disabled_hint')})</span>`}
         <div class="manage-sub">
-          ${fb.manufacturer === 'bambu' ? 'Bambu Lab &middot; ' + (fb.bambu_family || '').toUpperCase() : 'Ultimaker'}
-          &middot; Arbeitstag ${fb.work_start}&ndash;${fb.work_end} Uhr &middot; max. ${fb.max_queue_days} Tage
+          ${fb.manufacturer === 'bambu' ? t('farmbot_sub_bambu', {family: (fb.bambu_family || '').toUpperCase()}) : t('farmbot_sub_ultimaker')}
+          ${t('farmbot_manage_sub_suffix', {start: fb.work_start, end: fb.work_end, days: fb.max_queue_days})}
         </div>
       </div>
       <div class="manage-actions">
-        <button class="btn-mini" onclick="toggleFarmbotEnabled('${fb.id}', ${!fb.enabled})">${fb.enabled ? 'Deaktivieren' : 'Aktivieren'}</button>
-        <button class="btn-mini" title="Bearbeiten" onclick="startEditFarmbot('${fb.id}')">Bearbeiten</button>
-        <button class="btn-mini btn-delete" title="Entfernen" onclick="deleteFarmbot('${fb.id}')">&times;</button>
+        <button class="btn-mini" onclick="toggleFarmbotEnabled('${fb.id}', ${!fb.enabled})">${fb.enabled ? t('btn_disable') : t('btn_enable')}</button>
+        <button class="btn-mini" title="${t('btn_edit')}" onclick="startEditFarmbot('${fb.id}')">${t('btn_edit')}</button>
+        <button class="btn-mini btn-delete" title="${t('btn_remove')}" onclick="deleteFarmbot('${fb.id}')">&times;</button>
       </div>
     </div>`).join('');
 }
@@ -10543,10 +11668,31 @@ async function deleteFarmbot(farmbotId){
   refreshSettingsPanel();
 }
 
-setLayoutCols(getLayoutCols());
-loadVersion();
-refresh();
-setInterval(refresh, 2500);
+// v2.8.0: Sprache muss vor dem ersten refresh()/applyTranslations()-Lauf
+// feststehen, da sonst Kacheln kurz in der falschen Sprache aufblitzen
+// wuerden. Bei frischer Installation (noch keine config.json beim
+// Programmstart, siehe CONFIG_WAS_FRESH/first_run) wird stattdessen
+// zunaechst die Sprachauswahl gezeigt - erst danach startet der normale
+// Seitenaufbau (inkl. periodischem refresh()).
+async function initLanguageAndStart(){
+  let settings = {};
+  try{
+    settings = await fetch('/api/settings').then(r => r.json());
+  }catch(e){}
+  if(settings && settings.language && I18N[settings.language]){
+    currentLang = settings.language;
+  }
+  applyTranslations();
+  populateLanguageSelect();
+  setLayoutCols(getLayoutCols());
+  loadVersion();
+  if(settings && settings.first_run){
+    showFirstRunLanguagePicker();
+  }
+  refresh();
+  setInterval(refresh, 2500);
+}
+initLanguageAndStart();
 </script>
 </body>
 </html>

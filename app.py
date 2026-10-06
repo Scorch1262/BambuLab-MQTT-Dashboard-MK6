@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 
 import os
 import sys
@@ -1896,6 +1896,31 @@ class PrinterConnection:
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError("MQTT-Befehl zum Druckstart konnte nicht gesendet werden.")
 
+    # v2.9.0: laufenden Druck abbrechen ("print"/"command":"stop") - exakt
+    # dieselbe "print"-Befehlsstruktur wie bei _request_print() oben
+    # ("command"/"sequence_id"/"param"), hier mit "command": "stop" und
+    # leerem "param". Quelle: die bereits an anderer Stelle in diesem
+    # Projekt als vertrauenswuerdig zitierte Referenzbibliothek
+    # bambulabs_api (PrinterMQTTClient.stop_print()) sendet exakt dieses
+    # Payload - keine geratenen/undokumentierten Felder.
+    def request_stop_print(self):
+        if not self._client or not self.status.get("connected"):
+            raise RuntimeError(
+                "Keine aktive MQTT-Verbindung zum Drucker - Abbrechen ist "
+                "gerade nicht moeglich."
+            )
+        payload = {
+            "print": {
+                "sequence_id": "0",
+                "command": "stop",
+                "param": "",
+            }
+        }
+        req_topic = f"device/{self.cfg['serial']}/request"
+        result = self._client.publish(req_topic, json.dumps(payload))
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError("MQTT-Befehl zum Abbrechen konnte nicht gesendet werden.")
+
 
 def _parse_3mf_filaments(local_path: str):
     """Liest Filamentfarbe/-typ aus einer .gcode.3mf (ZIP-Container) und
@@ -3155,6 +3180,29 @@ class OctoPrintConnection:
             raw = resp.read()
         return json.loads(raw.decode("utf-8", errors="ignore")) if raw else {}
 
+    # v2.9.0: laufenden Druck abbrechen - POST /api/job mit
+    # {"command": "cancel"}, offiziell dokumentierter OctoPrint-Endpunkt
+    # ("Issue a job command", docs.octoprint.org/en/master/api/job.html).
+    def cancel_print(self):
+        url = self._base_url() + "/api/job"
+        body = json.dumps({"command": "cancel"}).encode()
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"X-Api-Key": self.cfg.get("api_key", ""), "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                raise RuntimeError(
+                    "OctoPrint meldet: aktuell kein Druckauftrag aktiv, der "
+                    "abgebrochen werden koennte (HTTP 409)."
+                ) from e
+            if e.code == 403:
+                raise RuntimeError("OctoPrint hat den API-Key abgelehnt (403).") from e
+            raise RuntimeError(f"OctoPrint lehnte den Abbruch-Befehl ab (HTTP {e.code}).") from e
+
     def _refresh(self):
         printer = self._get("/api/printer")
         job = self._get("/api/job")
@@ -3275,6 +3323,21 @@ class CrealityConnection:
         with urllib.request.urlopen(req, timeout=5) as resp:
             raw = resp.read()
         return json.loads(raw.decode("utf-8", errors="ignore")) if raw else {}
+
+    # v2.9.0: laufenden Druck abbrechen - POST /printer/print/cancel,
+    # offiziell dokumentierter Moonraker-Endpunkt (moonraker.readthedocs.io,
+    # Abschnitt "Printer Administration").
+    def cancel_print(self):
+        url = self._base_url() + "/printer/print/cancel"
+        headers = {}
+        if self.cfg.get("api_key"):
+            headers["X-Api-Key"] = self.cfg["api_key"]
+        req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Moonraker lehnte den Abbruch-Befehl ab (HTTP {e.code}).") from e
 
     def _discover_objects(self):
         """Fragt einmalig ab, welche Klipper-Objekte auf diesem Drucker
@@ -3709,6 +3772,55 @@ class UltimakerConnection:
 
         if on_progress:
             on_progress(total_size, total_size)
+
+    # v2.9.0: laufenden Druck abbrechen - PUT /api/v1/print_job/state mit
+    # {"target": "abort"}, offiziell dokumentierter Endpunkt laut
+    # Ultimaker-Swagger-Doku (siehe Klassendoku oben, /docs/api/ direkt
+    # am Drucker). Verlangt dieselbe Digest-Authentifizierung wie
+    # send_print() - die Challenge wird bewusst ueber die bereits
+    # bestehende Probe gegen /api/v1/print_job geholt (_digest_challenge_
+    # or_none()) statt eine zweite, identische Probe gegen /print_job/
+    # state zu bauen: laut RFC 2617 gilt eine Digest-Challenge fuer den
+    # gesamten "Protection Space" (hier: alle schreibenden Endpunkte
+    # desselben Druckers), nicht nur fuer den einen Pfad, ueber den sie
+    # angefragt wurde.
+    def abort_print(self):
+        auth_id = self.cfg.get("ultimaker_auth_id")
+        auth_key = self.cfg.get("ultimaker_auth_key")
+        if not auth_id or not auth_key:
+            raise RuntimeError(
+                "Dieser Ultimaker ist noch nicht mit dem Dashboard gekoppelt - "
+                "Abbrechen ueber das Dashboard ist daher nicht moeglich."
+            )
+        uri = "/api/v1/print_job/state"
+        challenge = self._digest_challenge_or_none()
+        body = json.dumps({"target": "abort"}).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if challenge is not None:
+            headers["Authorization"] = _build_digest_authorization(challenge, auth_id, auth_key, "PUT", uri)
+        req = urllib.request.Request(self._base_url() + uri, data=body, method="PUT", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            if e.code == 401:
+                raise RuntimeError(
+                    "Der Drucker hat die gespeicherten Zugangsdaten abgelehnt "
+                    "(HTTP 401) - die Kopplung wurde vermutlich am Drucker "
+                    "zurueckgesetzt. Bitte erneut koppeln."
+                ) from e
+            raise RuntimeError(
+                f"Drucker lehnte den Abbruch-Befehl ab (HTTP {e.code})"
+                f"{': ' + detail if detail else ''}."
+            ) from e
 
 
 # ----------------------------------------------------------------------
@@ -5106,6 +5218,49 @@ class DashboardApp:
             return state in BAMBU_READY_FOR_NEXT_STATES
         return not self.is_printer_busy(printer_id)
 
+    # v2.9.0: laufenden Druck abbrechen - auf ausdruecklichen Nutzerwunsch
+    # ("Passe das Dashboard so an das ein laufender Druck abgebrochen
+    # werden kann"). Reiner Dispatch nach Druckertyp auf die jeweils neu
+    # ergaenzte Abbrechen-Methode der Connection-Klasse (siehe
+    # PrinterConnection.request_stop_print()/OctoPrintConnection.
+    # cancel_print()/CrealityConnection.cancel_print()/
+    # UltimakerConnection.abort_print()) - jede davon nutzt ausschliesslich
+    # offiziell dokumentierte Endpunkte/Befehle (siehe jeweilige
+    # Methodendoku), keine geratenen Protokolldetails.
+    #
+    # Formlabs (Drucker/Wash/Cure) bleibt bewusst aussen vor: Druckauftraege
+    # werden bei diesem Typ nicht ueber das Dashboard gestartet (siehe
+    # README-Tabelle, Spalte "Druck per Drag & Drop" - "-"), sondern lokal
+    # per PreForm - es gibt dafuer keinen vom Formlabs Local API offiziell
+    # dokumentierten Fernabbruch-Endpunkt, ein geratener Endpunkt waere ein
+    # Verstoss gegen die Projekt-Konvention "keine undokumentierten
+    # Protokolldetails erfinden".
+    def abort_print(self, printer_id):
+        p = self.get_printer_cfg(printer_id)
+        if not p:
+            return False, "Unbekannter Drucker."
+        ptype = p.get("type", "bambu")
+        conn = self.connections.get(printer_id)
+        if not conn:
+            return False, "Keine aktive Verbindung zu diesem Drucker."
+        try:
+            if ptype == "bambu":
+                conn.request_stop_print()
+            elif ptype == "octoprint":
+                conn.cancel_print()
+            elif ptype in CREALITY_TYPES:
+                conn.cancel_print()
+            elif ptype == "ultimaker":
+                conn.abort_print()
+            else:
+                return False, (
+                    "Fuer diesen Druckertyp ist das Abbrechen eines laufenden "
+                    "Drucks ueber das Dashboard nicht unterstuetzt."
+                )
+        except Exception as e:
+            return False, str(e)
+        return True, None
+
     @staticmethod
     def _copy_to_temp_job_dir(stored_path, filename):
         """Kopiert eine dauerhaft gespeicherte Datei (Verlauf oder
@@ -6015,6 +6170,18 @@ def api_print_cancel(printer_id):
     if not job_id:
         return jsonify({"error": "job_id fehlt."}), 400
     dash.cancel_print_job(job_id)
+    return jsonify({"ok": True})
+
+
+# v2.9.0: bricht einen auf dem Drucker BEREITS LAUFENDEN Druck ab - zu
+# unterscheiden von /print/cancel oben (das verwirft nur einen noch nicht
+# bestaetigten, vorbereiteten Auftrag vor dem eigentlichen Senden). Siehe
+# DashboardApp.abort_print() fuer den Dispatch nach Druckertyp.
+@app.route("/api/printers/<printer_id>/print/abort", methods=["POST"])
+def api_print_abort(printer_id):
+    ok, err = dash.abort_print(printer_id)
+    if not ok:
+        return jsonify({"error": err}), 400
     return jsonify({"ok": True})
 
 
@@ -7706,7 +7873,12 @@ de: {
   farmbot_queue_modal_title_suffix: " - Warteschlange",
   farmbot_default_name: "FarmBot",
   loading_generic: "Wird geladen ...",
-  field_current_file: "Aktuelle Datei"
+  field_current_file: "Aktuelle Datei",
+  btn_abort_print: "Abbrechen",
+  confirm_abort_print: "Laufenden Druck wirklich abbrechen? Dies kann nicht rueckgaengig gemacht werden.",
+  toast_abort_sent: "Abbrechen angefordert.",
+  toast_abort_failed: "Abbrechen fehlgeschlagen.",
+  toast_abort_network_error: "Netzwerkfehler beim Abbrechen."
 },
 en: {
   layout_switch_title: "Card layout",
@@ -7837,7 +8009,12 @@ en: {
   farmbot_queue_modal_title_suffix: " - Queue",
   farmbot_default_name: "FarmBot",
   loading_generic: "Loading ...",
-  field_current_file: "Current file"
+  field_current_file: "Current file",
+  btn_abort_print: "Abort",
+  confirm_abort_print: "Really abort the running print? This cannot be undone.",
+  toast_abort_sent: "Abort requested.",
+  toast_abort_failed: "Failed to abort.",
+  toast_abort_network_error: "Network error while aborting."
 },
 fr: {
   layout_switch_title: "Disposition des cartes",
@@ -7968,7 +8145,12 @@ fr: {
   farmbot_queue_modal_title_suffix: " - File d'attente",
   farmbot_default_name: "FarmBot",
   loading_generic: "Chargement ...",
-  field_current_file: "Fichier actuel"
+  field_current_file: "Fichier actuel",
+  btn_abort_print: "Annuler",
+  confirm_abort_print: "Vraiment annuler l'impression en cours ? Cette action est irreversible.",
+  toast_abort_sent: "Annulation demandee.",
+  toast_abort_failed: "Echec de l'annulation.",
+  toast_abort_network_error: "Erreur reseau lors de l'annulation."
 },
 es: {
   layout_switch_title: "Disposicion de tarjetas",
@@ -8099,7 +8281,12 @@ es: {
   farmbot_queue_modal_title_suffix: " - Cola",
   farmbot_default_name: "FarmBot",
   loading_generic: "Cargando ...",
-  field_current_file: "Archivo actual"
+  field_current_file: "Archivo actual",
+  btn_abort_print: "Cancelar",
+  confirm_abort_print: "¿Cancelar realmente la impresion en curso? Esta accion no se puede deshacer.",
+  toast_abort_sent: "Cancelacion solicitada.",
+  toast_abort_failed: "Error al cancelar.",
+  toast_abort_network_error: "Error de red al cancelar."
 },
 zh: {
   layout_switch_title: "卡片布局",
@@ -8230,7 +8417,12 @@ zh: {
   farmbot_queue_modal_title_suffix: " - 队列",
   farmbot_default_name: "FarmBot",
   loading_generic: "正在加载...",
-  field_current_file: "当前文件"
+  field_current_file: "当前文件",
+  btn_abort_print: "中止",
+  confirm_abort_print: "确定要中止当前的打印任务吗？此操作无法撤销。",
+  toast_abort_sent: "已发送中止请求。",
+  toast_abort_failed: "中止失败。",
+  toast_abort_network_error: "中止时发生网络错误。"
 },
 ja: {
   layout_switch_title: "カードレイアウト",
@@ -8361,7 +8553,12 @@ ja: {
   farmbot_queue_modal_title_suffix: " - 待機列",
   farmbot_default_name: "FarmBot",
   loading_generic: "読み込み中...",
-  field_current_file: "現在のファイル"
+  field_current_file: "現在のファイル",
+  btn_abort_print: "中止",
+  confirm_abort_print: "実行中の印刷を本当に中止しますか？この操作は元に戻せません。",
+  toast_abort_sent: "中止をリクエストしました。",
+  toast_abort_failed: "中止に失敗しました。",
+  toast_abort_network_error: "中止時にネットワークエラーが発生しました。"
 },
 tr: {
   layout_switch_title: "Kart duzeni",
@@ -8492,7 +8689,12 @@ tr: {
   farmbot_queue_modal_title_suffix: " - Kuyruk",
   farmbot_default_name: "FarmBot",
   loading_generic: "Yukleniyor ...",
-  field_current_file: "Guncel dosya"
+  field_current_file: "Guncel dosya",
+  btn_abort_print: "Iptal",
+  confirm_abort_print: "Devam eden yazdirma gercekten iptal edilsin mi? Bu islem geri alinamaz.",
+  toast_abort_sent: "Iptal talebi gonderildi.",
+  toast_abort_failed: "Iptal basarisiz oldu.",
+  toast_abort_network_error: "Iptal sirasinda ag hatasi olustu."
 }
 };
 
@@ -8645,6 +8847,37 @@ const CREALITY_LABELS = {
   creality_k1se:  'Creality K1 SE',
   creality_other: 'Creality (Klipper)'
 };
+
+// v2.9.0: Druckertypen, fuer die das Dashboard einen laufenden Druck
+// abbrechen kann (siehe DashboardApp.abort_print() im Python-Teil fuer
+// die Begruendung, warum Formlabs bewusst aussen vor bleibt).
+const ABORT_SUPPORTED_TYPES = ['bambu', 'octoprint', 'ultimaker', ...CREALITY_TYPES];
+
+// Abbrechen-Knopf: nur fuer unterstuetzte Druckertypen UND nur, wenn
+// aktuell wirklich etwas laeuft/pausiert ist (siehe stateClass()) -
+// sonst wuerde ein Klick nur eine fuer den Nutzer verwirrende
+// Fehlermeldung des Druckers ("kein Druckauftrag aktiv") ausloesen.
+function abortButtonHtml(p){
+  if(!ABORT_SUPPORTED_TYPES.includes(p.type)) return '';
+  if(!['running', 'paused'].includes(stateClass(p.gcode_state))) return '';
+  return `<button class="btn-mini btn-delete" onclick="abortPrint('${p.id}')">${t('btn_abort_print')}</button>`;
+}
+
+async function abortPrint(printerId){
+  if(!confirm(t('confirm_abort_print'))) return;
+  try{
+    const res = await fetch('/api/printers/' + printerId + '/print/abort', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if(!res.ok){
+      showToast(data.error || t('toast_abort_failed'), 'err');
+      return;
+    }
+    showToast(t('toast_abort_sent'), 'ok');
+    refresh();
+  }catch(e){
+    showToast(t('toast_abort_network_error'), 'err');
+  }
+}
 
 function toggleTypeFields(){
   const type = document.getElementById('f_type').value;
@@ -10067,6 +10300,7 @@ function renderBambuCard(p){
             ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
+            ${abortButtonHtml(p)}
           </div>
 
           <div class="field-label">Temperaturen</div>
@@ -10448,6 +10682,7 @@ function renderOctoPrintCard(p){
             ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
+            ${abortButtonHtml(p)}
           </div>
 
           <div class="field-label">Temperaturen</div>
@@ -10497,6 +10732,7 @@ function renderCrealityCard(p){
             ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
+            ${abortButtonHtml(p)}
           </div>
 
           <div class="field-label">Temperaturen</div>
@@ -10547,6 +10783,7 @@ function renderUltimakerCard(p){
             ${progressThumb(p)}
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
             <div class="progress-pct">${pct}%</div>
+            ${abortButtonHtml(p)}
           </div>
 
           <div class="field-label">Temperaturen</div>

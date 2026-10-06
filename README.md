@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.8.0).
+> den aktuellen Stand (v2.9.0).
 
 ---
 
@@ -36,6 +36,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [7. Bedien-/Einstellungsmodus, Raeume & externe Kameras (seit v2.3.0)](#7-bedieneinstellungsmodus-raeume--externe-kameras-seit-v230)
 - [8. FarmBot: automatische Warteschlange ueber mehrere Drucker (seit v2.6.0)](#8-farmbot-automatische-warteschlange-ueber-mehrere-drucker-seit-v260)
 - [9. Sprache der Oberflaeche (seit v2.8.0)](#9-sprache-der-oberflaeche-seit-v280)
+- [10. Laufenden Druck abbrechen (seit v2.9.0)](#10-laufenden-druck-abbrechen-seit-v290)
 
 ---
 
@@ -536,6 +537,31 @@ Eingabe), bleiben unabhaengig von der gewaehlten Oberflaechensprache
 **immer auf Deutsch** - diese Meldungen stammen aus dem Python-Teil des
 Dashboards und wurden bewusst nicht in den Umfang dieser Umstellung
 aufgenommen.
+
+---
+
+## 10. Laufenden Druck abbrechen (seit v2.9.0)
+
+Auf jeder Drucker-Karte erscheint neben dem Fortschrittsbalken ein
+**"Abbrechen"**-Knopf, sobald tatsaechlich gedruckt wird (oder der Druck
+pausiert ist). Ein Klick fragt zur Sicherheit noch einmal nach, da der
+Abbruch nicht rueckgaengig gemacht werden kann.
+
+Unterstuetzt fuer **Bambu Lab, Ultimaker, OctoPrint und Creality/Klipper**
+- bei allen vieren wird dafuer der jeweils offiziell dokumentierte
+Befehl/Endpunkt verwendet (MQTT-Stop-Kommando bei Bambu Lab, `PUT
+/api/v1/print_job/state` bei Ultimaker, `POST /api/job` bei OctoPrint,
+`POST /printer/print/cancel` bei Moonraker/Creality).
+
+**Nicht unterstuetzt: Formlabs** (Drucker/Wash L/Cure L). Druckauftraege
+werden bei diesem Typ nicht ueber das Dashboard gestartet, sondern lokal
+per PreForm - die Formlabs Local API bietet dafuer keinen offiziell
+dokumentierten Endpunkt zum Fernabbruch.
+
+> Wichtig: der Abbruch wird direkt an den Drucker gesendet. Das Dashboard
+> selbst kann den Abbruch nicht erzwingen, wenn der Drucker ihn ablehnt
+> (z. B. weil gerade gar kein Druck laeuft) - in dem Fall erscheint eine
+> entsprechende Fehlermeldung.
 
 ---
 

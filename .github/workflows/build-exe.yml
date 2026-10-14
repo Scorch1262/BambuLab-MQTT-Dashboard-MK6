@@ -157,22 +157,62 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p ffmpeg_dl/extracted
-          curl -sL "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg_dl/ffmpeg.zip
-          unzip -o ffmpeg_dl/ffmpeg.zip -d ffmpeg_dl/extracted
-          FFMPEG_BIN=$(find ffmpeg_dl/extracted -type f -name "ffmpeg" | head -n 1)
-          if [ -z "$FFMPEG_BIN" ]; then
-            echo "ffmpeg-Binary im entpackten Archiv nicht gefunden." >&2
-            exit 1
-          fi
-          cp "$FFMPEG_BIN" dist/ffmpeg
-          chmod +x dist/ffmpeg
+          # v2.10.1: -sL durch -fL ersetzt und --retry ergaenzt (Begruendung
+          # siehe weiter oben im Datei-Kommentar). v2.10.2: zusaetzlich
+          # NICHT mehr hart abbrechen (kein `exit 1`/`set -e` mehr fuer
+          # diesen Schritt), wenn der Download/die Validierung endgueltig
+          # scheitert - stattdessen nur eine Warnung ausgeben und OHNE
+          # FFmpeg weiterbauen. Hintergrund: am 2026-10-14 lieferte
+          # evermeet.cx fuer genau diesen zuvor jahrelang funktionierenden
+          # Endpunkt ("getrelease/zip") direkt vom Server ein echtes
+          # "HTTP 410 Gone" - kein Block/Rate-Limit (das waere 403/429),
+          # sondern die ausdrueckliche Aussage "diese Ressource existiert
+          # nicht mehr". Retries helfen dagegen nicht, und ein Hart-Abbruch
+          # des gesamten Builds waere unverhaeltnismaessig: app.py toleriert
+          # ein fehlendes FFmpeg bereits zur Laufzeit (siehe
+          # _find_ffmpeg_binary() - nur die Kamera der X1/P1/P2/H2/X2-Serie
+          # waere dann betroffen, alle anderen Funktionen bleiben
+          # unberuehrt). Der Download-Versuch inkl. Retry/PK-Pruefung bleibt
+          # bestehen, damit ein bloss vorübergehendes Problem weiterhin
+          # automatisch geheilt wird und FFmpeg eingebettet wird, sobald die
+          # Quelle (wieder) erreichbar ist.
+          set +e
+          curl -fL --retry 5 --retry-delay 8 --retry-all-errors \
+            -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
+            "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg_dl/ffmpeg.zip
+          CURL_STATUS=$?
+          set -e
 
-      - name: macOS - ausfuehrbar machen + alle drei zusammen zippen (bewahrt Exec-Bit)
+          FFMPEG_OK=0
+          if [ $CURL_STATUS -eq 0 ] && [ -f ffmpeg_dl/ffmpeg.zip ] && [ "$(head -c 2 ffmpeg_dl/ffmpeg.zip)" = "PK" ]; then
+            unzip -o ffmpeg_dl/ffmpeg.zip -d ffmpeg_dl/extracted
+            FFMPEG_BIN=$(find ffmpeg_dl/extracted -type f -name "ffmpeg" | head -n 1)
+            if [ -n "$FFMPEG_BIN" ]; then
+              cp "$FFMPEG_BIN" dist/ffmpeg
+              chmod +x dist/ffmpeg
+              FFMPEG_OK=1
+            fi
+          fi
+
+          if [ "$FFMPEG_OK" -eq 1 ]; then
+            echo "FFmpeg erfolgreich besorgt und wird eingebettet."
+          else
+            echo "::warning::FFmpeg konnte nicht besorgt werden (curl-Exitcode $CURL_STATUS, Download ungueltig oder Binary im Archiv nicht gefunden - zuletzt beobachtete Ursache: evermeet.cx liefert fuer 'getrelease/zip' HTTP 410/Gone). Der macOS-Build wird OHNE eingebettetes FFmpeg fortgesetzt: nur die Kamera-Funktion der X1/P1/P2/H2/X2-Serie ist dann nicht nutzbar, alle anderen Funktionen bleiben unberuehrt (siehe README/UEBERGABE.md)."
+          fi
+
+      - name: macOS - ausfuehrbar machen + alle (zwei oder drei) zusammen zippen (bewahrt Exec-Bit)
         if: runner.os == 'macOS'
         run: |
-          chmod +x dist/DruckerDashboard dist/FtpsUploadHelper dist/ffmpeg
+          chmod +x dist/DruckerDashboard dist/FtpsUploadHelper
           mkdir -p out
-          cd dist && zip -j "../out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip" DruckerDashboard FtpsUploadHelper ffmpeg
+          ZIP_PATH="../out/DruckerDashboard-v${{ steps.version.outputs.version }}-${{ matrix.asset_name_suffix }}.zip"
+          if [ -f dist/ffmpeg ]; then
+            chmod +x dist/ffmpeg
+            cd dist && zip -j "$ZIP_PATH" DruckerDashboard FtpsUploadHelper ffmpeg
+          else
+            echo "::warning::FFmpeg fehlt in diesem Build (siehe vorheriger Schritt) - Zip wird ohne FFmpeg erstellt."
+            cd dist && zip -j "$ZIP_PATH" DruckerDashboard FtpsUploadHelper
+          fi
 
       - name: Windows - alle drei zusammen zippen
         if: runner.os == 'Windows'

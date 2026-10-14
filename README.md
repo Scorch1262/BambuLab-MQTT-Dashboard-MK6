@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.10.0).
+> den aktuellen Stand (v2.10.2).
 
 ---
 
@@ -58,6 +58,15 @@ dabei keine native Apple-Silicon(arm64)-FFmpeg-Variante, deshalb wird
 dort die Intel(x86_64)-Version mitgeliefert; sie laeuft auf Apple-
 Silicon-Macs ueber **Rosetta 2**, das macOS beim ersten Start bei Bedarf
 automatisch zur Installation anbietet (einmalig, braucht kurz Internet).
+
+> Hinweis (seit v2.10.2): ist die externe FFmpeg-Download-Quelle fuer
+> macOS zum Build-Zeitpunkt nicht erreichbar, bricht der Workflow NICHT
+> mehr komplett ab - das macOS-Zip wird dann automatisch ohne FFmpeg
+> veroeffentlicht (im Workflow-Log als Warnung sichtbar). Fehlt
+> `ffmpeg` im entpackten Zip, funktioniert nur die Kamera der
+> X1/P1/P2/H2/X2-Serie nicht, alles andere bleibt unberuehrt (siehe
+> Abschnitt 6) - in dem Fall hilft eine separat installierte, ueber
+> PATH erreichbare FFmpeg-Installation (siehe Abschnitt 1).
 
 **Setup:**
 ```bash

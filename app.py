@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.10.0"
 
 import os
 import sys
@@ -6869,6 +6869,15 @@ INDEX_HTML = r"""
 
   .ams-title{ font-size:11px; text-transform:uppercase; letter-spacing:0.6px; color:var(--text-dim); margin-bottom:10px;}
   .ams-slot{ display:flex; align-items:center; gap:10px; margin-bottom:9px; }
+  /* v2.10.0: Faecher gruppiert nach physischer AMS-Einheit (siehe
+     renderAms()/groupAmsBySlotUnit()) - bei nur einer Einheit (der
+     haeufigste Fall) bleibt die Optik unveraendert (kein Rahmen/Label,
+     nur minimaler Abstand); erst ab der zweiten Einheit erscheinen
+     Trennlinie und Beschriftung, damit erkennbar bleibt, welche
+     Materialrollen zusammen in derselben Einheit stecken. */
+  .ams-unit-group{ margin-bottom:4px; }
+  .ams-unit-group + .ams-unit-group{ margin-top:10px; padding-top:10px; border-top:1px dashed var(--border); }
+  .ams-unit-label{ font-family:var(--mono); font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.4px; color:var(--text-dim); margin-bottom:6px; }
   /* v2.2.1: Luftfeuchtigkeit je AMS-Einheit, unterhalb der Fach-Liste */
   .ams-humidity-row{ margin-top:4px; }
   .ams-swatch{ width:14px; height:14px; border-radius:3px; border:1px solid #000a; flex-shrink:0;}
@@ -10010,20 +10019,57 @@ function extraTempChips(printerId, extras){
     .join('');
 }
 
+// v2.10.0: AMS-Einheit-ID aus dem "slot"-Bezeichner "<ams_unit>-<tray>"
+// extrahieren (siehe DashboardApp._apply_print_report() im Python-Teil,
+// derselbe Bezeichner, der bereits fuer "flat_index"/"ams_mapping"
+// gebraucht wird - hier rein zur Anzeige, keine neue Datenquelle).
+function amsUnitIdFromSlot(slot){
+  if(!slot) return null;
+  const parts = String(slot).split('-');
+  return parts[0];
+}
+
+// Lesbare Beschriftung einer AMS-Einheit fuer die Anzeige. Eine AMS HT
+// (Einheit-ID >= 128, siehe _is_ams_ht_slot() im Python-Teil) hat genau
+// 1 Fach und wird als "AMS HT" beschriftet statt mit ihrer technischen,
+// hochgezaehlten ID - mehrere AMS-HT-Einheiten in derselben Kette sind
+// laut Python-Kommentar NICHT verifiziert, werden hier aber (falls
+// doch vorhanden) ueber die mitgefuehrte ID unterscheidbar gehalten,
+// statt sie faelschlich zusammenzufassen.
+function amsUnitLabel(rawId){
+  const id = parseInt(rawId, 10);
+  if(!Number.isFinite(id)) return `AMS ${rawId}`;
+  if(id >= 128) return id === 128 ? 'AMS HT' : `AMS HT (${id})`;
+  return `AMS ${id}`;
+}
+
+// v2.10.0: Faecher nach AMS-Einheit gruppiert, damit bei mehreren an
+// einen Drucker angeschlossenen AMS-Einheiten erkennbar ist, welche
+// Materialrollen zusammen in derselben physischen Einheit stecken (auf
+// ausdruecklichen Nutzerwunsch). Die Reihenfolge der Faecher bleibt
+// dabei unveraendert (wie vom Drucker gemeldet) - es wird nur
+// GRUPPIERT, nicht umsortiert. Ein Beschriftungs-Kopf je Einheit
+// erscheint nur, wenn tatsaechlich MEHR als eine Einheit erkannt wurde
+// - bei nur einer AMS-Einheit (der mit Abstand haeufigste Fall) sieht
+// die Karte dadurch weiterhin genauso aus wie vor diesem Feature.
+function groupAmsBySlotUnit(ams){
+  const groups = [];
+  const indexByUnit = {};
+  (ams || []).forEach(t => {
+    const unitId = amsUnitIdFromSlot(t.slot);
+    if(!(unitId in indexByUnit)){
+      indexByUnit[unitId] = groups.length;
+      groups.push({ unitId, trays: [] });
+    }
+    groups[indexByUnit[unitId]].trays.push(t);
+  });
+  return groups;
+}
+
 function renderAms(printerId, ams, amsUnits, bambuFamily){
   if(!ams || ams.length === 0){
     return '<div class="empty-ams">Kein AMS erkannt / keine Fach-Daten.</div>';
   }
-  const slots = ams.map(t => {
-    const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '–' : t.remain + '%';
-    const width = (t.remain && t.remain > 0) ? t.remain : 0;
-    return `<div class="ams-slot">
-      <div class="ams-swatch" style="background:${t.color}"></div>
-      <div class="ams-meta">${t.type}</div>
-      <div class="ams-track"><div class="ams-fill" style="width:${width}%; background:${t.color}"></div></div>
-      <div class="ams-remain">${remain}</div>
-    </div>`;
-  }).join('');
   // v2.2.5: Bei der A1-Familie wird das "AMS Lite" verbaut, das (anders
   // als das vollwertige AMS der X1-Serie) KEINEN Feuchtesensor besitzt.
   // Auf ausdruecklichen Nutzerwunsch wird die Feuchteanzeige deshalb bei
@@ -10034,21 +10080,40 @@ function renderAms(printerId, ams, amsUnits, bambuFamily){
   // Filter unten reicht bei der A1-Familie also nicht aus). Analog zur
   // bereits bestehenden Kammertemperatur-Ausblendung fuer A1 (v2.2.0).
   const isA1 = bambuFamily === 'a1';
-  // v2.2.1: Luftfeuchtigkeit je AMS-Einheit, mit Verlaufsdiagramm - nur
-  // Einheiten mit tatsaechlich vorhandenem Wert werden angezeigt (manche
-  // AMS-Firmwarestaende liefern das Feld nicht, siehe _apply_print_report()).
-  // v2.2.7: Einheit auch anzeigen, wenn NUR humidity_raw (Prozentwert,
-  // AMS 2 Pro) vorhanden ist, ohne die aeltere Stufe "humidity".
-  const units = isA1 ? [] : (amsUnits || []).filter(u =>
-    (u.humidity !== undefined && u.humidity !== null) ||
-    (u.humidity_raw !== undefined && u.humidity_raw !== null)
-  );
-  const humidityRow = units.length
-    ? `<div class="temps ams-humidity-row">${units.map(u =>
-        humidityChip(printerId, `ams_humidity_${u.id}`, `Feuchte AMS ${u.id}`, u.humidity, u.humidity_raw)
-      ).join('')}</div>`
-    : '';
-  return slots + humidityRow;
+  const humidityByUnit = {};
+  (amsUnits || []).forEach(u => { humidityByUnit[u.id] = u; });
+
+  const groups = groupAmsBySlotUnit(ams);
+  const showUnitLabels = groups.length > 1;
+
+  return groups.map(g => {
+    const slotsHtml = g.trays.map(t => {
+      const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '–' : t.remain + '%';
+      const width = (t.remain && t.remain > 0) ? t.remain : 0;
+      return `<div class="ams-slot">
+        <div class="ams-swatch" style="background:${t.color}"></div>
+        <div class="ams-meta">${t.type}</div>
+        <div class="ams-track"><div class="ams-fill" style="width:${width}%; background:${t.color}"></div></div>
+        <div class="ams-remain">${remain}</div>
+      </div>`;
+    }).join('');
+
+    // v2.2.1/v2.2.7: Luftfeuchtigkeit je AMS-Einheit, mit
+    // Verlaufsdiagramm - nur anzeigen, wenn fuer GENAU DIESE Einheit
+    // tatsaechlich ein Wert vorliegt (manche AMS-Firmwarestaende liefern
+    // das Feld gar nicht, siehe _apply_print_report()).
+    const u = humidityByUnit[g.unitId];
+    const hasHumidity = !isA1 && u && (
+      (u.humidity !== undefined && u.humidity !== null) ||
+      (u.humidity_raw !== undefined && u.humidity_raw !== null)
+    );
+    const humidityHtml = hasHumidity
+      ? `<div class="temps ams-humidity-row">${humidityChip(printerId, `ams_humidity_${g.unitId}`, `Feuchte ${amsUnitLabel(g.unitId)}`, u.humidity, u.humidity_raw)}</div>`
+      : '';
+
+    const labelHtml = showUnitLabels ? `<div class="ams-unit-label">${amsUnitLabel(g.unitId)}</div>` : '';
+    return `<div class="ams-unit-group">${labelHtml}${slotsHtml}${humidityHtml}</div>`;
+  }).join('');
 }
 
 function renderExtras(printerId, extras){
@@ -10464,19 +10529,49 @@ function amsRowHtml(filament, i, amsTrays){
   // Mapping-Wert); seit v2.2.21 (verifizierter Wert, siehe
   // _slot_to_flat_index()) werden sie wieder ganz normal wie jedes
   // andere AMS-Fach behandelt - keine Sonderbehandlung mehr noetig.
+  //
+  // v2.10.0: ist mehr als eine physische AMS-Einheit angeschlossen
+  // (erkennbar am "slot"-Praefix "<ams_unit>-<tray>", siehe
+  // amsUnitIdFromSlot()), wird das jeweils VOR der Fach-Nummer
+  // zusaetzlich mit ausgegeben ("AMS 1 · Fach 5" statt nur "AMS-Fach
+  // 5") - sonst ist am reinen flat_index nicht erkennbar, welche
+  // Materialrollen zusammen in derselben physischen Einheit stecken.
+  // Bei nur einer Einheit (der haeufigste Fall) bleibt die Beschriftung
+  // unveraendert wie vor diesem Feature.
+  const distinctUnits = new Set(amsTrays.map(t => amsUnitIdFromSlot(t.slot)));
+  const showUnit = distinctUnits.size > 1;
+  const trayLabel = (t) => showUnit
+    ? `${amsUnitLabel(amsUnitIdFromSlot(t.slot))} &middot; Fach ${t.flat_index}`
+    : `AMS-Fach ${t.flat_index}`;
+
   const suggestionLabel = hasSuggestion
-    ? `AMS-Fach ${suggestedTray.flat_index} &middot; ${suggestedTray.type || '-'} &middot; <span title="${'#' + (suggestedTray.color || '').toUpperCase()}">${colorNameFor(suggestedTray.color)}</span>`
+    ? `${trayLabel(suggestedTray)} &middot; ${suggestedTray.type || '-'} &middot; <span title="${'#' + (suggestedTray.color || '').toUpperCase()}">${colorNameFor(suggestedTray.color)}</span>`
     : `Extern / manuell am Display (keine passende Farbe im AMS gefunden)`;
 
-  // "Andere Wahl"-Dropdown: alle AMS-Faecher AUSSER dem bereits vorgeschlagenen,
-  // plus immer die Option "Extern / manuell".
+  // "Andere Wahl"-Dropdown: alle AMS-Faecher AUSSER dem bereits
+  // vorgeschlagenen, plus immer die Option "Extern / manuell". Bei
+  // mehreren AMS-Einheiten zusaetzlich per <optgroup> nach Einheit
+  // gruppiert (Reihenfolge der Faecher bleibt dabei unveraendert).
   const otherTrays = amsTrays.filter(t => t.flat_index !== suggested);
-  const otherOptions = [`<option value="-1">Extern / manuell am Display</option>`]
-    .concat(otherTrays.map(t => {
+  let otherOptionsBody;
+  if(showUnit){
+    const groups = groupAmsBySlotUnit(otherTrays);
+    otherOptionsBody = groups.map(g => {
+      const opts = g.trays.map(t => {
+        const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
+        const trayColorName = colorNameFor(t.color);
+        return `<option value="${t.flat_index}">Fach ${t.flat_index} &middot; ${t.type || '-'} &middot; ${trayColorName} &middot; ${remain}</option>`;
+      }).join('');
+      return `<optgroup label="${amsUnitLabel(g.unitId)}">${opts}</optgroup>`;
+    }).join('');
+  } else {
+    otherOptionsBody = otherTrays.map(t => {
       const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
       const trayColorName = colorNameFor(t.color);
       return `<option value="${t.flat_index}">AMS-Fach ${t.flat_index} &middot; ${t.type || '-'} &middot; ${trayColorName} &middot; ${remain}</option>`;
-    })).join('');
+    }).join('');
+  }
+  const otherOptions = `<option value="-1">Extern / manuell am Display</option>` + otherOptionsBody;
 
   const groupName = 'ams-choice-' + i;
   return `

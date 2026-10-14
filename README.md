@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.9.0).
+> den aktuellen Stand (v2.10.0).
 
 ---
 
@@ -37,6 +37,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [8. FarmBot: automatische Warteschlange ueber mehrere Drucker (seit v2.6.0)](#8-farmbot-automatische-warteschlange-ueber-mehrere-drucker-seit-v260)
 - [9. Sprache der Oberflaeche (seit v2.8.0)](#9-sprache-der-oberflaeche-seit-v280)
 - [10. Laufenden Druck abbrechen (seit v2.9.0)](#10-laufenden-druck-abbrechen-seit-v290)
+- [11. Mehrere AMS-Einheiten unterscheiden (seit v2.10.0)](#11-mehrere-ams-einheiten-unterscheiden-seit-v2100)
 
 ---
 
@@ -562,6 +563,35 @@ dokumentierten Endpunkt zum Fernabbruch.
 > selbst kann den Abbruch nicht erzwingen, wenn der Drucker ihn ablehnt
 > (z. B. weil gerade gar kein Druck laeuft) - in dem Fall erscheint eine
 > entsprechende Fehlermeldung.
+
+---
+
+## 11. Mehrere AMS-Einheiten unterscheiden (seit v2.10.0)
+
+Sind an einem Bambu-Lab-Drucker **mehrere AMS-Einheiten** (inkl. AMS HT /
+Humidity Tower) angeschlossen, zeigt das Dashboard jetzt, welche
+Materialfaecher physisch zusammen in derselben Einheit sitzen.
+
+**Auf der Drucker-Karte** werden die Faecher pro AMS-Einheit gruppiert
+dargestellt, mit einer Trennlinie und einer Beschriftung ("AMS 0", "AMS 1",
+"AMS HT", ...) oberhalb jeder Gruppe. Auch die Feuchte-Anzeige wird pro
+Einheit einzeln unter der jeweiligen Gruppe angezeigt statt in einer
+gemeinsamen Zeile fuer alle Faecher.
+
+**Im Zuweisungs-Dialog** (beim Drag & Drop-Druckstart, Reprint und bei der
+FarmBot-Zuweisung) wird der vorgeschlagene Fach ebenfalls mit seiner
+AMS-Einheit beschriftet, und die Dropdown-Liste mit den uebrigen Faechern
+gruppiert ihre Optionen per `<optgroup>` nach AMS-Einheit.
+
+Ist nur eine einzige AMS-Einheit angeschlossen, bleibt die Darstellung
+unveraendert zur bisherigen Version (keine Einheit-Beschriftung, keine
+Gruppierung) - die Aenderung wirkt sich ausschliesslich auf Konfigurationen
+mit mehreren AMS-Einheiten aus.
+
+> Hinweis: die Zuordnung "welches Fach gehoert zu welcher Einheit" basiert
+> auf den vom Drucker selbst per MQTT gemeldeten Einheiten-IDs - es werden
+> keine Annahmen ueber die physische Verkabelung/Reihenfolge der Einheiten
+> getroffen, die nicht durch die Drucker-Daten gedeckt sind.
 
 ---
 

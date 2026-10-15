@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.10.2"
+APP_VERSION = "2.10.3"
 
 import os
 import sys
@@ -10548,28 +10548,31 @@ function amsRowHtml(filament, i, amsTrays){
     ? `${trayLabel(suggestedTray)} &middot; ${suggestedTray.type || '-'} &middot; <span title="${'#' + (suggestedTray.color || '').toUpperCase()}">${colorNameFor(suggestedTray.color)}</span>`
     : `Extern / manuell am Display (keine passende Farbe im AMS gefunden)`;
 
-  // "Andere Wahl"-Dropdown: alle AMS-Faecher AUSSER dem bereits
-  // vorgeschlagenen, plus immer die Option "Extern / manuell". Bei
-  // mehreren AMS-Einheiten zusaetzlich per <optgroup> nach Einheit
-  // gruppiert (Reihenfolge der Faecher bleibt dabei unveraendert).
-  const otherTrays = amsTrays.filter(t => t.flat_index !== suggested);
+  // "Andere Wahl"-Dropdown: ALLE AMS-Faecher (inkl. des bereits
+  // automatisch vorgeschlagenen - seit v2.10.3; vorher wurde es hier
+  // herausgefiltert, was die Ansicht verwirrend machte, weil ein Fach
+  // in der Liste fehlte, ohne dass erkennbar war, warum), plus immer
+  // die Option "Extern / manuell". Das vorgeschlagene Fach bekommt in
+  // der Liste zusaetzlich den Hinweis "(Vorschlag)", damit klar bleibt,
+  // welches davon die Datei-Empfehlung ist. Bei mehreren AMS-Einheiten
+  // zusaetzlich per <optgroup> nach Einheit gruppiert (Reihenfolge der
+  // Faecher bleibt dabei unveraendert).
+  const optionLabelFor = (t) => {
+    const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
+    const trayColorName = colorNameFor(t.color);
+    const base = showUnit ? `Fach ${t.flat_index}` : `AMS-Fach ${t.flat_index}`;
+    const suggestedHint = (t.flat_index === suggested) ? ' (Vorschlag)' : '';
+    return `${base} &middot; ${t.type || '-'} &middot; ${trayColorName} &middot; ${remain}${suggestedHint}`;
+  };
   let otherOptionsBody;
   if(showUnit){
-    const groups = groupAmsBySlotUnit(otherTrays);
+    const groups = groupAmsBySlotUnit(amsTrays);
     otherOptionsBody = groups.map(g => {
-      const opts = g.trays.map(t => {
-        const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
-        const trayColorName = colorNameFor(t.color);
-        return `<option value="${t.flat_index}">Fach ${t.flat_index} &middot; ${t.type || '-'} &middot; ${trayColorName} &middot; ${remain}</option>`;
-      }).join('');
+      const opts = g.trays.map(t => `<option value="${t.flat_index}">${optionLabelFor(t)}</option>`).join('');
       return `<optgroup label="${amsUnitLabel(g.unitId)}">${opts}</optgroup>`;
     }).join('');
   } else {
-    otherOptionsBody = otherTrays.map(t => {
-      const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
-      const trayColorName = colorNameFor(t.color);
-      return `<option value="${t.flat_index}">AMS-Fach ${t.flat_index} &middot; ${t.type || '-'} &middot; ${trayColorName} &middot; ${remain}</option>`;
-    }).join('');
+    otherOptionsBody = amsTrays.map(t => `<option value="${t.flat_index}">${optionLabelFor(t)}</option>`).join('');
   }
   const otherOptions = `<option value="-1">Extern / manuell am Display</option>` + otherOptionsBody;
 

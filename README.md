@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.10.2).
+> den aktuellen Stand (v2.10.3).
 
 ---
 
@@ -589,8 +589,14 @@ gemeinsamen Zeile fuer alle Faecher.
 
 **Im Zuweisungs-Dialog** (beim Drag & Drop-Druckstart, Reprint und bei der
 FarmBot-Zuweisung) wird der vorgeschlagene Fach ebenfalls mit seiner
-AMS-Einheit beschriftet, und die Dropdown-Liste mit den uebrigen Faechern
-gruppiert ihre Optionen per `<optgroup>` nach AMS-Einheit.
+AMS-Einheit beschriftet, und die Dropdown-Liste gruppiert ihre Optionen per
+`<optgroup>` nach AMS-Einheit.
+
+> Seit v2.10.3 zeigt die Dropdown-Liste "Anderes Material aus dem AMS
+> waehlen" IMMER **alle** AMS-Faecher an - auch das bereits automatisch
+> vorgeschlagene (markiert mit dem Zusatz "(Vorschlag)"). Vorher fehlte
+> das vorgeschlagene Fach in dieser Liste, was die Ansicht verwirrend
+> machte, weil nicht erkennbar war, warum ein Fach fehlt.
 
 Ist nur eine einzige AMS-Einheit angeschlossen, bleibt die Darstellung
 unveraendert zur bisherigen Version (keine Einheit-Beschriftung, keine

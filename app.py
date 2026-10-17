@@ -124,7 +124,7 @@ Konfiguration:         config.json (liegt im selben Ordner wie das Skript
 # in Blau (humidity-spark) - cardForStandaloneExtra() hat die Sparkline-
 # Klasse schlicht nicht anhand von "display" gewaehlt. Fix: dieselbe
 # Logik wie in extraChip() ergaenzt. Siehe UEBERGABE.md v2.5.6.
-APP_VERSION = "2.10.3"
+APP_VERSION = "2.12.0"
 
 import os
 import sys
@@ -1004,6 +1004,11 @@ class PrinterConnection:
             "chamber_temp": None,
             "nozzle_temp": None,
             "bed_temp": None,
+            # v2.11.0: Soll-/Zieltemperaturen fuer Duese/Bett, zusaetzlich
+            # zu den bereits vorhandenen Ist-Werten - siehe
+            # _apply_print_report() fuer die Feldnamen im MQTT-Report.
+            "nozzle_target_temp": None,
+            "bed_target_temp": None,
             "remaining_min": None,
             "ams": [],
             "ams_units": [],  # v2.2.1: Luftfeuchtigkeit je AMS-Einheit, siehe _apply_print_report()
@@ -1345,6 +1350,16 @@ class PrinterConnection:
             s["nozzle_temp"] = p["nozzle_temper"]
         if "bed_temper" in p:
             s["bed_temp"] = p["bed_temper"]
+        # v2.11.0: Soll-/Zieltemperatur fuer Duese/Bett - community-
+        # dokumentierte Feldnamen "nozzle_target_temper"/"bed_target_temper"
+        # im selben "pushing.pushall"-MQTT-Report wie die bereits
+        # verwendeten Ist-Werte (siehe Doridian/OpenBambuAPI, mqtt.md).
+        # Defensiv nur bei Vorhandensein uebernommen, analog zu den
+        # anderen optionalen Feldern hier.
+        if "nozzle_target_temper" in p:
+            s["nozzle_target_temp"] = p["nozzle_target_temper"]
+        if "bed_target_temper" in p:
+            s["bed_target_temp"] = p["bed_target_temper"]
         if "mc_remaining_time" in p:
             s["remaining_min"] = p["mc_remaining_time"]
         # v2.2.22: fuer den RTSPS-Kamera-Stream (siehe
@@ -1399,13 +1414,54 @@ class PrinterConnection:
                         humidity_raw = int(unit["humidity_raw"])
                 except (TypeError, ValueError):
                     humidity_raw = None
+                # v2.11.0: Temperatur je AMS-Einheit - community-
+                # dokumentiertes Feld "temp" im selben Einheit-Objekt wie
+                # "humidity"/"humidity_raw" (Quelle: Doridian/OpenBambuAPI,
+                # mqtt.md - Beispielwert "22.7", Grad Celsius als String).
+                # Defensiv geparst: fehlt das Feld oder ist es keine Zahl,
+                # bleibt die Einheit ohne Temperaturangabe - das Frontend
+                # zeigt in diesem Fall KEIN Temperatur-Feld an (kein
+                # Platzhalter/Rateanzeige), siehe renderAms().
+                temp = None
+                try:
+                    if unit.get("temp") is not None:
+                        temp = float(unit["temp"])
+                except (TypeError, ValueError):
+                    temp = None
                 units.append({
                     "id": unit.get("id", "0"),
                     "humidity": humidity,
                     "humidity_raw": humidity_raw,
+                    "temp": temp,
                 })
             s["ams"] = slots
             s["ams_units"] = units
+
+            # v2.11.0: markiert, welches AMS-Fach aktuell tatsaechlich in
+            # den Druckkopf geladen ist - community-dokumentiertes Feld
+            # "ams.tray_now" (Doridian/OpenBambuAPI, mqtt.md): "254"
+            # bedeutet externe Spule/vt_tray, sonst der flache Index
+            # (ams_id*4+tray_id) des aktiven Fachs fuer reguläre Einheiten
+            # - exakt dieselbe, bereits verifizierte Formel wie
+            # _slot_to_flat_index() (siehe dort). Fuer AMS-HT-Faecher
+            # (Einheit-ID >= 128) ist die genaue Bedeutung von "tray_now"
+            # nicht gesondert dokumentiert; der Vergleich nutzt trotzdem
+            # dieselbe _slot_to_flat_index()-Formel, OHNE eine zusaetzliche,
+            # unbestaetigte Annahme ueber den Wertebereich zu treffen.
+            tray_now_raw = p.get("ams", {}).get("tray_now")
+            tray_now = None
+            try:
+                if tray_now_raw is not None:
+                    tray_now = int(tray_now_raw)
+            except (TypeError, ValueError):
+                tray_now = None
+            for slot_entry in slots:
+                slot_entry["active"] = (
+                    tray_now is not None
+                    and tray_now != 254
+                    and _slot_to_flat_index(slot_entry["slot"]) == tray_now
+                )
+            s["ams_external_spool_active"] = (tray_now == 254)
 
     # ------------------------------------------------------------------
     # Druckauftrag per Drag & Drop senden
@@ -1509,21 +1565,27 @@ class PrinterConnection:
             "total_filaments": total_filaments,
         }
 
-    def send_print(self, local_path: str, remote_name: str, mapping, on_progress=None):
+    def send_print(self, local_path: str, remote_name: str, mapping, on_progress=None, timelapse: bool = False, bed_leveling: bool = True):
         """Laedt local_path per FTPS auf den Drucker hoch und startet den
         Druck mit der vom Nutzer (im Browser) bestaetigten/korrigierten
         AMS-Zuordnung. mapping ist eine Liste von AMS-Fach-Indizes (-1 =
         kein AMS / externe Spule fuer dieses Filament) oder None/leer,
         wenn ganz ohne AMS gedruckt werden soll. on_progress(sent, total)
         wird waehrend des Uploads wiederholt aufgerufen (fuer die
-        Fortschrittsanzeige im Browser). Wirft eine Exception mit
-        Klartext-Fehlermeldung bei Problemen."""
+        Fortschrittsanzeige im Browser). timelapse (seit v2.11.0) steuert
+        das gleichnamige Feld im project_file-Befehl (siehe
+        _request_print()) - vom Nutzer im AMS-Zuweisungs-Dialog gewaehlt.
+        bed_leveling (seit v2.12.0, Standard True) steuert analog dazu
+        das Feld "bed_leveling" im project_file-Befehl. Wirft eine
+        Exception mit Klartext-Fehlermeldung bei Problemen."""
         use_ams = bool(mapping) and any(m is not None and int(m) >= 0 for m in mapping)
         ams_summary = {
             "use_ams": use_ams,
             "mapping": [int(m) for m in mapping] if mapping else None,
             "total": len(mapping) if mapping else 0,
             "matched": sum(1 for m in (mapping or []) if m is not None and int(m) >= 0),
+            "timelapse": bool(timelapse),
+            "bed_leveling": bool(bed_leveling),
         }
         # WICHTIG (v1.5.2): MQTT-Verbindung waehrend des Uploads bewusst
         # kurz trennen - siehe ausfuehrliche Begruendung bei
@@ -1821,7 +1883,15 @@ class PrinterConnection:
                 "subtask_id": "0",
                 "subtask_name": job_name,
                 "use_ams": bool(ams_summary.get("use_ams")),
-                "timelapse": False,
+                # v2.11.0: vorher fest auf False - jetzt vom Nutzer im
+                # AMS-Zuweisungs-Dialog beim Druckstart waehlbar (siehe
+                # amsModalTimelapse-Checkbox im Frontend sowie
+                # send_print()/start_confirm_print_job(), die den Wert bis
+                # hierher durchreichen). Fehlt der Wert (z. B. Reprint/
+                # FarmBot-Pfad ohne eigene Checkbox), bleibt der bisherige
+                # Standard False erhalten - keine Verhaltensaenderung fuer
+                # diese Pfade.
+                "timelapse": bool(ams_summary.get("timelapse", False)),
                 # WICHTIG (v1.6.0): Bisher fest auf False, obwohl die
                 # etablierte Referenzbibliothek "bambulabs_api" hierfuer
                 # den Standardwert True verwendet
@@ -1836,7 +1906,15 @@ class PrinterConnection:
                 # koennen. Auf True umgestellt, um dem bestaetigten
                 # Referenzverhalten zu entsprechen.
                 "flow_cali": True,
-                "bed_leveling": True,
+                # v2.12.0: vorher fest auf True - jetzt vom Nutzer im
+                # AMS-Zuweisungs-Dialog beim Druckstart abwaehlbar (siehe
+                # amsModalBedLeveling-Checkbox im Frontend sowie
+                # send_print()/start_confirm_print_job(), die den Wert bis
+                # hierher durchreichen). Fehlt der Wert (z. B. Reprint/
+                # FarmBot-Pfad ohne eigene Checkbox), bleibt der bisherige
+                # Standard True erhalten - keine Verhaltensaenderung fuer
+                # diese Pfade.
+                "bed_leveling": bool(ams_summary.get("bed_leveling", True)),
                 "layer_inspect": True,
                 "vibration_cali": True,
             }
@@ -3137,6 +3215,8 @@ class OctoPrintConnection:
             "chamber_temp": None,
             "nozzle_temp": None,
             "bed_temp": None,
+            "nozzle_target_temp": None,
+            "bed_target_temp": None,
             "remaining_min": None,
             "ams": [],
             "error": None
@@ -3220,6 +3300,13 @@ class OctoPrintConnection:
             self.status["nozzle_temp"] = tool0["actual"]
         if bed.get("actual") is not None:
             self.status["bed_temp"] = bed["actual"]
+        # v2.11.0: Soll-/Zieltemperatur - offiziell dokumentiertes Feld
+        # "target" im selben Temperatur-Objekt wie "actual"
+        # (docs.octoprint.org, "PrinterState"-Schema).
+        if tool0.get("target") is not None:
+            self.status["nozzle_target_temp"] = tool0["target"]
+        if bed.get("target") is not None:
+            self.status["bed_target_temp"] = bed["target"]
 
         job_info = job.get("job") or {}
         file_info = job_info.get("file") or {}
@@ -3281,6 +3368,8 @@ class CrealityConnection:
             "chamber_temp": None,
             "nozzle_temp": None,
             "bed_temp": None,
+            "nozzle_target_temp": None,
+            "bed_target_temp": None,
             "remaining_min": None,
             "ams": [],
             "error": None
@@ -3382,10 +3471,19 @@ class CrealityConnection:
         extruder = status.get("extruder") or {}
         if extruder.get("temperature") is not None:
             self.status["nozzle_temp"] = round(extruder["temperature"], 1)
+        # v2.11.0: Soll-/Zieltemperatur - offiziell dokumentiertes Feld
+        # "target" im selben Objekt wie "temperature"
+        # (moonraker.readthedocs.io, "Printer Objects" - extruder/
+        # heater_bed), wird bereits mitgeliefert, da das ganze Objekt
+        # ohne Feldauswahl abgefragt wird (siehe _refresh() oben).
+        if extruder.get("target") is not None:
+            self.status["nozzle_target_temp"] = round(extruder["target"], 1)
 
         bed = status.get("heater_bed") or {}
         if bed.get("temperature") is not None:
             self.status["bed_temp"] = round(bed["temperature"], 1)
+        if bed.get("target") is not None:
+            self.status["bed_target_temp"] = round(bed["target"], 1)
 
         if self._chamber_object_name and self._chamber_object_name in status:
             chamber_obj = status[self._chamber_object_name] or {}
@@ -3515,6 +3613,8 @@ class UltimakerConnection:
             "chamber_temp": None,
             "nozzle_temp": None,
             "bed_temp": None,
+            "nozzle_target_temp": None,
+            "bed_target_temp": None,
             "remaining_min": None,
             "error": None
         }
@@ -3585,6 +3685,11 @@ class UltimakerConnection:
             bed = self._get("/api/v1/printer/bed/temperature")
             if bed and bed.get("current") is not None:
                 self.status["bed_temp"] = round(bed["current"], 1)
+            # v2.11.0: Soll-/Zieltemperatur - offiziell dokumentiertes
+            # Feld "target" in derselben Antwort wie "current" (am
+            # Drucker selbst abrufbare Swagger-Doku, "/docs/api/").
+            if bed and bed.get("target") is not None:
+                self.status["bed_target_temp"] = round(bed["target"], 1)
         except Exception:
             pass
 
@@ -3592,6 +3697,8 @@ class UltimakerConnection:
             hotend = self._get("/api/v1/printer/heads/0/extruders/0/hotend/temperature")
             if hotend and hotend.get("current") is not None:
                 self.status["nozzle_temp"] = round(hotend["current"], 1)
+            if hotend and hotend.get("target") is not None:
+                self.status["nozzle_target_temp"] = round(hotend["target"], 1)
         except Exception:
             pass
 
@@ -5070,7 +5177,7 @@ class DashboardApp:
             p = self._print_progress.get(job_id)
             return dict(p) if p else None
 
-    def start_confirm_print_job(self, job_id, mapping):
+    def start_confirm_print_job(self, job_id, mapping, timelapse=False, bed_leveling=True):
         """Startet FTPS-Upload + Druckstart in einem Hintergrund-Thread
         und kehrt SOFORT zurueck - der Fortschritt wird ueber
         get_print_progress(job_id) abgefragt (Polling vom Browser).
@@ -5079,7 +5186,11 @@ class DashboardApp:
         klicken kann, ohne die Datei nochmal hochladen und die
         AMS-Zuordnung neu waehlen zu muessen. Nur bei Erfolg oder durch
         cancel_print_job()/die 20-Minuten-Aufraeumroutine wird die
-        Temp-Datei geloescht."""
+        Temp-Datei geloescht. timelapse (seit v2.11.0): vom Nutzer im
+        Browser gewaehlter Wert fuer die Zeitraffer-Aufnahme dieses
+        Drucks, wird unveraendert an conn.send_print() durchgereicht.
+        bed_leveling (seit v2.12.0, Standard True): analog dazu fuer die
+        automatische Bettnivelierung dieses Drucks."""
         with self._print_jobs_lock:
             job = self._print_jobs.get(job_id)
         if not job:
@@ -5102,7 +5213,7 @@ class DashboardApp:
                 percent = int(sent * 100 / total) if total else 0
                 self._set_progress(job_id, phase="uploading", sent=sent, total=total, percent=percent)
             try:
-                ams_summary = conn.send_print(job["local_path"], job["remote_name"], mapping, on_progress=on_progress)
+                ams_summary = conn.send_print(job["local_path"], job["remote_name"], mapping, on_progress=on_progress, timelapse=timelapse, bed_leveling=bed_leveling)
                 self._set_progress(job_id, phase="done", sent=total_size, total=total_size, percent=100, ams=ams_summary)
                 # MK6: erfolgreich gesendeten Auftrag in den Verlauf des
                 # Druckers uebernehmen (bzw. bei Reprint/Warteschlange nur
@@ -6138,12 +6249,24 @@ def api_print_confirm(printer_id):
     data = request.get_json(force=True) or {}
     job_id = data.get("job_id")
     mapping = data.get("mapping")
+    # v2.11.0: optionales Feld "timelapse" (true/false) - vom Nutzer im
+    # AMS-Zuweisungs-Dialog gewaehlt, steuert das gleichnamige Feld im
+    # project_file-Befehl (siehe _request_print()). Fehlt es (aeltere
+    # Frontend-Version im Browser-Cache, Reprint/FarmBot-Pfad ohne eigene
+    # Checkbox), bleibt der bisherige Standard False erhalten.
+    timelapse = bool(data.get("timelapse", False))
+    # v2.12.0: optionales Feld "bed_leveling" (true/false) - vom Nutzer im
+    # AMS-Zuweisungs-Dialog gewaehlt, steuert das gleichnamige Feld im
+    # project_file-Befehl (siehe _request_print()). Fehlt es (aeltere
+    # Frontend-Version im Browser-Cache, Reprint/FarmBot-Pfad ohne eigene
+    # Checkbox), bleibt der bisherige Standard True erhalten.
+    bed_leveling = bool(data.get("bed_leveling", True))
     if not job_id:
         return jsonify({"error": "job_id fehlt."}), 400
     if mapping is not None and not isinstance(mapping, list):
         return jsonify({"error": "mapping muss eine Liste sein."}), 400
 
-    ok, err = dash.start_confirm_print_job(job_id, mapping)
+    ok, err = dash.start_confirm_print_job(job_id, mapping, timelapse, bed_leveling)
     if not ok:
         return jsonify({"error": err}), 400
     return jsonify({"ok": True, "job_id": job_id})
@@ -6886,6 +7009,15 @@ INDEX_HTML = r"""
   .ams-fill{ height:100%; }
   .ams-remain{ font-family:var(--mono); font-size:11.5px; width:36px; text-align:right; color:var(--text-dim);}
   .empty-ams{ font-size:12px; color:var(--text-dim); font-style:italic; }
+  /* v2.11.0: Fach, dessen Material laut Drucker gerade tatsaechlich in
+     den Druckkopf geladen ist (siehe renderAms()) - dezent hervorgehoben
+     statt eines auffaelligen Rahmens, damit es sich bei einem einzigen
+     AMS (haeufigster Fall, meist nur ein Fach aktiv) nicht wie ein
+     Fehler/eine Warnung anfuehlt. */
+  .ams-slot-active{ background:rgba(74,158,255,0.08); border-radius:5px; margin-left:-4px; padding-left:4px; }
+  .ams-active-badge{ font-family:var(--mono); font-size:10px; font-weight:600; color:var(--accent); white-space:nowrap; flex-shrink:0; }
+  .ams-temp-row{ margin-top:4px; }
+  .ams-external-spool-hint{ font-family:var(--mono); font-size:10.5px; color:var(--accent); margin-top:8px; }
 
   .drop-zone{
     margin-top:16px; border:1px dashed var(--border); border-radius:8px;
@@ -6946,6 +7078,16 @@ INDEX_HTML = r"""
     margin-left:4px;
   }
   .ams-row-select:disabled{ opacity:0.4; cursor:not-allowed; }
+
+  /* v2.11.0: Zeitraffer-Checkbox im AMS-Zuweisungs-Dialog, siehe
+     amsModal im HTML sowie confirmAmsModal(). Seit v2.12.0 teilt sich
+     auch die Bettnivelierungs-Checkbox dieselbe (rein generische)
+     Toggle-Optik. */
+  .ams-timelapse-toggle{
+    display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-dim);
+    padding:10px 0 2px; cursor:pointer;
+  }
+  .ams-timelapse-toggle input[type="checkbox"]{ width:auto; margin:0; flex-shrink:0; accent-color:var(--accent-2); }
 
   .ams-progress-wrap{ margin-top:16px; }
   .ams-progress-track{
@@ -7547,6 +7689,27 @@ INDEX_HTML = r"""
     <h2 data-i18n="modal_ams_title">AMS-Zuordnung pruefen</h2>
     <div class="file-name" id="amsModalFilename" style="margin-bottom:16px;"></div>
     <div id="amsModalRows"></div>
+    <!-- v2.11.0: Zeitraffer-Aufnahme fuer diesen Druck ein-/ausschaltbar
+         (steuert das "timelapse"-Feld im project_file-Befehl, siehe
+         _request_print()/confirmAmsModal()) - Standard: aus, wie bisher
+         fest im Backend vorgegeben, also keine Verhaltensaenderung fuer
+         Nutzer, die die Checkbox nicht anfassen. -->
+    <label class="ams-timelapse-toggle">
+      <input type="checkbox" id="amsModalTimelapse">
+      <span data-i18n="label_timelapse">Zeitraffer-Aufnahme fuer diesen Druck aufzeichnen</span>
+    </label>
+    <!-- v2.12.0: automatische Bettnivelierung fuer diesen Druck ein-/
+         ausschaltbar (steuert das "bed_leveling"-Feld im project_file-
+         Befehl, siehe _request_print()/confirmAmsModal()) - anders als
+         bei der Zeitraffer-Checkbox ist der Standard hier AN (Haekchen
+         gesetzt), da automatische Bettnivelierung normalerweise
+         gewuenscht ist; Nutzer, die die Checkbox nicht anfassen,
+         bekommen weiterhin exakt das bisherige Verhalten
+         (bed_leveling fest an). -->
+    <label class="ams-timelapse-toggle">
+      <input type="checkbox" id="amsModalBedLeveling" checked>
+      <span data-i18n="label_bed_leveling">Automatische Bettnivelierung fuer diesen Druck</span>
+    </label>
     <div class="ams-progress-wrap" id="amsProgressWrap" style="display:none;">
       <div class="ams-progress-track"><div class="ams-progress-bar" id="amsProgressBar" style="width:0%"></div></div>
       <div class="ams-progress-label" id="amsProgressLabel"></div>
@@ -7814,6 +7977,8 @@ de: {
   label_port_optional: "Port (optional)",
   btn_add: "Hinzufuegen",
   modal_ams_title: "AMS-Zuordnung pruefen",
+  label_timelapse: "Zeitraffer-Aufnahme fuer diesen Druck aufzeichnen",
+  label_bed_leveling: "Automatische Bettnivelierung fuer diesen Druck",
   btn_start_print: "Drucken starten",
   modal_history_title: "Druckauftrags-Verlauf",
   btn_close: "Schliessen",
@@ -7950,6 +8115,8 @@ en: {
   label_port_optional: "Port (optional)",
   btn_add: "Add",
   modal_ams_title: "Check AMS assignment",
+  label_timelapse: "Record a timelapse for this print",
+  label_bed_leveling: "Automatic bed leveling for this print",
   btn_start_print: "Start print",
   modal_history_title: "Print history",
   btn_close: "Close",
@@ -8086,6 +8253,8 @@ fr: {
   label_port_optional: "Port (optionnel)",
   btn_add: "Ajouter",
   modal_ams_title: "Verifier l'assignation AMS",
+  label_timelapse: "Enregistrer un timelapse pour cette impression",
+  label_bed_leveling: "Nivellement automatique du plateau pour cette impression",
   btn_start_print: "Lancer l'impression",
   modal_history_title: "Historique d'impression",
   btn_close: "Fermer",
@@ -8222,6 +8391,8 @@ es: {
   label_port_optional: "Puerto (opcional)",
   btn_add: "Anadir",
   modal_ams_title: "Comprobar asignacion de AMS",
+  label_timelapse: "Grabar un timelapse de esta impresion",
+  label_bed_leveling: "Nivelacion automatica de la cama para esta impresion",
   btn_start_print: "Iniciar impresion",
   modal_history_title: "Historial de impresion",
   btn_close: "Cerrar",
@@ -8358,6 +8529,8 @@ zh: {
   label_port_optional: "端口（可选）",
   btn_add: "添加",
   modal_ams_title: "检查 AMS 分配",
+  label_timelapse: "为本次打印录制延时摄影",
+  label_bed_leveling: "为本次打印开启自动调平",
   btn_start_print: "开始打印",
   modal_history_title: "打印历史",
   btn_close: "关闭",
@@ -8494,6 +8667,8 @@ ja: {
   label_port_optional: "ポート（任意）",
   btn_add: "追加",
   modal_ams_title: "AMS の割り当てを確認",
+  label_timelapse: "この印刷のタイムラプスを記録する",
+  label_bed_leveling: "この印刷で自動ベッドレベリングを行う",
   btn_start_print: "印刷を開始",
   modal_history_title: "印刷履歴",
   btn_close: "閉じる",
@@ -8630,6 +8805,8 @@ tr: {
   label_port_optional: "Port (istege bagli)",
   btn_add: "Ekle",
   modal_ams_title: "AMS atamasini kontrol et",
+  label_timelapse: "Bu baski icin hizlandirilmis kayit yap",
+  label_bed_leveling: "Bu baski icin otomatik tabla seviyelemesi",
   btn_start_print: "Yazdirmayi baslat",
   modal_history_title: "Yazdirma gecmisi",
   btn_close: "Kapat",
@@ -9861,7 +10038,7 @@ function sparklineSvg(values, cssClass){
 // Creality/Ultimaker) - erfasst den aktuellen Wert in tempHistory UND
 // rendert Chip + Sparkline in einem Aufwasch, damit das nicht in jeder
 // Karten-Renderfunktion einzeln dupliziert werden muss.
-function tempChip(printerId, field, label, value){
+function tempChip(printerId, field, label, value, target){
   recordTempHistory(printerId, field, value);
   const history = (tempHistory[printerId] && tempHistory[printerId][field]) || [];
   // v2.8.0: label wird ueber den Feldnamen uebersetzt (I18N), statt den
@@ -9871,7 +10048,14 @@ function tempChip(printerId, field, label, value){
   // mehr benutzt.
   const key = {nozzle: 'temp_nozzle', bed: 'temp_bed', chamber: 'temp_chamber'}[field];
   const text = key ? t(key) : label;
-  return `<div class="temp-chip">${text} <b>${formatTemp(value)}&deg;C</b>${sparklineSvg(history)}</div>`;
+  // v2.11.0: optionaler fuenfter Parameter "target" - ist er vorhanden
+  // (nicht undefined/null), wird zusaetzlich zum Ist-Wert die Soll-
+  // Temperatur mit "/" getrennt angezeigt ("210 / 220°C"). Fehlt er
+  // (Drucker/Verbindungstyp liefert keine Soll-Temperatur), bleibt die
+  // Anzeige unveraendert nur beim Ist-Wert - kein Platzhalter.
+  const hasTarget = (target !== undefined && target !== null);
+  const valueText = hasTarget ? `${formatTemp(value)} / ${formatTemp(target)}` : formatTemp(value);
+  return `<div class="temp-chip">${text} <b>${valueText}&deg;C</b>${sparklineSvg(history)}</div>`;
 }
 
 // v2.2.0: kleines Vorschaubild des aktuellen/zuletzt gestarteten
@@ -10066,10 +10250,17 @@ function groupAmsBySlotUnit(ams){
   return groups;
 }
 
-function renderAms(printerId, ams, amsUnits, bambuFamily){
+function renderAms(printerId, ams, amsUnits, bambuFamily, externalSpoolActive){
   if(!ams || ams.length === 0){
     return '<div class="empty-ams">Kein AMS erkannt / keine Fach-Daten.</div>';
   }
+  // v2.11.0: ist laut Drucker gerade eine externe Spule geladen (Feld
+  // "ams.tray_now" == 254, siehe _apply_print_report()), ist KEIN
+  // AMS-Fach aktiv - ohne diesen Hinweis wuerde man sich fragen, warum
+  // kein Fach markiert ist, obwohl gerade gedruckt wird.
+  const externalSpoolHtml = externalSpoolActive
+    ? `<div class="ams-external-spool-hint">&#9654; Extern/manuell am Display geladen (kein AMS-Fach aktiv)</div>`
+    : '';
   // v2.2.5: Bei der A1-Familie wird das "AMS Lite" verbaut, das (anders
   // als das vollwertige AMS der X1-Serie) KEINEN Feuchtesensor besitzt.
   // Auf ausdruecklichen Nutzerwunsch wird die Feuchteanzeige deshalb bei
@@ -10090,8 +10281,17 @@ function renderAms(printerId, ams, amsUnits, bambuFamily){
     const slotsHtml = g.trays.map(t => {
       const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '–' : t.remain + '%';
       const width = (t.remain && t.remain > 0) ? t.remain : 0;
-      return `<div class="ams-slot">
+      // v2.11.0: markiert das Fach, dessen Material laut Drucker (Feld
+      // "ams.tray_now", siehe _apply_print_report()) GERADE tatsaechlich
+      // in den Druckkopf geladen ist - mit hervorgehobenem Rahmen und
+      // einem kleinen Badge, damit es auch ohne Hover auffaellt.
+      const activeClass = t.active ? ' ams-slot-active' : '';
+      const activeBadge = t.active
+        ? `<div class="ams-active-badge" title="Aktuell in den Druckkopf geladen">&#9654;</div>`
+        : '';
+      return `<div class="ams-slot${activeClass}">
         <div class="ams-swatch" style="background:${t.color}"></div>
+        ${activeBadge}
         <div class="ams-meta">${t.type}</div>
         <div class="ams-track"><div class="ams-fill" style="width:${width}%; background:${t.color}"></div></div>
         <div class="ams-remain">${remain}</div>
@@ -10111,9 +10311,18 @@ function renderAms(printerId, ams, amsUnits, bambuFamily){
       ? `<div class="temps ams-humidity-row">${humidityChip(printerId, `ams_humidity_${g.unitId}`, `Feuchte ${amsUnitLabel(g.unitId)}`, u.humidity, u.humidity_raw)}</div>`
       : '';
 
+    // v2.11.0: Temperatur je AMS-Einheit - NUR anzeigen, wenn der
+    // Drucker fuer GENAU DIESE Einheit tatsaechlich einen Wert
+    // uebertraegt (Feld "temp", siehe _apply_print_report()); fehlt es,
+    // wird bewusst KEIN Feld/Platzhalter dargestellt (Nutzerwunsch).
+    const hasTemp = u && (u.temp !== undefined && u.temp !== null);
+    const tempHtml = hasTemp
+      ? `<div class="temps ams-temp-row">${tempChip(printerId, `ams_temp_${g.unitId}`, `Temp. ${amsUnitLabel(g.unitId)}`, u.temp)}</div>`
+      : '';
+
     const labelHtml = showUnitLabels ? `<div class="ams-unit-label">${amsUnitLabel(g.unitId)}</div>` : '';
-    return `<div class="ams-unit-group">${labelHtml}${slotsHtml}${humidityHtml}</div>`;
-  }).join('');
+    return `<div class="ams-unit-group">${labelHtml}${slotsHtml}${tempHtml}${humidityHtml}</div>`;
+  }).join('') + externalSpoolHtml;
 }
 
 function renderExtras(printerId, extras){
@@ -10376,14 +10585,14 @@ function renderBambuCard(p){
           </div>`}
           <div class="temps">
             ${p.bambu_family === 'a1' ? '' : tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp)}
-            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
-            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp, p.nozzle_target_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp, p.bed_target_temp)}
             ${extraTempChips(p.id, p.extras)}
           </div>
         </div>
         <div>
           <div class="ams-title">${t('ams_filament_title')}</div>
-          ${renderAms(p.id, p.ams, p.ams_units, p.bambu_family)}
+          ${renderAms(p.id, p.ams, p.ams_units, p.bambu_family, p.ams_external_spool_active)}
           ${renderDropZone(p.id)}
         </div>
       </div>
@@ -10504,6 +10713,13 @@ function openAmsModal(printerId, data){
 
   document.getElementById('amsModalFilename').textContent = data.filename;
   resetAmsProgress();
+  // v2.11.0: bei jedem neu geoeffneten Dialog zuruecksetzen - sonst
+  // wuerde eine fuer einen vorherigen Druck angehakte Checkbox
+  // faelschlich fuer den naechsten Druck uebernommen.
+  document.getElementById('amsModalTimelapse').checked = false;
+  // v2.12.0: ebenfalls bei jedem neu geoeffneten Dialog zuruecksetzen -
+  // Standard hier bewusst AN (siehe Kommentar im HTML).
+  document.getElementById('amsModalBedLeveling').checked = true;
 
   const rows = document.getElementById('amsModalRows');
   if(!data.filaments || data.filaments.length === 0){
@@ -10546,17 +10762,21 @@ function amsRowHtml(filament, i, amsTrays){
 
   const suggestionLabel = hasSuggestion
     ? `${trayLabel(suggestedTray)} &middot; ${suggestedTray.type || '-'} &middot; <span title="${'#' + (suggestedTray.color || '').toUpperCase()}">${colorNameFor(suggestedTray.color)}</span>`
-    : `Extern / manuell am Display (keine passende Farbe im AMS gefunden)`;
+    : `Extern (keine passende Farbe im AMS gefunden)`;
 
   // "Andere Wahl"-Dropdown: ALLE AMS-Faecher (inkl. des bereits
   // automatisch vorgeschlagenen - seit v2.10.3; vorher wurde es hier
   // herausgefiltert, was die Ansicht verwirrend machte, weil ein Fach
   // in der Liste fehlte, ohne dass erkennbar war, warum), plus immer
-  // die Option "Extern / manuell". Das vorgeschlagene Fach bekommt in
+  // die Option "Extern". Das vorgeschlagene Fach bekommt in
   // der Liste zusaetzlich den Hinweis "(Vorschlag)", damit klar bleibt,
   // welches davon die Datei-Empfehlung ist. Bei mehreren AMS-Einheiten
   // zusaetzlich per <optgroup> nach Einheit gruppiert (Reihenfolge der
   // Faecher bleibt dabei unveraendert).
+  // v2.12.0: der Text "manuell am Display" wurde entfernt (auf
+  // Nutzerwunsch) - diese Auswahl erscheint am Drucker selbst nie und
+  // hat nur verwirrt; die Option bleibt unter dem Wert -1 funktional
+  // unveraendert erhalten (siehe confirmAmsModal()).
   const optionLabelFor = (t) => {
     const remain = (t.remain === undefined || t.remain === null || t.remain < 0) ? '?' : t.remain + '%';
     const trayColorName = colorNameFor(t.color);
@@ -10574,7 +10794,7 @@ function amsRowHtml(filament, i, amsTrays){
   } else {
     otherOptionsBody = amsTrays.map(t => `<option value="${t.flat_index}">${optionLabelFor(t)}</option>`).join('');
   }
-  const otherOptions = `<option value="-1">Extern / manuell am Display</option>` + otherOptionsBody;
+  const otherOptions = `<option value="-1">Extern</option>` + otherOptionsBody;
 
   const groupName = 'ams-choice-' + i;
   return `
@@ -10677,10 +10897,17 @@ async function confirmAmsModal(){
   document.getElementById('amsModalCancelBtn').disabled = true;
   setAmsProgress(0, 'Wird gestartet ...');
 
+  // v2.11.0: Zeitraffer-Einstellung aus der Checkbox mitsenden - siehe
+  // api_print_confirm()/_request_print() auf Backend-Seite.
+  const timelapse = document.getElementById('amsModalTimelapse').checked;
+  // v2.12.0: Bettnivelierungs-Einstellung aus der Checkbox mitsenden -
+  // siehe api_print_confirm()/_request_print() auf Backend-Seite.
+  const bedLeveling = document.getElementById('amsModalBedLeveling').checked;
+
   try{
     const res = await fetch('/api/printers/' + printerId + '/print/confirm', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({job_id: jobId, mapping: mapping})
+      body: JSON.stringify({job_id: jobId, mapping: mapping, timelapse: timelapse, bed_leveling: bedLeveling})
     });
     const data = await res.json();
     if(!res.ok){
@@ -10785,8 +11012,8 @@ function renderOctoPrintCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
-            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp, p.nozzle_target_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp, p.bed_target_temp)}
             ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
@@ -10836,8 +11063,8 @@ function renderCrealityCard(p){
           <div class="field-label">Temperaturen</div>
           <div class="temps">
             ${hasChamber ? tempChip(p.id, 'chamber', 'Kammer', p.chamber_temp) : ''}
-            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
-            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp, p.nozzle_target_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp, p.bed_target_temp)}
             ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}
@@ -10886,8 +11113,8 @@ function renderUltimakerCard(p){
 
           <div class="field-label">Temperaturen</div>
           <div class="temps">
-            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp)}
-            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp)}
+            ${tempChip(p.id, 'nozzle', 'Duese', p.nozzle_temp, p.nozzle_target_temp)}
+            ${tempChip(p.id, 'bed', 'Bett', p.bed_temp, p.bed_target_temp)}
             ${extraTempChips(p.id, p.extras)}
           </div>
           ${p.error ? `<div class="error-hint">${p.error}</div>` : ''}

@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.10.3).
+> den aktuellen Stand (v2.12.0).
 
 ---
 
@@ -38,6 +38,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 - [9. Sprache der Oberflaeche (seit v2.8.0)](#9-sprache-der-oberflaeche-seit-v280)
 - [10. Laufenden Druck abbrechen (seit v2.9.0)](#10-laufenden-druck-abbrechen-seit-v290)
 - [11. Mehrere AMS-Einheiten unterscheiden (seit v2.10.0)](#11-mehrere-ams-einheiten-unterscheiden-seit-v2100)
+- [12. AMS-Temperatur, Soll-Temperaturen, aktives Fach & Zeitraffer (seit v2.11.0)](#12-ams-temperatur-soll-temperaturen-aktives-fach--zeitraffer-seit-v2110)
 
 ---
 
@@ -607,6 +608,72 @@ mit mehreren AMS-Einheiten aus.
 > auf den vom Drucker selbst per MQTT gemeldeten Einheiten-IDs - es werden
 > keine Annahmen ueber die physische Verkabelung/Reihenfolge der Einheiten
 > getroffen, die nicht durch die Drucker-Daten gedeckt sind.
+
+---
+
+## 12. AMS-Temperatur, Soll-Temperaturen, aktives Fach & Zeitraffer (seit v2.11.0)
+
+**Temperatur je AMS-Einheit** erscheint jetzt zusaetzlich zur Feuchte-
+Anzeige, ABER NUR, wenn der Drucker fuer die jeweilige Einheit
+tatsaechlich einen Wert uebertraegt - liefert eine Einheit kein
+Temperatur-Feld, bleibt dort einfach keine Temperaturanzeige (kein
+Platzhalter, keine Rateanzeige).
+
+**Duesen- und Bett-Temperatur** zeigen jetzt zusaetzlich zum Ist-Wert
+die Soll-/Zieltemperatur, getrennt durch "/" (z. B. "215 / 220°C").
+Liefert der jeweilige Drucker/Verbindungstyp keine Soll-Temperatur,
+bleibt die Anzeige unveraendert nur beim Ist-Wert. Gilt fuer alle
+Druckertypen mit Temperaturanzeige (Bambu Lab, OctoPrint, Creality/
+Klipper, Ultimaker).
+
+**Aktuell geladenes AMS-Fach:** bei Bambu-Lab-Druckern wird das Fach,
+dessen Material gerade tatsaechlich in den Druckkopf geladen ist, auf
+der Drucker-Karte mit einem kleinen "▶"-Pfeil markiert (seit v2.12.0
+nur noch der Pfeil, ohne Text - siehe Abschnitt 13). Ist stattdessen
+eine externe Spule geladen, erscheint unterhalb der AMS-Anzeige ein
+entsprechender Hinweis statt einer Fach-Markierung.
+
+**Zeitraffer-Aufnahme beim Druckstart:** im AMS-Zuweisungs-Dialog (vor
+dem Drucken starten per Drag & Drop, Reprint oder FarmBot-Zuweisung)
+laesst sich per Checkbox festlegen, ob der Drucker fuer diesen Druck
+eine Zeitraffer-Aufnahme anfertigen soll. Standard ist AUS (wie bisher
+fest vorgegeben) - wer die Checkbox nicht anfasst, bekommt exakt das
+bisherige Verhalten.
+
+> Hinweis: die Feldnamen fuer AMS-Temperatur ("temp"), aktives Fach
+> ("tray_now") und Duesen-/Bett-Soll-Temperatur
+> ("nozzle_target_temper"/"bed_target_temper") stammen aus der
+> community-dokumentierten Bambu-MQTT-Referenz (Doridian/OpenBambuAPI)
+> - derselben Quelle, die in diesem Projekt bereits fuer andere
+> AMS-/Druckstart-Felder herangezogen wird.
+
+---
+
+## 13. Aktiv-Pfeil umplatziert, "manuell am Display" entfernt, Bettnivelierung abwaehlbar (seit v2.12.0)
+
+**Aktiv-Pfeil beim AMS-Fach:** der Hinweis auf das gerade in den
+Druckkopf geladene Material zeigt jetzt nur noch den Pfeil (▶), ohne
+den Text "geladen" - und sitzt direkt hinter dem Farbquadrat des
+Fachs, statt wie bisher am Ende der Zeile (nach der
+Fuellstand-Prozentanzeige). Grund: an dieser Stelle ist auf einen
+Blick erkennbar, zu welcher Farbe der Pfeil gehoert, ohne die Zeile
+bis zum Ende lesen zu muessen.
+
+**"Extern / manuell am Display" entfernt:** bei der manuellen
+Material-Zuordnung vor dem Druckstart (AMS-Zuweisungs-Dialog) wurde
+der Text "manuell am Display" komplett entfernt - diese Auswahl
+erscheint am Drucker selbst nie und hat nur verwirrt. Die Option
+("Extern") bleibt als Dropdown-Eintrag erhalten, falls kein
+passendes AMS-Fach gewaehlt werden soll; es aendert sich nur die
+Beschriftung, nicht die Funktion.
+
+**Automatische Bettnivelierung ein-/ausschaltbar:** im selben
+AMS-Zuweisungs-Dialog (neben der Zeitraffer-Checkbox) laesst sich
+jetzt auch festlegen, ob der Drucker vor diesem Druck automatisch
+das Bett nivellieren soll. Anders als bei der Zeitraffer-Checkbox
+ist der Standard hier AN (Haekchen gesetzt) - wer die Checkbox nicht
+anfasst, bekommt weiterhin exakt das bisherige Verhalten (automatische
+Bettnivelierung aktiv).
 
 ---
 

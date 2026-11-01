@@ -20,7 +20,7 @@ Abschnitt 3) sowie Bambu Lab/Ultimaker zusaetzlich eine
 
 > Fuer Architektur, Codestellen und die vollstaendige
 > Entwicklungshistorie siehe `UEBERGABE.md`. Diese README beschreibt nur
-> den aktuellen Stand (v2.12.0).
+> den aktuellen Stand (v2.13.2).
 
 ---
 
@@ -674,6 +674,69 @@ das Bett nivellieren soll. Anders als bei der Zeitraffer-Checkbox
 ist der Standard hier AN (Haekchen gesetzt) - wer die Checkbox nicht
 anfasst, bekommt weiterhin exakt das bisherige Verhalten (automatische
 Bettnivelierung aktiv).
+
+---
+
+## 14. AMS-Temperatur/Feuchte nebeneinander, Fluss-Kalibrierung abwaehlbar, Zeitraffer-Bugfix (seit v2.13.0)
+
+**AMS-Temperatur und -Feuchte stehen jetzt nebeneinander** statt wie
+bisher übereinander (zwei getrennte Zeilen pro AMS-Einheit). Beide
+Angaben erscheinen weiterhin nur, wenn der Drucker fuer die jeweilige
+Einheit tatsaechlich einen Wert liefert (siehe Abschnitt 12).
+
+**Fluss-Kalibrierung ein-/ausschaltbar:** im AMS-Zuweisungs-Dialog
+(neben Zeitraffer- und Bettnivelierungs-Checkbox) laesst sich jetzt
+auch die Fluss-Kalibrierung fuer diesen Druck abwaehlen. Standard ist
+AN (wie bisher fest vorgegeben) - wer die Checkbox nicht anfasst,
+bekommt exakt das bisherige Verhalten.
+
+**Bugfix: Zeitraffer wurde trotz Abwahl aufgenommen.** Ursache
+(bestaetigt per Recherche in der community-dokumentierten
+Bambu-MQTT-Referenz Doridian/OpenBambuAPI): das "timelapse"-Feld im
+Druckstart-Befehl ist nur ein Hinweis fuer den jeweiligen Druckauftrag.
+Ob tatsaechlich aufgenommen wird, steuert eine DAVON GETRENNTE,
+GERAETESEITIG PERSISTENTE Kamera-Einstellung (sichtbar im Status als
+"ipcam.timelapse", umschaltbar per eigenem MQTT-Kamera-Befehl) - blieb
+diese z. B. von Bambu Studio oder der Bambu-Handy-App auf "an" stehen,
+hat der Drucker unabhaengig von der Dashboard-Checkbox weiter
+aufgenommen. Das Dashboard sendet jetzt vor jedem Druckstart
+zusaetzlich diesen Kamera-Befehl passend zur Checkbox, sodass beide
+Einstellungen uebereinstimmen.
+
+---
+
+## 15. Zwei weitere Korrekturen: AMS-Temp/Feuchte wirklich nebeneinander, aktiver Pfeil bei Mehrduesen-Druckern (seit v2.13.1)
+
+**AMS-Temperatur/Feuchte standen trotz Abschnitt 14 oft weiter
+untereinander:** Ursache war ein Zeilenumbruch, der bei schmaleren
+Drucker-Karten (z. B. 3-4 Karten pro Reihe) fast immer gegriffen hat.
+Behoben, indem genau diese eine Zeile nicht mehr umbricht (siehe
+Abschnitt 16 fuer die endgueltige, verfeinerte Loesung ohne
+Scrollbalken).
+
+**Aktiver Material-Pfeil blieb bei Mehrduesen-Druckern (H2D/H2D Pro)
+teils haengen:** das bisher genutzte globale Statusfeld scheint bei
+Druckern mit zwei Duesen nicht immer zuverlaessig abzubilden, welche
+Duese gerade druckt. Fuer solche Drucker wertet das Dashboard jetzt
+zusaetzlich pro-Duesen-Statusfelder aus, um das tatsaechlich aktive
+Fach zu bestimmen - bei Druckern mit nur einer Duese (X1/P1/A1)
+aendert sich nichts. Diese Korrektur basiert auf einer gut
+dokumentierten, aber (noch) nicht an eigener Hardware verifizierten
+Quelle - bei weiterhin falscher Markierung bitte melden, idealerweise
+mit einem Blick in die Server-Konsole (dort wird einmalig protokolliert,
+wenn dieser Pfad greift).
+
+---
+
+## 16. AMS-Temperatur/Feuchte: Stauchen statt Scrollen (seit v2.13.2)
+
+Der in Abschnitt 15 eingefuehrte horizontale Scrollbalken fuer sehr
+schmale Drucker-Karten gefiel auf Nutzer-Feedback nicht. Stattdessen
+duerfen beide Chips (Temperatur und Feuchte) jetzt aktiv schrumpfen:
+wird der Platz eng, kuerzt sich zuerst die Beschriftung (z. B. "Temp.
+AMS 1" -> "Temp. A…") und die kleine Verlaufsgrafik wird kompakter
+dargestellt - der eigentliche Messwert bleibt dabei immer vollstaendig
+und unverkuerzt lesbar. Kein Scrollbalken, kein Zeilenumbruch mehr.
 
 ---
 
